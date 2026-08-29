@@ -1,0 +1,25 @@
+[package]
+name = "dm-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Core download engine for the DM download manager (segmented, resumable, rate-limited)."
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "time", "io-util", "process"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "cookies", "gzip", "brotli", "deflate", "http2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+directories = "5"
+url = "2"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "1"
+futures-util = "0.3"
+log = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tempfile = "3"
