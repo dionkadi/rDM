@@ -142,8 +142,9 @@ Greenfield — no existing code. Lean on:
       **[DONE:3]** Backend validated headless via `tests/integration.rs` (full probe→chunk→write→
       checksum pipeline against a local Range server: segmented download, single-connection fallback,
       and deliberate checksum-mismatch→Error all pass). Frontend shows live List + AddUrl + progress
-      events + a category field; category-management / checksum-entry / proxy-entry panels are
-      simplified (engine supports them — flesh out in M7).
+      events + a category field. Category-management and checksum-entry panels were later fleshed out
+      (see M7 note): `App.svelte` AddUrl accepts an optional sha256 expected hash and the Settings
+      panel CRUDs Category rows (name/extensions/directory, persisted via `updateSettings`).
 - [x] **M4 — Clipboard + drag-drop + tray**: clipboard-manager monitor → suggest download; window
       drag-drop of `text/uri-list`; system tray + minimize/close-to-tray; completion notifications.
       **[DONE:4]** Frontend (clipboard auto-monitor + "Add clipboard URL", window drag-drop of
@@ -174,11 +175,14 @@ Greenfield — no existing code. Lean on:
 - [x] **M7 — Polish + ship**: live **uplot speed graph** (`src/lib/SpeedGraph.svelte`) sampling
       aggregate speed each second, rendered into a dedicated card in `App.svelte`; completion
       notification via `tauri-plugin-notification` (`notify_on_complete` command + capability +
-      plugin wired in `main.rs`); autostart + system-tray already in place (M4). **[DONE:7]** Frontend
+      plugin wired in `main.rs`); system-tray already in place (M4). **[DONE:7]** Autostart
+      (`tauri-plugin-autostart`) was wired after M7: plugin + capability permissions + a "Launch at
+      login" toggle in `App.svelte`, and the checksum-entry / category-management panels were added. Frontend
       build-verifiable: `npm run check` → 0 errors/0 warnings, `npm run build` → BUILD_EXIT=0 (uplot
       bundled). The Rust-side notification wiring is written but unverifiable in this sandbox
-      (no webkit2gtk). Remaining host-only steps: `tauri icon` to generate `src-tauri/icons/`, enable
-      `tauri-plugin-autostart`, and run `tauri build` per OS (Linux/macOS/Windows) for end-to-end smoke.
+      (no webkit2gtk). Remaining host-only steps: run `tauri build` per OS
+      (Linux/macOS/Windows) for end-to-end smoke; the `com.app.dm.native.json` `path`/`allowed_origins`
+      must still be filled per OS/extension-id.
 
 ## Verification
 

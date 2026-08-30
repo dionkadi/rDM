@@ -71,8 +71,13 @@ a webview host.
   (`svelte.config.js` exists and `vite.config.ts` registers `svelte()`).
 - **Icons** (`src-tauri/icons/*`) are already present; you do NOT need to run `tauri icon` unless you
   replace the artwork.
-- **`tauri-plugin-autostart`** is planned but not yet wired. Scheduler (`chrono` timers) and
-  notification (`tauri-plugin-notification`) are wired.
+- **`tauri-plugin-autostart`** IS wired (v2 plugin, `main.rs` + capability permissions +
+  a "Launch at login" toggle in `App.svelte` Settings). Scheduler (`chrono` timers) and
+  notification (`tauri-plugin-notification`) are also wired.
+- **Checksum entry + category management are now in the UI**: `App.svelte` AddUrl form accepts an
+  optional `sha256` expected hash (→ `api.addDownload` `checksum`), and the Settings panel lists/
+  edits/adds/deletes `Category` rows (name/extensions/directory) persisted via `updateSettings`
+  (categories live inside `Settings`). No new backend command was needed for categories.
 - The **video grabber** is heuristic (page `<video>`/`<source>`/`.m3u8`/`.mpd`); site-specific
   HLS/DASH resolution is out of scope for v1.
 

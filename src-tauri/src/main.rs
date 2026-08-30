@@ -10,12 +10,14 @@ use dm_engine::manager::DownloadManager;
 use dm_engine::storage::Storage;
 use events::FrontendEvent;
 use std::sync::Arc;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
+use tauri_plugin_autostart::MacosLauncher;
 
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))
         .setup(|app| {
             let handle = app.handle().clone();
 
@@ -25,7 +27,7 @@ fn main() {
                 .app_data_dir()
                 .expect("app data directory must be resolvable");
             std::fs::create_dir_all(&data_dir).ok();
-            let storage = Storage::open(data_dir.join("dm.sqlite")).expect("open storage");
+            let storage = Storage::open(&data_dir.join("dm.sqlite")).expect("open storage");
 
             let manager = DownloadManager::new(storage);
 
@@ -38,15 +40,22 @@ fn main() {
 
             app.manage(manager.clone());
 
+            // Wrap in an Arc for the background native-host listener (which
+            // needs a shareable handle) and the schedule loop.
+            let manager = Arc::new(manager);
+
             // Accept URLs forwarded from the browser extension via the
             // native-messaging host.
             native_host::start_native_host_listener(manager.clone(), native_host::DEFAULT_PORT);
 
             // Resume any downloads that were active when the app last closed,
             // then keep the schedule window open/closed.
-            tauri::async_runtime::spawn(async move {
-                manager.start().await;
-                manager.run_schedule_loop();
+            tauri::async_runtime::spawn({
+                let manager = manager.clone();
+                async move {
+                    manager.start().await;
+                    manager.run_schedule_loop();
+                }
             });
 
             tray::build_tray(app)?;

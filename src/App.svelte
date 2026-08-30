@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { readText } from "@tauri-apps/plugin-clipboard-manager";
+  import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
   import * as api from "./lib/api";
   import SpeedGraph from "./lib/SpeedGraph.svelte";
   import type { Download, FrontendEvent, Settings } from "./lib/types";
@@ -17,6 +18,11 @@
   let clipboardUrl = "";
   let clipTimer: ReturnType<typeof setInterval> | null = null;
   let showSettings = false;
+
+  // Launch-at-login (autostart plugin) and optional checksum entry on add.
+  let autostart = false;
+  let checksumAlgo = "sha256";
+  let checksumExpected = "";
 
   // Aggregate live speed (bytes/sec), sampled once per second from the
   // in-flight downloads and fed to the SpeedGraph for a rolling chart.
@@ -60,14 +66,25 @@
     }
   }
 
-  async function add(u: string, cat?: string | null) {
+  async function add(
+    u: string,
+    cat?: string | null,
+    checksum?: { algorithm: string; expected: string } | null,
+  ) {
     if (!u) return;
     try {
-      await api.addDownload({ url: u, category: cat ?? null });
+      await api.addDownload({ url: u, category: cat ?? null, checksum: checksum ?? null });
       await refresh();
+      checksumExpected = "";
     } catch (e) {
       error = String(e);
     }
+  }
+
+  // Build a ChecksumSpec from the optional checksum inputs (manual add only).
+  function currentChecksum(): { algorithm: string; expected: string } | null {
+    const hex = checksumExpected.trim();
+    return hex === "" ? null : { algorithm: checksumAlgo, expected: hex };
   }
 
   async function applyGlobalLimit() {
@@ -134,6 +151,64 @@
     saveSettings({ proxy: v === "" ? null : v });
   }
 
+  // ---- Autostart (launch at login) ----
+  async function loadAutostart() {
+    try {
+      autostart = await isEnabled();
+    } catch {
+      /* plugin unavailable outside Tauri — leave toggle off */
+    }
+  }
+  async function onAutostartToggle(e: Event) {
+    const on = (e.target as HTMLInputElement).checked;
+    try {
+      if (on) await enable();
+      else await disable();
+      autostart = on;
+    } catch (err) {
+      error = String(err);
+      autostart = !on;
+    }
+  }
+
+  // ---- Category management (categories live inside Settings) ----
+  async function addCategory() {
+    if (!settings) return;
+    const cats = settings.categories.slice();
+    cats.push({
+      id: "cat-" + Date.now().toString(36),
+      name: "New category",
+      extensions: [],
+      directory: "",
+    });
+    await saveSettings({ categories: cats });
+  }
+  // Read an input value from a DOM event without an inline TS cast in markup.
+  function targetValue(e: Event): string {
+    return (e.target as HTMLInputElement).value;
+  }
+  async function setCategoryField(
+    id: string,
+    field: "name" | "extensions" | "directory",
+    value: string,
+  ) {
+    if (!settings) return;
+    const cats = settings.categories.map((c) => {
+      if (c.id !== id) return c;
+      const next = { ...c };
+      if (field === "name") next.name = value;
+      else if (field === "directory") next.directory = value;
+      else next.extensions = value.split(",").map((s) => s.trim()).filter(Boolean);
+      return next;
+    });
+    await saveSettings({ categories: cats });
+  }
+  async function removeCategory(id: string) {
+    if (!settings) return;
+    const cats = settings.categories.filter((c) => c.id !== id);
+    await saveSettings({ categories: cats });
+  }
+
   // ---- Clipboard monitor (M4) ----
   function isUrl(s: string): boolean {
     return /^https?:\/\/\S+$/i.test(s.trim());
@@ -184,6 +259,7 @@
     loadSettings().then(() => {
       if (settings?.clipboardMonitor) startClipboardMonitor();
     });
+    loadAutostart();
     startSpeedMonitor();
     const unlisten: Promise<UnlistenFn> = listen<FrontendEvent>(
       "download-event",
@@ -287,6 +363,40 @@
           on:change={onProxyChange}
         />
       </div>
+      <div class="row" style="margin-bottom:8px">
+        <strong>Launch at login</strong>
+        <label class="pill">
+          <input type="checkbox" checked={autostart} on:change={onAutostartToggle} />
+          start DM on system login
+        </label>
+      </div>
+      <div class="row" style="margin-bottom:8px">
+        <strong>Categories</strong>
+        <button class="ghost" on:click={addCategory}>Add category</button>
+      </div>
+      {#each settings.categories as c (c.id)}
+        <div class="row" style="margin-bottom:6px; align-items:flex-start">
+          <input
+            style="flex:1"
+            value={c.name}
+            placeholder="name"
+            on:change={(e) => setCategoryField(c.id, "name", targetValue(e))}
+          />
+          <input
+            style="flex:1.4"
+            value={c.extensions.join(", ")}
+            placeholder="extensions, comma-separated"
+            on:change={(e) => setCategoryField(c.id, "extensions", targetValue(e))}
+          />
+          <input
+            style="flex:1.4"
+            value={c.directory}
+            placeholder="save directory"
+            on:change={(e) => setCategoryField(c.id, "directory", targetValue(e))}
+          />
+          <button class="danger" on:click={() => removeCategory(c.id)}>Del</button>
+        </div>
+      {/each}
     </div>
   {/if}
 
@@ -295,14 +405,24 @@
       <input
         placeholder="https://example.com/big-file.iso"
         bind:value={url}
-        on:keydown={(e) => e.key === "Enter" && add(url, newCategory || null)}
+        on:keydown={(e) => e.key === "Enter" && add(url, newCategory || null, currentChecksum())}
       />
       <input
         style="flex: 0 1 160px"
         placeholder="category (optional)"
         bind:value={newCategory}
       />
-      <button on:click={() => add(url, newCategory || null)}>Add URL</button>
+      <button on:click={() => add(url, newCategory || null, currentChecksum())}>Add URL</button>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <select bind:value={checksumAlgo} style="flex:0 1 140px">
+        <option value="sha256">sha256</option>
+      </select>
+      <input
+        style="flex:1"
+        placeholder="expected checksum (optional, hex)"
+        bind:value={checksumExpected}
+      />
     </div>
     <div class="row" style="margin-top:10px">
       <input

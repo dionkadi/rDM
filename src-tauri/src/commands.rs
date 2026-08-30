@@ -23,7 +23,6 @@ pub fn add_download(
     speed_limit: Option<u64>,
     checksum: Option<ChecksumSpec>,
 ) -> Download {
-    let settings = state.settings();
     let dir = state.save_dir_for(category.as_deref());
     let fname = filename.unwrap_or_else(|| protocol::suggest_filename(&url, None, "download.bin"));
     let save_path = dir.join(&fname);
