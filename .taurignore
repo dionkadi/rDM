@@ -1,0 +1,56 @@
+# `.taurignore` — Tauri CLI ignore patterns.
+#
+# The Tauri CLI uses the `ignore` crate (via `ignore::WalkBuilder`) to
+# walk the project tree for two things: the `tauri dev` file watcher
+# (notify) and the icon / source-file discovery at build time. Both
+# open a file descriptor per directory entry while iterating, and
+# the Tauri CLI does **not** apply a `max_open(1)` or equivalent
+# back-pressure. On a project whose `target/` and `node_modules/`
+# together contain tens of thousands of files, that walker can
+# exhaust the per-process file-descriptor limit and panic with
+# `Error { kind: Io(Os { code: 24, kind: Uncategorized, message: "Too
+# many open files" }) }` at `crates/tauri-cli/src/interface/rust.rs`
+# line 146 (the `Result::unwrap()` on the walker iterator).
+#
+# The Tauri CLI is a precompiled native Node addon bundled in
+# `node_modules/@tauri-apps/cli-linux-x64-gnu/`, so we cannot patch
+# the walker ourselves. The supported fix is to add this file
+# (Tauri CLI looks for `.taurignore` in every directory it walks
+# and applies the patterns in addition to the built-in defaults).
+#
+# Syntax: gitignore-compatible (the Tauri CLI uses the `ignore`
+# crate, which supports the same patterns as `.gitignore`).
+
+# Build artefacts — by far the largest source of FD pressure.
+# `target/` holds every compiled `.rmeta`, `.rlib`, and intermediate
+# Cargo output for every workspace member; a release build easily
+# pushes past 20k files. Tauri never needs to read anything from
+# `target/` after `cargo build` finishes.
+target/
+**/target/
+
+# Node modules — never needed at build time; the frontend is already
+# bundled into `dist/` by Vite before Tauri sees it.
+node_modules/
+**/node_modules/
+
+# Vite / frontend build output. Tauri reads `dist/` via the
+# `frontendDist` config option directly, not by walking.
+dist/
+
+# Crash dumps (Tauri/webview segfaults on this OS occasionally).
+coredump/
+
+# README / docs screenshots.
+images/
+
+# Editor / OS metadata.
+.DS_Store
+Thumbs.db
+
+# Local agent scratch (Plannotator sessions etc.).
+.pi/
+
+# Notes from past sessions.
+notes/
+*.log

@@ -162,6 +162,19 @@ impl Storage {
         Ok(())
     }
 
+    /// Physically remove a download row from the `downloads` table.
+    ///
+    /// Used by `DownloadManager::remove()` when the user explicitly
+    /// deletes an entry — without this, the row would reappear on the
+    /// next launch via `load_active()`. The corresponding `history`
+    /// row is left in place (it's an append-only log of completed
+    /// downloads, useful for re-downloading later).
+    pub fn delete_download(&self, id: &str) -> Result<(), StorageError> {
+        let conn = self.inner.lock().unwrap();
+        conn.execute("DELETE FROM downloads WHERE id=?1", params![id])?;
+        Ok(())
+    }
+
     pub fn add_history(
         &self,
         download_id: Option<&str>,

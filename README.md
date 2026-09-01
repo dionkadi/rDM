@@ -1,172 +1,151 @@
-# DM — a cross-platform download manager (IDM equivalent)
+# DM — Download Manager
 
-**DM** is a desktop download manager that accelerates downloads by splitting a file into multiple
-parallel HTTP `Range` connections (segmented downloading), with pause/resume, queueing, speed
-limiting, categories, a live speed graph, checksum verification, proxy support, clipboard capture,
-drag-and-drop, a system tray, a timed scheduler, and browser extensions with a video grabber.
+A cross-platform, IDM-style download manager built with **Tauri 2 (Rust + WebView)** and a **Svelte 4 + TypeScript** SPA frontend. Resumable, segmented, rate-limited downloads with a native browser-extension bridge.
 
-It is built with **[Tauri 2](https://v2.tauri.app/)** (Rust backend + Svelte/Vite **web UI**) so a
-single codebase targets Linux, macOS, and Windows.
+## Highlights
 
----
+- **Segmented / resumable downloads** — HTTP Range requests, up to N connections per file, automatic resume across restarts.
+- **Global + per-download speed caps** — token-bucket rate limiting (more-restrictive bucket wins).
+- **Schedule window** — park downloads outside the configured time range; auto-promote when it opens.
+- **Categories** — auto-route by extension (Videos, Music, Documents, …) into per-category folders.
+- **Browser integration** — Chromium MV3 extension grabs media URLs from pages and forwards them to DM.
+- **Native messaging shim** — separate `dm-native-host` binary, no Tauri runtime required.
+- **System tray** with show / hide / quit; clipboard URL monitor; drag-and-drop.
+- **SQLite persistence** (bundled, no system dep) of downloads, history, categories, settings.
+- **Cross-platform** — Linux, macOS, Windows. A 23 MB stripped Linux binary linking to `webkit2gtk-4.1`.
 
-## Features
-
-| Feature | Notes |
-| --- | --- |
-| **Segmented downloads** | Splits a file into parallel `Range` GETs; falls back to a single connection when the server lacks `Accept-Ranges`. |
-| **Pause / resume** | Resume offset computed from completed chunk bytes; persists across app restarts via SQLite. |
-| **Queueing + concurrency** | Global max concurrent downloads and per-download connection count (`tokio::sync::Semaphore`). |
-| **Speed limiting** | Token-bucket limiter for global and per-download caps. |
-| **Categories** | Downloads can be tagged with a category; auto-routed storage path by extension. |
-| **Live speed graph** | `uplot` chart in the UI, sampling aggregate in-flight speed once per second. |
-| **Checksum verification** | Streamed `sha2` hash; verifies against an optional provided hash. |
-| **Proxy support** | Global or per-download HTTP/HTTPS/SOCKS proxy via `reqwest`. |
-| **Clipboard capture** | Monitors the clipboard for URLs and offers to add them. |
-| **Drag & drop** | Drop `text/uri-list` / `text/plain` URLs onto the window to enqueue. |
-| **System tray** | Minimize/close-to-tray with a tray menu. |
-| **Scheduler** | Timed start/stop window; downloads outside the window are parked as `Scheduled`. |
-| **Browser extensions + video grabber** | MV3 extension + a native-messaging host binary that captures page media URLs (`<video>`/`<source>`/`.m3u8`/DASH) and forwards them to the app. |
-
----
-
-## Architecture
+## Architecture at a glance
 
 ```
- Browser / Clipboard / Tray  ──►  Svelte + Vite web UI (Tauri webview)
-                                       │  invoke()  /  listen("download-event")
-                                       ▼
-                          Tauri backend (Rust, tokio)  —  DownloadManager (managed state)
-   ├─ commands.rs     add / pause / resume / cancel / set_global_speed_limit / list / settings
-   ├─ events.rs       emit("download-event"): added|progress|statusChanged|completed|error|removed
-   ├─ tray.rs         system tray + close/minimize-to-tray
-   ├─ native_host.rs  localhost TCP listener (port 9157) for the browser-extension host
-   └─ (wires engine scheduler loop + notification plugin)
-                                       │
-                       crates/engine   (zero Tauri dependency — headless-testable)
-   ├─ manager.rs   task map + command channel + schedule loop
-   ├─ task.rs      per-file state machine + resume-offset plan
-   ├─ chunk.rs     one Range GET → seek-write at file offset
-   ├─ scheduler.rs semaphore: global + per-download concurrency
-   ├─ limiter.rs   token bucket: global + per-download speed cap
-   ├─ protocol.rs  HEAD probe, Accept-Ranges/length, range negotiation
-   ├─ storage.rs   rusqlite (bundled): downloads, chunks, history, categories, settings
-   ├─ config.rs    settings + categories (serde + directories)
-   └─ model.rs     Download / Chunk / Status / Settings (serde, camelCase)
-
-   crates/native-host  —  standalone binary (no Tauri/webview): native-messaging frames
-                          ↔ localhost socket (port 9157) to the running app
+                  ┌─────────────────────┐
+   Browser ─────► │  MV3 extension      │
+   (media URLs)   │  (background.js)    │
+                  └──────────┬──────────┘
+                             │ chrome.runtime.connectNative
+                             ▼
+                  ┌─────────────────────┐
+                  │ dm-native-host bin  │  stdio ↔ 4-byte-LE frames
+                  │ (extract_media_urls │
+                  │  → forward_url)     │
+                  └──────────┬──────────┘
+                             │ TCP 127.0.0.1:9157  (newline-JSON)
+                             ▼
+   ┌──────────────────────────────────────────────┐
+   │ src-tauri (Tauri 2 shell)                    │
+   │   • commands.rs → DownloadManager            │
+   │   • events.rs   → "download-event" channel   │
+   │   • tray.rs     → system tray (best-effort)  │
+   └──────────────────────┬───────────────────────┘
+                          │ uses
+                          ▼
+   ┌──────────────────────────────────────────────┐
+   │ crates/engine (UI-agnostic, no Tauri)        │
+   │  DownloadManager / Scheduler / Limiter /     │
+   │  Control / Protocol / Chunk / Task /         │
+   │  Storage (rusqlite bundled) / Config         │
+   └──────────────────────────────────────────────┘
+                          ▲
+                          │ Tauri events (camelCase JSON)
+                          │
+   ┌──────────────────────────────────────────────┐
+   │ src/  Svelte 4 + TS + Vite SPA               │
+   │   App.svelte → stores → components           │
+   │   (lib/api.ts wraps invoke("...") commands)  │
+   └──────────────────────────────────────────────┘
 ```
 
-The **engine** (`crates/engine`) has **no Tauri dependency**, so it can be unit- and
-integration-tested headlessly. The **native-messaging host** (`crates/native-host`) is also a
-standalone binary (no Tauri/webview), so it compiles and tests even where the webview toolchain is
-unavailable.
+For a deep dive (engine internals, event shape, build gotchas, conventions), see **[`AGENTS.md`](AGENTS.md)**.
 
----
+## Quick start
 
-## Repository layout
+### Prerequisites
+
+- **Rust** stable (1.74+ recommended; edition 2021).
+- **Node.js 18+** and **npm**.
+- **Tauri 2 system deps** for your platform — see <https://tauri.app/start/prerequisites/>.
+- **On Fedora 40+**: nothing extra; the build script handles the missing `libappindicator3` / `ayatana-appindicator3` `.pc` files via a local shim.
+
+### Run the frontend alone (demo mode, no Rust)
+
+```bash
+npm install
+npm run dev      # http://localhost:5173
+```
+
+The UI ships with a **demo mode** that simulates progress locally so you can exercise the layout, filters, command palette, and settings without launching the engine.
+
+### Run the full app
+
+```bash
+# Linux (Fedora 40+ and similar)
+./build-with-shim.sh
+
+# Stock Debian/Ubuntu or macOS/Windows
+npm run tauri dev
+```
+
+The first build is slow (compiles Tauri's webview bindings + the engine + the native host). Subsequent builds are incremental.
+
+### Run tests
+
+```bash
+cargo test -p dm-engine   # 22 unit + integration tests
+```
+
+The integration suite spins up an in-process HTTP/1.1 server that supports `Range` requests and runs the real `DownloadManager` end-to-end.
+
+### Build a release binary
+
+```bash
+./build-with-shim.sh                   # Linux
+# or: npm run tauri build              # Other platforms
+
+ls target/release/dm-tauri             # 23 MB stripped
+```
+
+The Cargo workspace at the repo root unifies `target/`, so the binary lives at **`target/release/dm-tauri`** (not `src-tauri/target/...`).
+
+## Browser extension
+
+`browser-extension/` is a Manifest V3 Chromium extension with:
+
+- a content script that scrapes `<video>`, `<source>`, `<audio>`, and `<a>` tags for media URLs plus HLS (`*.m3u8`) and DASH (`manifest`) hints,
+- a service worker that connects to the `com.app.dm.native` host and forwards URLs,
+- a popup with **Grab page media** and **Open DM** buttons.
+
+To install:
+
+1. Build the native host: `cargo build --release -p dm-native-host`.
+2. Edit `browser-extension/com.app.dm.native.json` to point `"path"` at the absolute path of the produced binary, and replace `REPLACE_WITH_EXTENSION_ID` with the extension's id once loaded into Chrome.
+3. Load the extension unpacked from `browser-extension/`.
+
+See the [native messaging docs](https://developer.chrome.com/docs/apps/nativeMessaging/) for the per-platform manifest install location.
+
+## Project layout
 
 ```
 DM/
-  Cargo.toml                     # workspace: members = [crates/engine, crates/native-host, src-tauri]
-  crates/
-    engine/                     # core download engine (no Tauri dep) — lib + tests/integration.rs
-    native-host/                # Chrome native-messaging host binary (stdin/stdout ↔ localhost)
-  src-tauri/                    # Tauri v2 app: Cargo.toml, tauri.conf.json, build.rs,
-                                #   capabilities/default.json, icons/, src/{main,commands,events,
-                                #   tray,native_host}.rs
-  browser-extension/            # MV3 extension: manifest.json, background.js, content.js,
-                                #   popup.html, popup.js, com.app.dm.native.json (registration template)
-  src/                          # frontend: main.ts, App.svelte, app.css,
-                                #   lib/{types.ts, api.ts, SpeedGraph.svelte}, vite-env.d.ts
-  index.html  package.json  vite.config.ts  svelte.config.js  tsconfig*.json
-  PLAN.md                       # approved build plan (milestones M0–M7)
+├── AGENTS.md                  ← agent/human working guide
+├── UI_DESIGN_PLAN.md          ← IDM-parity UX target (read before UX work)
+├── Cargo.toml                 ← Cargo workspace
+├── package.json               ← Svelte + Vite frontend
+├── build-with-shim.sh         ← Tauri build wrapper (Fedora pkg-config shim)
+├── src/                       ← Svelte frontend (App.svelte, lib/{api,types,stores,…})
+├── src-tauri/                 ← Tauri shell (commands, events, tray, native-host listener)
+├── crates/engine/             ← UI-agnostic core: manager, scheduler, limiter, chunk, storage…
+├── crates/native-host/        ← stdio native-messaging shim
+├── browser-extension/         ← MV3 Chromium extension
+├── .pkgconfig-shim/           ← Fedora 40+ libappindicator .pc shims
+└── notes/session-logs/        ← Free-form per-session notes
 ```
 
----
+## Contributing
 
-## Prerequisites
-
-- **Rust** toolchain (edition 2021) — `cargo`, `rustc`.
-- **Node.js** 18+ and **npm**.
-- **Tauri 2 CLI**: `npm install -g @tauri-apps/cli` (or use `npm run tauri ...`).
-- **Platform webview dependencies** (required only for `tauri dev` / `tauri build`):
-  - Linux: `webkit2gtk-4.1`, `libsoup-3.0`, `libjavascriptcoregtk`, `build-essential`, `pkg-config`, `librsvg2-dev`, etc.
-  - macOS: Xcode Command Line Tools.
-  - Windows: WebView2 (preinstalled on Win11; the Tauri VS build tools otherwise).
-
-> The sandbox used to develop this repo did **not** have the webview toolchain, so the Tauri binary
-> (`tauri dev` / `tauri build`) could not be executed there. The frontend, engine, and native-host
-> were still fully build- and test-verified (see below).
-
----
-
-## Build & run
-
-```bash
-# 1. Frontend dependencies
-npm install
-
-# 2. Frontend dev server (Vite) — for UI work without the webview
-npm run dev
-
-# 3. Full desktop app (requires webview deps on the host)
-npm run tauri dev        # dev with hot-reload
-npm run tauri build      # produce a platform bundle
-
-# Frontend type-check / production build (no webview needed)
-npm run check            # svelte-check: 0 errors / 0 warnings
-npm run build            # production build into dist/
-
-# Engine + native-host tests (no webview needed)
-cargo test -p dm-engine        # 19 unit + 3 integration tests
-cargo test -p dm-native-host   # 3 tests (native-messaging frame + media extraction)
-```
-
-### Browser extension + video grabber
-
-1. Build the native host binary: `cargo build -p dm-native-host` (release: `cargo build -p dm-native-host --release`).
-2. Load `browser-extension/` as an unpacked **MV3** extension (Chrome/Edge: `chrome://extensions` →
-   Developer mode → Load unpacked; Firefox: temporary add-on).
-3. Register native messaging. Fill in `browser-extension/com.app.dm.native.json`:
-   - `path` → absolute path to the `dm-native-host` binary.
-   - `allowed_origins` → `chrome-extension://<YOUR_EXTENSION_ID>/` (copy the ID from `chrome://extensions`).
-   Install that manifest to the OS location for `com.app.dm.native`:
-   - Linux: `~/.config/google-chrome/NativeMessagingHosts/` (or the Chromium/Brave equivalent).
-   - macOS: `~/Library/Application Support/Google/Chrome/NativeMessagingHosts/`.
-   - Windows: registry `HKCU\Software\Google\Chrome\NativeMessagingHosts\com.app.dm.native` → path to JSON.
-4. Start DM. The extension captures media URLs on pages and forwards them to the app over
-   `127.0.0.1:9157`; the app-side listener (`src-tauri/src/native_host.rs`) enqueues them like a
-   normal `add_download`.
-
-> The video grabber is **heuristic** (detects page `<video>`/`<source>` elements and `.m3u8`/`.mpd`
-> links). Site-specific HLS/DASH manifest resolution is out of scope for v1.
-
----
-
-## Verification status
-
-| Check | Command | Result |
-| --- | --- | --- |
-| Engine unit + integration tests | `cargo test -p dm-engine` | ✅ 22 passed |
-| Native-messaging host tests | `cargo test -p dm-native-host` | ✅ 3 passed |
-| Frontend type-check | `npm run check` | ✅ 0 errors / 0 warnings |
-| Frontend production build | `npm run build` | ✅ succeeds (uplot bundled) |
-| Tauri desktop app (`tauri dev`/`build`) | `npm run tauri dev` | ⚠️ requires webview host (not run in sandbox) |
-
----
-
-## Roadmap / known gaps
-
-- **Autostart plugin** (`tauri-plugin-autostart`) is listed in the plan but not yet enabled.
-- **End-to-end smoke test** with `tauri build` per OS (Linux/macOS/Windows) — run on a webview host.
-- **Browser-extension packaging** (zip/crx) and per-OS native-messaging registration docs.
-- Richer category management / checksum-entry / proxy-entry panels in the UI (the engine already
-  supports checksum + proxy; the UI panels are simplified).
-
----
+1. Read [`AGENTS.md`](AGENTS.md) for architecture, conventions, and gotchas.
+2. UX work: read [`UI_DESIGN_PLAN.md`](UI_DESIGN_PLAN.md) first.
+3. Engine changes: update the integration test in `crates/engine/tests/integration.rs` and mirror any new fields end-to-end (Rust model → storage → Tauri events → TS types → UI).
+5. Run `npm run check` (must be 0 errors / 0 warnings) and `cargo test -p dm-engine` before pushing.
 
 ## License
 
-TBD. (Specify a license before distributing.)
+No license file is present yet. Until one is added, treat this repository as **all rights reserved** by its authors.

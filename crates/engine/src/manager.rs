@@ -26,6 +26,34 @@ pub enum DownloadEvent {
 /// Callback invoked for every event (the Tauri layer emits these to the webview).
 pub type EventSink = Arc<dyn Fn(DownloadEvent) + Send + Sync>;
 
+/// Type of the async spawner the engine uses to launch download tasks and the
+/// schedule loop. Takes a boxed future and is expected to drive it on whatever
+/// async runtime the host provides. The Tauri shell passes its own runtime
+/// handle so the engine never has to know about Tauri and never has to assume
+/// it is being called from inside a Tokio context.
+pub type Spawner = Arc<dyn Fn(BoxFuture<'static, ()>) + Send + Sync>;
+
+/// Convenience alias for boxed `'static` futures. Equivalent to the standard
+/// `std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>`.
+pub type BoxFuture<'a, T = ()> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+fn default_spawner() -> Spawner {
+    // If we are already inside a Tokio runtime, hand the future off to it.
+    // If we are not, fall back to `tokio::spawn` which will panic — but
+    // that is the same behaviour the engine had before, and the Tauri shell
+    // is expected to provide a real spawner before the first download.
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        Arc::new(move |fut| {
+            handle.spawn(fut);
+        })
+    } else {
+        Arc::new(|fut| {
+            tokio::spawn(fut);
+        })
+    }
+}
+
 /// Shared, immutable-per-run context handed to each download task.
 #[derive(Clone)]
 pub struct RunContext {
@@ -68,6 +96,7 @@ struct Inner {
     tasks: Mutex<HashMap<String, TaskEntry>>,
     ctx: Mutex<Arc<RunContext>>,
     storage: Storage,
+    spawn: Spawner,
 }
 
 impl DownloadManager {
@@ -79,6 +108,18 @@ impl DownloadManager {
 
     /// Construct from an explicit settings value.
     pub fn with_settings(storage: Storage, settings: Settings) -> Self {
+        Self::with_settings_and_spawner(storage, settings, default_spawner())
+    }
+
+    /// Construct from an explicit settings value AND an async spawner. The Tauri
+    /// shell uses this to inject `tauri::async_runtime::spawn` so that commands
+    /// dispatched on the IPC thread can safely launch download tasks without
+    /// requiring a Tokio runtime to be active on the calling thread.
+    pub fn with_settings_and_spawner(
+        storage: Storage,
+        settings: Settings,
+        spawn: Spawner,
+    ) -> Self {
         let scheduler = DownloadScheduler::new(
             settings.max_concurrent_downloads,
             settings.connections_per_download,
@@ -89,7 +130,7 @@ impl DownloadManager {
             global_limiter,
             storage: storage.clone(),
             max_connections: settings.connections_per_download,
-            global_proxy: settings.proxy.clone(),
+            global_proxy: settings.effective_proxy_url(),
             event_sink: Arc::new(|_| {}),
         });
         let inner = Inner {
@@ -97,6 +138,7 @@ impl DownloadManager {
             tasks: Mutex::new(HashMap::new()),
             ctx: Mutex::new(ctx),
             storage,
+            spawn,
         };
         DownloadManager {
             inner: Arc::new(inner),
@@ -197,7 +239,8 @@ impl DownloadManager {
     /// reopens. Call once after `start`.
     pub fn run_schedule_loop(&self) {
         let mgr = self.clone();
-        tokio::spawn(async move {
+        let spawn = Arc::clone(&self.inner.spawn);
+        let fut: BoxFuture<'static, ()> = Box::pin(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
             let _ = ticker.tick().await; // discard the immediate first tick
             let mut was_open = mgr.in_schedule_window();
@@ -259,6 +302,7 @@ impl DownloadManager {
                 was_open = open;
             }
         });
+        spawn(fut);
     }
 
     /// Spawn the run task for a download if it is not already running.
@@ -274,12 +318,15 @@ impl DownloadManager {
         let state = entry.state.clone();
         let inner = self.inner.clone();
         let ctx = self.inner.ctx.lock().unwrap().clone();
-        tokio::spawn(async move {
+        let spawn = Arc::clone(&self.inner.spawn);
+        let task_id = id.clone();
+        let fut: BoxFuture<'static, ()> = Box::pin(async move {
             run_download(ctx, state).await;
-            if let Some(e) = inner.tasks.lock().unwrap().get(&id) {
+            if let Some(e) = inner.tasks.lock().unwrap().get(&task_id) {
                 e.running.store(false, Ordering::SeqCst);
             }
         });
+        spawn(fut);
     }
 
     pub fn pause(&self, id: &str) {
@@ -288,6 +335,10 @@ impl DownloadManager {
             let mut d = e.state.download.lock().unwrap();
             if d.status == DownloadStatus::Downloading || d.status == DownloadStatus::Queued {
                 d.status = DownloadStatus::Paused;
+                // Clear any stale error from a previous failed attempt so
+                // the user isn't shown a 403 / connection-refused message
+                // for a download they just paused manually.
+                d.error = None;
                 let _ = self.inner.storage.save_download(&d);
                 self.emit(DownloadEvent::StatusChanged(d.clone()));
             }
@@ -300,6 +351,9 @@ impl DownloadManager {
             let mut d = e.state.download.lock().unwrap();
             if d.status == DownloadStatus::Paused {
                 d.status = DownloadStatus::Queued;
+                // Same rationale as `pause`: starting a fresh attempt
+                // invalidates the previous failure's error message.
+                d.error = None;
                 let _ = self.inner.storage.save_download(&d);
                 self.emit(DownloadEvent::StatusChanged(d.clone()));
             }
@@ -319,8 +373,15 @@ impl DownloadManager {
     }
 
     pub fn remove(&self, id: &str) {
+        // Stop any in-flight workers, then drop the in-memory entry.
+        // We *also* delete the SQLite row, otherwise the next launch's
+        // `load_active()` would re-create the task from disk — making
+        // the remove action not persist across restarts.
         self.cancel(id);
         self.inner.tasks.lock().unwrap().remove(id);
+        if let Err(e) = self.inner.storage.delete_download(id) {
+            log::warn!("failed to delete download {id} from storage: {e}");
+        }
         self.emit(DownloadEvent::Removed(id.to_string()));
     }
 
@@ -365,8 +426,29 @@ impl DownloadManager {
         ctx.global_limiter.set_global_rate(settings.speed_limit_global.unwrap_or(0));
         // Rebuild context with new proxy/connections.
         let mut new_ctx = (**ctx).clone();
-        new_ctx.global_proxy = settings.proxy.clone();
+        new_ctx.global_proxy = settings.effective_proxy_url();
         new_ctx.max_connections = settings.connections_per_download;
+        drop(ctx);
+        *self.inner.ctx.lock().unwrap() = Arc::new(new_ctx);
+    }
+
+    /// Update only the global proxy configuration (mode + manual URL) without
+    /// touching the rest of the settings. Cheaper than `update_settings` when
+    /// the UI just toggled the proxy picker.
+    pub fn set_global_proxy(&self, mode: crate::model::ProxyMode, url: Option<String>) {
+        {
+            let mut s = self.inner.settings.write().unwrap();
+            s.proxy_mode = mode;
+            // Keep the manual URL even if mode != Manual so toggling back is
+            // a one-click action.
+            s.proxy = url.filter(|u| !u.is_empty());
+            let _ = self.inner.storage.save_settings(&s);
+        }
+        let ctx = self.inner.ctx.lock().unwrap();
+        let mut new_ctx = (**ctx).clone();
+        let s = self.inner.settings.read().unwrap();
+        new_ctx.global_proxy = s.effective_proxy_url();
+        drop(s);
         drop(ctx);
         *self.inner.ctx.lock().unwrap() = Arc::new(new_ctx);
     }
@@ -467,5 +549,82 @@ mod tests {
         let mgr = DownloadManager::new(storage);
         mgr.set_global_speed_limit(Some(1234));
         assert_eq!(mgr.settings().speed_limit_global, Some(1234));
+    }
+
+    /// Pausing a download should clear any stale error message from a
+    /// previous failed attempt so the UI doesn't keep showing "HTTP 403"
+    /// next to a row the user just paused manually. The same applies to
+    /// resuming — starting a fresh attempt invalidates the old failure.
+    #[tokio::test]
+    async fn pause_clears_stale_error() {
+        let storage = Storage::open_memory().unwrap();
+        let mgr = DownloadManager::new(storage);
+        mgr.add(new_download("a", "https://example.com/a.bin"));
+        // Inject a stale error and force the status to Downloading so the
+        // pause() branch will fire (mirrors what the engine would do on
+        // a real failed attempt before the user clicks Pause).
+        {
+            let entry = mgr.inner.tasks.lock().unwrap().get("a").cloned().unwrap();
+            let mut d = entry.state.download.lock().unwrap();
+            d.status = DownloadStatus::Downloading;
+            d.error = Some("HTTP 403 Forbidden".into());
+        }
+        mgr.pause("a");
+        let after = mgr.get("a").unwrap();
+        assert_eq!(after.status, DownloadStatus::Paused);
+        assert!(after.error.is_none(), "pause() must clear the error field, got {:?}", after.error);
+    }
+
+    #[tokio::test]
+    async fn resume_clears_stale_error() {
+        let storage = Storage::open_memory().unwrap();
+        let mgr = DownloadManager::new(storage);
+        mgr.add(new_download("a", "https://example.com/a.bin"));
+        // Force into Paused with a stale error.
+        {
+            let entry = mgr.inner.tasks.lock().unwrap().get("a").cloned().unwrap();
+            let mut d = entry.state.download.lock().unwrap();
+            d.status = DownloadStatus::Paused;
+            d.error = Some("connection refused".into());
+        }
+        mgr.resume("a");
+        let after = mgr.get("a").unwrap();
+        // Status is back to Queued (the engine will try to spawn a real
+        // download; harmless in a test).
+        assert_eq!(after.status, DownloadStatus::Queued);
+        assert!(after.error.is_none(), "resume() must clear the error field, got {:?}", after.error);
+    }
+
+    /// Regression test: `remove()` must delete the SQLite row, not just
+    /// drop the in-memory entry. Otherwise the download would reappear
+    /// on the next launch via `load_active()` — which is exactly the
+    /// "remove doesn't persist" bug we hit.
+    ///
+    /// We simulate the restart by opening a fresh `Storage` against the
+    /// same in-memory database (`open_in_memory` returns a new
+    /// connection each time, so the underlying SQLite file is shared
+    /// when the test uses `tempfile`-backed paths; here we keep it
+    /// simple by reusing the same `Storage` handle and just calling
+    /// `load_active()` after the remove, which is what `start()` does).
+    #[tokio::test]
+    async fn remove_persists_across_reload() {
+        let storage = Storage::open_memory().unwrap();
+        let mgr = DownloadManager::new(storage);
+        mgr.add(new_download("a", "https://example.com/a.bin"));
+        mgr.add(new_download("b", "https://example.com/b.bin"));
+        assert_eq!(mgr.list().len(), 2);
+
+        mgr.remove("a");
+
+        // In-memory: removed.
+        assert_eq!(mgr.list().len(), 1);
+        assert_eq!(mgr.list()[0].id, "b");
+
+        // Simulate restart: the engine's `start()` calls
+        // `load_active()`, which reads from SQLite. The removed
+        // download must NOT come back.
+        let active = mgr.inner.storage.load_active().unwrap();
+        assert_eq!(active.len(), 1, "removed download came back from storage: {active:?}");
+        assert_eq!(active[0].id, "b");
     }
 }

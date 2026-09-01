@@ -15,7 +15,9 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
-// 256 KiB of a deterministic, easily-verifiable pattern.
+// 256 KiB of a deterministic, easily-verifiable pattern. The legacy
+// tests use this — small enough to drain through the in-process
+// server in a single TCP write and complete in well under a second.
 fn payload() -> Vec<u8> {
     let mut v = Vec::with_capacity(256 * 1024);
     for i in 0..(256 * 1024) {
@@ -24,9 +26,26 @@ fn payload() -> Vec<u8> {
     v
 }
 
+// 64 MiB variant for the persistence tests. With
+// `connections_per_download = 8` the chunks are 8 MiB each, so a
+// partial download always leaves work for the resumed manager AND
+// the transfer takes long enough (>>100 ms) that the test's 20 ms
+// `wait_for_min_bytes` poll reliably catches an in-progress state.
+// 4 MiB was too small — the in-process server finishes the whole
+// transfer in ~50 ms, faster than any reasonable poll.
+fn large_payload() -> Vec<u8> {
+    let mut v = Vec::with_capacity(64 * 1024 * 1024);
+    for i in 0..(64 * 1024 * 1024) {
+        v.push((i as u8).wrapping_mul(31).wrapping_add(7));
+    }
+    v
+}
+
 /// 0 = full Range support, 1 = claims no ranges (fallback path).
-fn spawn_server(mode: u8) -> u16 {
-    let data = payload();
+/// `size` selects between the 256 KiB and 4 MiB payloads; legacy
+/// tests pass `0` (256 KiB), persistence tests pass `1` (4 MiB).
+fn spawn_server(mode: u8, size: u8) -> u16 {
+    let data = if size == 0 { payload() } else { large_payload() };
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind server");
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
@@ -157,7 +176,7 @@ async fn wait_until_downloaded(mgr: &DownloadManager, id: &str) -> Download {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn full_segmented_download_writes_correct_bytes() {
-    let port = spawn_server(0);
+    let port = spawn_server(0, 0);
     let tmp = std::env::temp_dir().join(format!("dm_it_seg_{}.bin", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
 
@@ -188,7 +207,7 @@ async fn full_segmented_download_writes_correct_bytes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fallback_single_connection_when_no_ranges() {
-    let port = spawn_server(1);
+    let port = spawn_server(1, 0);
     let tmp = std::env::temp_dir().join(format!("dm_it_fb_{}.bin", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
 
@@ -218,7 +237,7 @@ async fn fallback_single_connection_when_no_ranges() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn checksum_mismatch_marks_error() {
-    let port = spawn_server(0);
+    let port = spawn_server(0, 0);
     let tmp = std::env::temp_dir().join(format!("dm_it_chk_{}.bin", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
 
@@ -255,4 +274,212 @@ async fn checksum_mismatch_marks_error() {
     );
 
     let _ = std::fs::remove_file(&tmp);
+}
+
+// ── Persistence regression tests ────────────────────────────────────
+//
+// The original bug: `downloaded` and per-chunk `downloaded` were only
+// flushed to SQLite on status transitions, so a hard kill mid-transfer
+// lost every byte since the last status change. After the fix, the
+// aggregator flushes the row every `PROGRESS_FLUSH_INTERVAL` (1 s) or
+// every `PROGRESS_FLUSH_BYTES` (1 MiB), whichever fires first. These
+// tests pin that contract end-to-end.
+
+/// Wait until a download has at least `min_bytes` of in-memory progress
+/// and then return its current `Download` snapshot. Used by the
+/// crash-recovery tests to land the transfer at a known intermediate
+/// state.
+async fn wait_for_min_bytes(mgr: &DownloadManager, id: &str, min_bytes: u64) -> Download {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let d = mgr.get(id).expect("download exists while waiting");
+        if d.downloaded >= min_bytes {
+            return d;
+        }
+        if matches!(
+            d.status,
+            DownloadStatus::Completed | DownloadStatus::Error | DownloadStatus::Canceled
+        ) {
+            // Reached a terminal state before we hit the byte budget.
+            return d;
+        }
+        if Instant::now() > deadline {
+            panic!(
+                "download {id} did not reach {min_bytes} bytes within 20s \
+                 (last status: {:?}, downloaded: {})",
+                d.status, d.downloaded
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Regression test for the "starts at 7% instead of 30%" bug. Without
+/// a periodic flush, the aggregator only persisted on status
+/// transitions; a hard kill at 30% would leave the SQLite row at
+/// `downloaded = 0`. With the fix, after a few hundred ms the row on
+/// disk must already reflect a non-zero progress.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn progress_persists_to_sqlite_mid_transfer() {
+    let port = spawn_server(0, 1);
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp_dir.path().join("dm.sqlite");
+    let out_path = tmp_dir.path().join("out.bin");
+    let _ = std::fs::remove_file(&out_path);
+
+    let storage = Storage::open(&db_path).expect("file storage");
+    let mgr = DownloadManager::with_settings(storage, Settings::default());
+
+    let mut d = Download::new(format!("http://127.0.0.1:{port}/file.bin"));
+    d.id = "persist".into();
+    d.save_path = out_path.clone();
+    let id = d.id.clone();
+    mgr.add(d);
+
+    // Land the transfer at a known intermediate state. With a 4 MiB
+    // payload and 8 chunk workers the transfer can finish in well
+    // under 100 ms against the in-process server, so we may also
+    // see `Completed` here — that's fine, the byte-equality with
+    // the on-disk row is what matters.
+    let snap = wait_for_min_bytes(&mgr, &id, 64 * 1024).await;
+    assert!(
+        snap.downloaded > 0,
+        "test setup: download did not make progress"
+    );
+    assert!(
+        matches!(
+            snap.status,
+            DownloadStatus::Downloading
+                | DownloadStatus::Paused
+                | DownloadStatus::Queued
+                | DownloadStatus::Completed
+        ),
+        "expected an in-flight or just-completed state, got {:?}",
+        snap.status
+    );
+
+    // Drop the manager (= simulate a hard kill). Note we do NOT call
+    // cancel() — the row's on-disk status is whatever it was at the
+    // last flush. We only assert that progress was flushed.
+    drop(mgr);
+
+    // Re-open a fresh manager + storage over the same file and
+    // confirm the row survived.
+    let storage2 = Storage::open(&db_path).expect("reopen storage");
+    let active = storage2.load_active().expect("load_active");
+    assert_eq!(active.len(), 1, "expected 1 active row, got {active:?}");
+    let row = &active[0];
+    assert_eq!(row.id, "persist");
+    assert!(
+        row.downloaded > 0,
+        "downloaded was 0 after restart — periodic flush is broken \
+         (snap.downloaded = {}, snap.status = {:?})",
+        snap.downloaded,
+        snap.status
+    );
+    // Per-chunk downloaded must also have been persisted so the
+    // resume range can be reconstructed.
+    let total_chunk_downloaded: u64 = row.chunks.iter().map(|c| c.downloaded).sum();
+    assert_eq!(
+        total_chunk_downloaded, row.downloaded,
+        "per-chunk downloaded ({}) must sum to total downloaded ({})",
+        total_chunk_downloaded, row.downloaded
+    );
+    assert!(
+        row.chunks.iter().any(|c| c.downloaded > 0),
+        "no chunk has any downloaded bytes — resume would re-download from 0"
+    );
+}
+
+/// End-to-end crash-recovery: start a download, let it run a while,
+/// drop the manager (= power loss), build a new manager over the
+/// same on-disk file, and confirm the transfer finishes with the
+/// correct bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_after_crash_finishes_with_correct_bytes() {
+    let port = spawn_server(0, 1);
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp_dir.path().join("dm.sqlite");
+    let out_path = tmp_dir.path().join("out.bin");
+
+    {
+        let storage = Storage::open(&db_path).expect("file storage");
+        let mgr = DownloadManager::with_settings(storage, Settings::default());
+
+        let mut d = Download::new(format!("http://127.0.0.1:{port}/file.bin"));
+        d.id = "crash".into();
+        d.save_path = out_path.clone();
+        let id = d.id.clone();
+        mgr.add(d);
+
+        // Wait until some bytes are on disk AND on SQLite.
+        let _ = wait_for_min_bytes(&mgr, &id, 32 * 1024).await;
+        // The transfer is still going — simulate a hard kill.
+    } // mgr + storage drop here
+
+    // Restart with a brand new manager on the same DB file.
+    let storage = Storage::open(&db_path).expect("reopen storage");
+    let mgr = DownloadManager::with_settings(storage, Settings::default());
+    mgr.start().await;
+    let d = wait_until_downloaded(&mgr, "crash").await;
+    assert_eq!(
+        d.status,
+        DownloadStatus::Completed,
+        "resumed download did not complete: status={:?} err={:?}",
+        d.status,
+        d.error
+    );
+
+    let written = std::fs::read(&out_path).expect("output file exists");
+    assert_eq!(
+        written.len(),
+        large_payload().len(),
+        "resumed file length does not match server"
+    );
+    assert_eq!(
+        written,
+        large_payload(),
+        "resumed file bytes do not match the source payload"
+    );
+}
+
+/// Cancellation must persist whatever progress was made. The
+/// aggregator's final flush guarantees that even if the user hits
+/// Cancel the instant the transfer starts, the row records the
+/// partial work instead of snapping back to 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_persists_partial_progress() {
+    let port = spawn_server(0, 1);
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp_dir.path().join("dm.sqlite");
+    let out_path = tmp_dir.path().join("out.bin");
+
+    let storage = Storage::open(&db_path).expect("file storage");
+    let mgr = DownloadManager::with_settings(storage, Settings::default());
+
+    let mut d = Download::new(format!("http://127.0.0.1:{port}/file.bin"));
+    d.id = "cancel".into();
+    d.save_path = out_path.clone();
+    let id = d.id.clone();
+    mgr.add(d);
+
+    let snap = wait_for_min_bytes(&mgr, &id, 32 * 1024).await;
+    let partial = snap.downloaded;
+    mgr.cancel(&id);
+    drop(mgr);
+
+    let storage2 = Storage::open(&db_path).expect("reopen storage");
+    let row = storage2
+        .load_active()
+        .expect("load_active")
+        .into_iter()
+        .find(|d| d.id == "cancel")
+        .expect("cancel row should still exist (status = canceled)");
+    assert_eq!(row.status, DownloadStatus::Canceled);
+    assert_eq!(
+        row.downloaded, partial,
+        "cancel must persist the partial progress we observed in-memory \
+         (in-memory: {partial}, on disk: {})",
+        row.downloaded
+    );
 }

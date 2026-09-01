@@ -1,9 +1,23 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
     <title>DM — Download Manager</title>
+    <script>
+      // Apply theme before paint to avoid a flash of wrong theme
+      (function () {
+        try {
+          var stored = localStorage.getItem("dm-theme");
+          var theme = stored === "light" || stored === "dark" ? stored
+            : stored === "system"
+              ? (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark")
+              : "dark";
+          document.documentElement.setAttribute("data-theme", theme);
+        } catch (e) { /* ignore */ }
+      })();
+    </script>
   </head>
   <body>
     <div id="app"></div>

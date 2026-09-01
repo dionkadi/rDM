@@ -10,6 +10,8 @@ export type DownloadStatus =
   | "canceled"
   | "scheduled";
 
+export type ProxyMode = "none" | "system" | "manual";
+
 export interface ChunkState {
   index: number;
   start: number;
@@ -55,7 +57,10 @@ export interface Settings {
   defaultDirectory: string;
   speedLimitGlobal: number | null;
   categories: Category[];
+  /** Manual proxy URL (used when `proxyMode === "manual"`). */
   proxy: string | null;
+  /** Proxy policy. `undefined` is tolerated for backward compat (old rows). */
+  proxyMode?: ProxyMode;
   clipboardMonitor: boolean;
   closeToTray: boolean;
   scheduleEnabled: boolean;
@@ -71,3 +76,17 @@ export type FrontendEvent =
   | { kind: "completed"; download: Download }
   | { kind: "error"; download: Download }
   | { kind: "removed"; download: { id: string } };
+
+/** Human-readable label for a proxy mode. */
+export const PROXY_MODE_LABEL: Record<ProxyMode, string> = {
+  none: "No proxy",
+  system: "System proxy",
+  manual: "Manual",
+};
+
+/** Short description for a proxy mode, used in tooltips and the picker. */
+export const PROXY_MODE_DESC: Record<ProxyMode, string> = {
+  none: "Always connect directly. Ignore the system environment.",
+  system: "Use the HTTP_PROXY / HTTPS_PROXY / NO_PROXY environment variables.",
+  manual: "Use a specific proxy URL. Supports http://, https://, socks5://.",
+};

@@ -48,7 +48,12 @@ pub struct ChunkState {
 
 impl ChunkState {
     /// Total bytes in the chunk's full range (end is inclusive).
+    /// Returns `u64::MAX` for the open-ended chunk (`end == u64::MAX`)
+    /// since the resource has no known total length.
     pub fn size(&self) -> u64 {
+        if self.end == u64::MAX {
+            return u64::MAX;
+        }
         self.end.saturating_sub(self.start) + 1
     }
 
@@ -151,6 +156,26 @@ pub struct Category {
     pub directory: PathBuf,
 }
 
+/// Proxy policy for downloads. Serialised as a camelCase string on the wire
+/// so the frontend can drive it directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProxyMode {
+    /// Direct connection — no proxy, regardless of environment variables.
+    None,
+    /// Honour the standard `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` env vars
+    /// (lower-case accepted on Windows). reqwest reads these directly.
+    System,
+    /// Use the `proxy` URL configured in settings (or per-download override).
+    Manual,
+}
+
+impl Default for ProxyMode {
+    fn default() -> Self {
+        ProxyMode::System
+    }
+}
+
 /// Global + per-download engine settings (persisted to disk).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -164,7 +189,14 @@ pub struct Settings {
     /// Global speed cap in bytes/sec (`None` = unlimited).
     pub speed_limit_global: Option<u64>,
     pub categories: Vec<Category>,
-    /// Global proxy (`None` = direct). Per-download override still wins.
+    /// Proxy policy (None / System / Manual). `None` here means "no proxy ever";
+    /// this is independent of the legacy `proxy: Option<String>` field, which
+    /// carries the Manual URL.
+    #[serde(default)]
+    pub proxy_mode: ProxyMode,
+    /// Manual proxy URL (`http://…`, `https://…`, `socks5://…`). Used when
+    /// `proxy_mode == Manual`, and also kept for backwards compatibility so
+    /// older clients / configs that only set this still get a proxy.
     pub proxy: Option<String>,
     pub clipboard_monitor: bool,
     pub close_to_tray: bool,
@@ -172,6 +204,23 @@ pub struct Settings {
     pub schedule_enabled: bool,
     pub schedule_start: (u8, u8),
     pub schedule_end: (u8, u8),
+}
+
+impl Settings {
+    /// Resolve the effective global proxy URL to use, given the policy and the
+    /// current process environment. `None` means "connect directly".
+    pub fn effective_proxy_url(&self) -> Option<String> {
+        match self.proxy_mode {
+            ProxyMode::None => None,
+            ProxyMode::System => std::env::var("HTTPS_PROXY")
+                .or_else(|_| std::env::var("https_proxy"))
+                .or_else(|_| std::env::var("HTTP_PROXY"))
+                .or_else(|_| std::env::var("http_proxy"))
+                .ok()
+                .filter(|s| !s.is_empty()),
+            ProxyMode::Manual => self.proxy.clone().filter(|s| !s.is_empty()),
+        }
+    }
 }
 
 impl Default for Settings {
@@ -185,6 +234,7 @@ impl Default for Settings {
             default_directory,
             speed_limit_global: None,
             categories: Vec::new(),
+            proxy_mode: ProxyMode::default(),
             proxy: None,
             clipboard_monitor: true,
             close_to_tray: true,
@@ -257,5 +307,144 @@ mod tests {
         assert!(s.in_schedule_window(at(5, 59)));
         assert!(!s.in_schedule_window(at(12, 0)));
         assert!(!s.in_schedule_window(at(21, 59)));
+    }
+
+    // ── Proxy resolution ───────────────────────────────────────
+
+    /// Tests that touch the process-wide proxy env vars must run under this
+    /// lock — Cargo runs tests in parallel and a sibling test clearing the
+    /// env between our `set_var` and our `assert_eq` causes spurious
+    /// failures.
+    static PROXY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_clean_env<F: FnOnce()>(f: F) {
+        // Snapshot and clear the proxy env vars so tests don't leak into each other.
+        let _guard = PROXY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = [
+            "HTTP_PROXY", "http_proxy",
+            "HTTPS_PROXY", "https_proxy",
+            "ALL_PROXY", "all_proxy",
+            "NO_PROXY", "no_proxy",
+        ];
+        let saved: Vec<(&str, Option<String>)> = keys
+            .iter()
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
+        for k in keys {
+            std::env::remove_var(k);
+        }
+        f();
+        for (k, v) in saved {
+            if let Some(v) = v {
+                std::env::set_var(k, v);
+            } else {
+                std::env::remove_var(k);
+            }
+        }
+    }
+
+    #[test]
+    fn proxy_mode_none_never_returns_a_url() {
+        with_clean_env(|| {
+            std::env::set_var("HTTPS_PROXY", "http://from-env:8080");
+            let mut s = Settings::default();
+            s.proxy_mode = ProxyMode::None;
+            s.proxy = Some("http://manual:3128".into());
+            assert!(s.effective_proxy_url().is_none());
+        });
+    }
+
+    #[test]
+    fn proxy_mode_system_reads_https_proxy_first() {
+        with_clean_env(|| {
+            std::env::set_var("HTTP_PROXY", "http://from-env-http:8080");
+            std::env::set_var("HTTPS_PROXY", "http://from-env-https:8443");
+            let s = Settings {
+                proxy_mode: ProxyMode::System,
+                ..Settings::default()
+            };
+            assert_eq!(
+                s.effective_proxy_url().as_deref(),
+                Some("http://from-env-https:8443")
+            );
+        });
+    }
+
+    #[test]
+    fn proxy_mode_system_falls_back_to_http_proxy() {
+        with_clean_env(|| {
+            std::env::set_var("HTTP_PROXY", "http://from-env-http:8080");
+            let s = Settings {
+                proxy_mode: ProxyMode::System,
+                ..Settings::default()
+            };
+            assert_eq!(
+                s.effective_proxy_url().as_deref(),
+                Some("http://from-env-http:8080")
+            );
+        });
+    }
+
+    #[test]
+    fn proxy_mode_system_no_env_means_direct() {
+        with_clean_env(|| {
+            let s = Settings {
+                proxy_mode: ProxyMode::System,
+                ..Settings::default()
+            };
+            assert!(s.effective_proxy_url().is_none());
+        });
+    }
+
+    #[test]
+    fn proxy_mode_manual_uses_settings_url() {
+        let mut s = Settings::default();
+        s.proxy_mode = ProxyMode::Manual;
+        s.proxy = Some("socks5://localhost:1080".into());
+        assert_eq!(
+            s.effective_proxy_url().as_deref(),
+            Some("socks5://localhost:1080")
+        );
+    }
+
+    #[test]
+    fn proxy_mode_manual_with_empty_url_falls_back_to_direct() {
+        let mut s = Settings::default();
+        s.proxy_mode = ProxyMode::Manual;
+        s.proxy = Some("".into());
+        assert!(s.effective_proxy_url().is_none());
+    }
+
+    #[test]
+    fn settings_roundtrip_preserves_proxy_mode() {
+        let mut s = Settings::default();
+        s.proxy_mode = ProxyMode::Manual;
+        s.proxy = Some("http://manual:3128".into());
+        let json = serde_json::to_string(&s).unwrap();
+        // camelCase on the wire
+        assert!(json.contains("\"proxyMode\":\"manual\""));
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.proxy_mode, ProxyMode::Manual);
+        assert_eq!(back.proxy.as_deref(), Some("http://manual:3128"));
+    }
+
+    #[test]
+    fn settings_old_json_without_proxy_mode_defaults_to_system() {
+        // Simulate a row written by an older build (no `proxyMode` field).
+        let old = r#"{
+            "maxConcurrentDownloads": 3,
+            "connectionsPerDownload": 8,
+            "defaultDirectory": "/tmp",
+            "speedLimitGlobal": null,
+            "categories": [],
+            "proxy": null,
+            "clipboardMonitor": true,
+            "closeToTray": true,
+            "scheduleEnabled": false,
+            "scheduleStart": [0, 0],
+            "scheduleEnd": [23, 59]
+        }"#;
+        let s: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(s.proxy_mode, ProxyMode::System);
     }
 }

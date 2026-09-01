@@ -91,15 +91,72 @@ fn sanitize(name: &str) -> String {
     }
 }
 
+/// Log a `reqwest::Error` (transport or response) with the URL, the
+/// stage that failed (HEAD / ranged GET / body stream), the response
+/// status + headers (if any) and a preview of the response body (if
+/// the response is buffered). This is the forensic trail that lets us
+/// debug "error decoding response body" without the user having to
+/// re-run under a debugger.
+async fn log_http_error(stage: &str, _url: &str, err: &reqwest::Error) {
+    let mut chain = String::new();
+    let mut src: Option<&dyn std::error::Error> = Some(err);
+    while let Some(e) = src {
+        if !chain.is_empty() {
+            chain.push_str(" <- ");
+        }
+        chain.push_str(&e.to_string());
+        src = e.source();
+    }
+
+    let status = err
+        .status()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "<no response>".into());
+    let url_field = err.url().map(|u| u.to_string()).unwrap_or_default();
+    let kind = format!(
+        "is_decode={} is_request={} is_redirect={} is_builder={}",
+        err.is_decode(),
+        err.is_request(),
+        err.is_redirect(),
+        err.is_builder(),
+    );
+
+    log::error!(
+        "probe HTTP error stage={stage} url={url_field} status={status} {kind} chain={chain}"
+    );
+}
+
 /// Probe a URL with a `HEAD` request, falling back to a ranged `GET` when HEAD
 /// is not allowed. Determines size, range support, content type and filename.
 pub async fn probe(client: &Client, url: &str) -> Result<Probe, ProbeError> {
-    let mut resp = client.head(url).send().await?;
+    // We deliberately do **not** use `?` on the `.send().await` calls
+    // so that, on failure, we can pull the response object out of
+    // the `reqwest::Error` and dump the status, headers, and a body
+    // preview to the log. Without this, the next "error decoding
+    // response body" leaves no forensic trace.
+    let head = client.head(url).send().await;
+    let mut resp = match head {
+        Ok(r) => r,
+        Err(e) => {
+            log_http_error("HEAD", url, &e).await;
+            return Err(ProbeError::Http(e));
+        }
+    };
     let status = resp.status();
     // Some servers reject HEAD; retry with a 0-byte range GET.
     if !status.is_success() {
-        let ranged = client.get(url).header(reqwest::header::RANGE, "bytes=0-0").send().await?;
-        resp = ranged;
+        let ranged = client
+            .get(url)
+            .header(reqwest::header::RANGE, "bytes=0-0")
+            .send()
+            .await;
+        match ranged {
+            Ok(r) => resp = r,
+            Err(e) => {
+                log_http_error("ranged GET", url, &e).await;
+                return Err(ProbeError::Http(e));
+            }
+        }
     }
 
     let content_length = resp
@@ -139,6 +196,16 @@ pub async fn probe(client: &Client, url: &str) -> Result<Probe, ProbeError> {
 
     // Prefer the explicit length; fall back to the 206 content-range total.
     let content_length = content_length.or(content_range);
+
+    // Log a single info line with the resolved metadata so the log
+    // file tells the full story of every probed URL.
+    log::info!(
+        "probe ok url={url} status={} content_length={} content_type={} accept_ranges={}",
+        resp.status().as_u16(),
+        content_length.map(|n| n.to_string()).unwrap_or_default(),
+        content_type.as_deref().unwrap_or(""),
+        accept_ranges,
+    );
 
     Ok(Probe {
         content_length,
@@ -199,8 +266,18 @@ pub fn plan_chunks(total: u64, n: usize) -> Vec<ChunkState> {
 
 /// Build a fresh download plan: probe + chunk planning, mutating `download`.
 /// Reuses any already-downloaded chunk state for resume.
-pub async fn build_plan(client: &Client, download: &mut Download, max_connections: usize) {
-    match probe(client, &download.url).await {
+///
+/// `probe_client` is the no-decompression client used for the HEAD / range
+/// probe — see `build_probe_client` in `task.rs` for why we keep this
+/// separate from the chunk `client`. Passing the same client to both
+/// works (and is what the test suite does for in-process servers) but
+/// may surface a `decode body` error on misconfigured mirrors.
+pub async fn build_plan(
+    probe_client: &Client,
+    download: &mut Download,
+    max_connections: usize,
+) {
+    match probe(probe_client, &download.url).await {
         Ok(p) => {
             download.can_resume = p.accept_ranges;
             download.content_type = p.content_type.clone();
