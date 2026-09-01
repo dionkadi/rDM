@@ -17,3 +17,9 @@ dist/
 # OS / editor
 .DS_Store
 Thumbs.db
+
+# Local-only artifacts (Tauri/webview crash dumps and the
+# README-screenshot scratch dir; AGENTS.md documents both as
+# gitignored so the next agent doesn't try to commit them).
+coredump/
+images/

@@ -1,0 +1,43 @@
+{
+  "manifest_version": 3,
+  "name": "DM Download Grabber",
+  "short_name": "DM Grabber",
+  "version": "0.1.0",
+  "description": "Detect media/download links and send them to DM for accelerated, resumable downloads.",
+  "author": "DM Project",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "dm-grabber@dm-project",
+      "strict_min_version": "109.0"
+    }
+  },
+  "icons": {
+    "16": "icons/icon.svg",
+    "32": "icons/icon.svg",
+    "48": "icons/icon.svg",
+    "128": "icons/icon.svg"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Send to DM",
+    "default_icon": {
+      "16": "icons/icon.svg",
+      "32": "icons/icon.svg",
+      "48": "icons/icon.svg",
+      "128": "icons/icon.svg"
+    }
+  },
+  "permissions": ["nativeMessaging", "downloads", "tabs", "activeTab", "scripting", "storage"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "scripts": ["background.js"],
+    "persistent": false
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
