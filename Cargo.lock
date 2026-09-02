@@ -984,7 +984,7 @@ dependencies = [
 
 [[package]]
 name = "dm-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "directories",
@@ -1005,7 +1005,7 @@ dependencies = [
 
 [[package]]
 name = "dm-native-host"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "regex",
  "serde",
@@ -1014,7 +1014,7 @@ dependencies = [
 
 [[package]]
 name = "dm-tauri"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "dm-engine",
