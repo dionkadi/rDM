@@ -373,12 +373,43 @@ impl DownloadManager {
     }
 
     pub fn remove(&self, id: &str) {
-        // Stop any in-flight workers, then drop the in-memory entry.
-        // We *also* delete the SQLite row, otherwise the next launch's
-        // `load_active()` would re-create the task from disk — making
-        // the remove action not persist across restarts.
-        self.cancel(id);
-        self.inner.tasks.lock().unwrap().remove(id);
+        // We deliberately do **not** call `self.cancel(id)` here. The
+        // `cancel()` path sets `d.status = Canceled`, persists that
+        // status to SQLite, and emits a `StatusChanged(d)` event with
+        // the canceled download. The frontend's event listener sees
+        // that StatusChanged *before* the Removed event we emit below
+        // (Tauri's event channel dispatches them in order, but the
+        // frontend's `removeDownload()` also calls
+        // `refreshDownloads()` after the Tauri command returns — so
+        // the StatusChanged is racing with the list snapshot, and
+        // either one can win).
+        //
+        // The user-visible bug: the user clicks Remove, the list
+        // briefly shows the entry with status="canceled" (because
+        // StatusChanged was the last event to land before
+        // `downloads.set()` from refreshDownloads gets overwritten by
+        // a later StatusChanged that's still in flight), and Resume on
+        // that ghost row hits the engine which has already deleted
+        // the task — so the resume silently does nothing and the row
+        // is then removed by the still-pending Removed event. The
+        // result looks like a "canceled ghost" that the user can
+        // only get rid of by reloading the view.
+        //
+        // The fix: skip `cancel()` entirely. Set the underlying
+        // `control.cancel` flag directly so in-flight chunk workers
+        // see the abort signal, drop the in-memory entry, delete the
+        // SQLite row, and emit **only** `Removed(id)` — no
+        // StatusChanged, no `d.status = Canceled`, no `save_download`.
+        // The frontend sees a single Removed event and the row is
+        // gone.
+        let entry = self.inner.tasks.lock().unwrap().remove(id);
+        if let Some(e) = entry {
+            // Stop the chunk workers without touching the on-disk
+            // row. The `DownloadControl::cancel()` flag is what
+            // `chunk.rs` polls; flipping it is enough to make the
+            // in-flight `run_download()` future unwind.
+            e.state.control.cancel();
+        }
         if let Err(e) = self.inner.storage.delete_download(id) {
             log::warn!("failed to delete download {id} from storage: {e}");
         }
@@ -626,5 +657,66 @@ mod tests {
         let active = mgr.inner.storage.load_active().unwrap();
         assert_eq!(active.len(), 1, "removed download came back from storage: {active:?}");
         assert_eq!(active[0].id, "b");
+    }
+
+    /// Regression test: `remove()` must NOT emit a `StatusChanged`
+    /// with status="canceled" before emitting `Removed`. Otherwise
+    /// the frontend's `StatusChanged` handler merges the canceled
+    /// download back into the list (because `findIndex` returns -1
+    /// for a row that's already been removed in-memory), and the
+    /// user sees a "canceled ghost" row that only disappears when
+    /// the still-pending `Removed` event lands.
+    ///
+    /// The old implementation called `self.cancel(id)` from
+    /// `remove()`, which saved `status='canceled'` to SQLite and
+    /// emitted `StatusChanged(d)` before the `Removed(id)` event.
+    /// The fix: skip `cancel()` entirely; set the underlying
+    /// `control.cancel` flag, drop the in-memory entry, delete the
+    /// SQLite row, and emit only `Removed(id)`.
+    #[tokio::test]
+    async fn remove_does_not_emit_canceled_status_change() {
+        use std::sync::Mutex;
+        let storage = Storage::open_memory().unwrap();
+        let mgr = DownloadManager::new(storage);
+        // Wire up an event sink that records every event the manager
+        // emits.
+        let events: std::sync::Arc<Mutex<Vec<DownloadEvent>>> =
+            std::sync::Arc::new(Mutex::new(Vec::new()));
+        {
+            let events = events.clone();
+            mgr.set_event_sink(std::sync::Arc::new(move |e| {
+                events.lock().unwrap().push(e);
+            }));
+        }
+        mgr.add(new_download("ghost", "https://example.com/ghost.zip"));
+        // Snapshot the events emitted so far (the `Added` from
+        // `mgr.add()`); we only want to assert on the events that
+        // `remove()` itself produces.
+        let before_remove = events.lock().unwrap().len();
+
+        mgr.remove("ghost");
+
+        let recorded: Vec<DownloadEvent> = {
+            let all = events.lock().unwrap();
+            all.iter().skip(before_remove).cloned().collect()
+        };
+        // We must see exactly one event from `remove()` — the
+        // `Removed`. Anything else (especially a `StatusChanged`
+        // with status=Canceled) is the bug.
+        assert_eq!(
+            recorded.len(),
+            1,
+            "remove() emitted {} events (expected 1): {:?}",
+            recorded.len(),
+            recorded
+        );
+        match &recorded[0] {
+            DownloadEvent::Removed(id) => assert_eq!(id, "ghost"),
+            other => panic!("expected Removed event, got {other:?}"),
+        }
+        // Sanity: the in-memory entry is gone and so is the SQLite
+        // row.
+        assert!(mgr.get("ghost").is_none());
+        assert_eq!(mgr.inner.storage.load_active().unwrap().len(), 0);
     }
 }
