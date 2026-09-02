@@ -636,6 +636,63 @@ select {
   margin-top: 12px;
 }
 .add-sub .grow { flex: 1 1 180px; min-width: 0; }
+
+/* Category dropdown for the "Add download" hero. Replaces the
+   previous free-text input so the user picks from the categories
+   defined in Settings (each one has a fixed save directory). The
+   `dir-hint` next to it shows the resolved save path as a
+   read-only preview. */
+.cat-select {
+  flex: 1 1 200px;
+  min-width: 0;
+  padding: 7px 10px;
+  background: var(--color-bg-elevated, var(--color-surface, #181c28));
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  font-size: 12.5px;
+  font-family: inherit;
+  cursor: pointer;
+  outline: none;
+  transition: border-color 0.12s, box-shadow 0.12s;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--color-text-muted) 50%),
+                    linear-gradient(135deg, var(--color-text-muted) 50%, transparent 50%);
+  background-position: calc(100% - 14px) 50%, calc(100% - 9px) 50%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  padding-right: 26px;
+}
+.cat-select:focus {
+  border-color: var(--color-accent, #74e0a4);
+  box-shadow: 0 0 0 3px var(--color-accent-dim, rgba(116, 224, 164, 0.2));
+}
+.dir-hint {
+  flex: 0 1 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 9px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  color: var(--color-text-muted);
+  font-size: 11.5px;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+}
+.dir-hint svg { width: 13px; height: 13px; flex: none; }
+.dir-hint code {
+  font-family: var(--font-mono, ui-monospace, "SF Mono", Menlo, monospace);
+  color: var(--color-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 360px;
+  display: inline-block;
+}
 .chk-toggle {
   display: inline-flex;
   align-items: center;

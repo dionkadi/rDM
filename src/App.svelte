@@ -13,6 +13,7 @@
     SettingsTabs,
     StatusBar,
     Toast,
+    CaptureDialog,
   } from "./lib/components";
   import * as api from "./lib/api";
   import {
@@ -134,6 +135,32 @@
   function stopDemoSim() {
     if (demoTimer) clearInterval(demoTimer);
     demoTimer = null;
+  }
+
+  /**
+   * Mirror of the engine's `save_dir_for(category)` — used to
+   * render the save-path preview next to the category dropdown
+   * on the home view. `catId === ""` (no category) falls back to
+   * the global default save dir; otherwise we look up the
+   * category's `directory` field. The engine is the source of
+   * truth at the moment the user actually clicks "Add" — this is
+   * just a preview to help the user pick a category.
+   */
+  function resolveDirFor(catId: string): string {
+    const s = $settings;
+    if (!s) return "";
+    if (!catId) {
+      return typeof s.defaultDirectory === "string"
+        ? s.defaultDirectory
+        : String(s.defaultDirectory ?? "");
+    }
+    const cat = s.categories.find((c) => c.id === catId);
+    if (!cat) {
+      return typeof s.defaultDirectory === "string"
+        ? s.defaultDirectory
+        : String(s.defaultDirectory ?? "");
+    }
+    return cat.directory || String(s.defaultDirectory ?? "");
   }
 
   // ── Derived ───────────────────────────────────────────────────
@@ -556,7 +583,24 @@
       </div>
 
       <div class="add-sub">
-        <input class="grow" placeholder="category (optional)" bind:value={newCategory} />
+        <select
+          class="cat-select"
+          bind:value={newCategory}
+          aria-label="Category"
+        >
+          <option value="">Default (no category)</option>
+          {#each $settings?.categories ?? [] as cat}
+            <option value={cat.id}>{cat.name}</option>
+          {/each}
+        </select>
+        {#if newCategory}
+          <span class="dir-hint" title="Resolved save directory">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+            </svg>
+            <code>{resolveDirFor(newCategory)}</code>
+          </span>
+        {/if}
         <label class="chk-toggle">
           <input type="checkbox" bind:checked={showChecksum} />
           checksum
@@ -691,6 +735,13 @@
 
 <!-- ── Toasts ────────────────────────────────────────────────── -->
 <Toast />
+
+<!-- ── Capture dialog ────────────────────────────────────────── -->
+<!-- The `CaptureDialog` listens to the `captureQueue` store and
+     shows an IDM-style confirmation prompt for every URL the
+     browser extension forwards. It is the *only* path that
+     calls `addDownload` for browser-captured URLs. -->
+<CaptureDialog />
 
 <!-- ── Status bar ────────────────────────────────────────────── -->
 <StatusBar />

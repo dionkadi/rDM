@@ -11,4 +11,5 @@ export { default as SmartFilters } from "./SmartFilters.svelte";
 export { default as SettingsTabs } from "./SettingsTabs.svelte";
 export { default as StatusBar } from "./StatusBar.svelte";
 export { default as Toast } from "./Toast.svelte";
+export { default as CaptureDialog } from "./CaptureDialog.svelte";
 export { default as SpeedGraph } from "../SpeedGraph.svelte";

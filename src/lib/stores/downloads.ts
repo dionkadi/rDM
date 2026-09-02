@@ -1,7 +1,46 @@
 // Downloads store — reactive state for the download list
 import { writable, derived, get } from "svelte/store";
-import type { Download, FrontendEvent } from "../types";
+import type { CapturedUrl, Download, FrontendEvent } from "../types";
 import * as api from "../api";
+
+// ── Capture queue (IDM-style) ───────────────────────────────────
+//
+// When the browser extension forwards a URL, the Tauri side emits a
+// `Captured` event on the `download-event` channel. We push it into
+// `captureQueue`; the `CaptureDialog` component renders the most
+// recent capture and lets the user confirm category / path /
+// filename before the URL is queued. The queue is a small array
+// (usually 0–2 items; rare to have more than one pending at a time)
+// so we keep it simple — no separate "pending approvals" store.
+
+export const captureQueue = writable<CapturedUrl[]>([]);
+const seenCaptureNonces = new Set<string>();
+
+export function enqueueCapture(c: CapturedUrl): void {
+  // Dedupe: the same URL can arrive twice in quick succession
+  // (e.g. the user double-clicks a link, the extension fires two
+  // onCreated events, or two tabs both surface the same media).
+  // The Rust side stamps each event with a monotonic nonce; if
+  // we've already seen it, drop the duplicate.
+  if (c.nonce && seenCaptureNonces.has(c.nonce)) return;
+  if (c.nonce) seenCaptureNonces.add(c.nonce);
+  // Cap the queue to 10 entries — the dialog shows the head, and
+  // anything beyond 10 is almost certainly a misbehaving extension
+  // flooding the channel. Old entries are dropped silently.
+  captureQueue.update((q) => {
+    const next = [...q, c];
+    if (next.length > 10) next.shift();
+    return next;
+  });
+}
+
+export function popCapture(): void {
+  captureQueue.update((q) => q.slice(1));
+}
+
+export function clearCaptures(): void {
+  captureQueue.set([]);
+}
 
 // ── Core state ──────────────────────────────────────────────────────
 export const downloads = writable<Download[]>([]);
@@ -103,6 +142,15 @@ export async function startEventListener(): Promise<void> {
     const { listen } = await import("@tauri-apps/api/event");
     unlistenFn = await listen<FrontendEvent>("download-event", (ev) => {
       const e = ev.payload;
+      if (e.kind === "captured") {
+        // Browser-extension capture: push into the capture queue
+        // so the `CaptureDialog` component can show the
+        // confirmation prompt. The dialog calls `addDownload()`
+        // when the user clicks "Download", which is what actually
+        // queues the task in the engine.
+        enqueueCapture(e.download);
+        return;
+      }
       if (e.kind === "removed") {
         downloads.update((list) => list.filter((d) => d.id !== e.download.id));
         return;

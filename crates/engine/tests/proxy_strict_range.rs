@@ -11,6 +11,13 @@
 //! **fall back to a no-`Range` GET** that streams the full body via
 //! `Transfer-Encoding: chunked` (or reads to EOF), and the download
 //! must complete with the file on disk matching the server's payload.
+//!
+//! The `truncated_body_marks_error` test pins the user-reported
+//! "879 B downloaded, marked Completed" failure: when an open-ended
+//! transfer closes the body stream with fewer bytes than
+//! `OPEN_ENDED_MIN_BYTES` (a proxy-truncation symptom), the engine
+//! must mark the download `Error` with a clear message, not silently
+//! call it `Completed`.
 
 use dm_engine::manager::DownloadManager;
 use dm_engine::model::{Download, DownloadStatus, Settings};
@@ -21,24 +28,27 @@ use std::time::{Duration, Instant};
 
 const PAYLOAD_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
 
-/// Strict-range mock: HEAD has no Content-Length / Accept-Ranges;
-/// GET with a Range header returns 416; GET without a Range header
-/// streams the full body using Transfer-Encoding: chunked.
-fn spawn_strict_range() -> u16 {
+/// Two-mode mock that mirrors the real proxy behaviour we've
+/// observed: `/?strict` 416s on `Range:` and streams the full
+/// 8 MiB body on a plain GET; `/?truncated` 416s on `Range:` and
+/// then **closes the plain GET body with a 879 B stub** — the
+/// "Chrome raced us and the proxy aborted the upstream" failure
+/// mode.
+fn spawn_two_mode() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             if let Ok(s) = stream {
                 let mut s = s;
-                std::thread::spawn(move || handle_strict(&mut s));
+                std::thread::spawn(move || handle_two_mode(&mut s));
             }
         }
     });
     port
 }
 
-fn handle_strict(s: &mut std::net::TcpStream) {
+fn handle_two_mode(s: &mut std::net::TcpStream) {
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -49,7 +59,10 @@ fn handle_strict(s: &mut std::net::TcpStream) {
         match s.read(&mut byte) {
             Ok(0) => break,
             Ok(_) => {
-                buf.push(byte[0]);
+                // Destructure the single-byte buffer so the linter
+                // doesn't complain about indexing a `[u8; 1]`.
+                let [b] = byte;
+                buf.push(b);
                 if buf.ends_with(b"\r\n\r\n") {
                     break;
                 }
@@ -61,6 +74,7 @@ fn handle_strict(s: &mut std::net::TcpStream) {
     let mut lines = req.lines();
     let request_line = lines.next().unwrap_or("").to_string();
     let method = request_line.split_whitespace().next().unwrap_or("").to_string();
+    let path = request_line.split_whitespace().nth(1).unwrap_or("").to_string();
     let has_range = lines.any(|l| l.to_ascii_lowercase().starts_with("range:"));
 
     if method.eq_ignore_ascii_case("HEAD") {
@@ -81,6 +95,25 @@ fn handle_strict(s: &mut std::net::TcpStream) {
             body.len()
         );
         let _ = s.write_all(body);
+        return;
+    }
+
+    // Plain GET → mode-dependent.
+    if path.contains("truncated") {
+        // The proxy is supposed to send a 142 MB file but Chrome's
+        // own download was racing DM's; the proxy aborted the
+        // upstream connection and forwarded a tiny stub body to
+        // DM. We send 879 B (the exact size from the bug report) and
+        // close the connection cleanly.
+        let stub_len: usize = 879;
+        let stub = vec![b'X'; stub_len];
+        let _ = write!(
+            s,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        );
+        let _ = write!(s, "{:x}\r\n", stub_len);
+        let _ = s.write_all(&stub);
+        let _ = write!(s, "\r\n0\r\n\r\n");
         return;
     }
 
@@ -124,7 +157,7 @@ async fn wait_for_terminal(mgr: &DownloadManager, id: &str) -> Download {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn proxy_416_triggers_fallback_to_plain_get() {
-    let port = spawn_strict_range();
+    let port = spawn_two_mode();
     let tmp = tempfile::tempdir().expect("tempdir");
     let out_path = tmp.path().join("out.bin");
 
@@ -154,4 +187,56 @@ async fn proxy_416_triggers_fallback_to_plain_get() {
     );
     // Sanity: the bytes should all be 'X'.
     assert!(written.iter().all(|&b| b == b'X'));
+}
+
+/// Regression test for the user-reported "879 B downloaded, marked
+/// Completed" failure: when the proxy truncates the body to a tiny
+/// stub (the symptom of Chrome racing the DM copy and the upstream
+/// connection being killed), the engine must mark the open-ended
+/// transfer `Error`, not `Completed`. The user gets a clear error
+/// message instead of a fake-success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn truncated_body_marks_error_not_completed() {
+    let port = spawn_two_mode();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out_path = tmp.path().join("out.bin");
+
+    let storage = Storage::open_memory().expect("memory storage");
+    let mgr = DownloadManager::with_settings(storage, Settings::default());
+
+    let mut d = Download::new(format!(
+        "http://127.0.0.1:{port}/file.bin?truncated"
+    ));
+    d.id = "truncated".into();
+    d.save_path = out_path.clone();
+    let id = d.id.clone();
+    mgr.add(d);
+
+    let snap = wait_for_terminal(&mgr, &id).await;
+    assert_eq!(
+        snap.status,
+        DownloadStatus::Error,
+        "an open-ended transfer that received only {} B should be Error, \
+         not Completed (proxy truncation symptom — the upstream \
+         connection was almost certainly aborted by the proxy). \
+         Got status={:?} err={:?}",
+        879,
+        snap.status,
+        snap.error
+    );
+    let err_msg = snap
+        .error
+        .as_deref()
+        .unwrap_or("<no error message>");
+    assert!(
+        err_msg.contains("truncated") || err_msg.contains("879"),
+        "error message should explain the truncation: got {err_msg:?}"
+    );
+    // We should NOT have left a misleading 879 B file on disk
+    // marked Completed.
+    assert_ne!(
+        snap.status,
+        DownloadStatus::Completed,
+        "the bug from the report: 879 B must NOT be marked Completed"
+    );
 }

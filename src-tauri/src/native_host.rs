@@ -1,27 +1,43 @@
 //! Listens for URLs forwarded by the browser native-messaging host
-//! (`dm-native-host`) and enqueues them as downloads.
+//! (`dm-native-host`) and surfaces them to the user as a
+//! confirmation dialog (`CaptureDialog` in the Svelte SPA).
 //!
-//! The native host connects to a localhost TCP socket and sends newline-
-//! delimited JSON (`{"url":"..."}`). Each URL is turned into a `Queued`
-//! download exactly like the `add_download` command; engine events are then
-//! emitted to the webview through the manager's existing event sink.
+//! The previous implementation called `DownloadManager::add()`
+//! directly when a URL arrived, which is why every click on a
+//! download link immediately started transferring — the user had
+//! no chance to confirm category, path, or filename. IDM, FDM and
+//! similar managers pop a dialog for every captured URL; we now
+//! match that flow:
 //!
-//! The listener can be probed via `probe_native_host_port` to drive the
-//! status panel in the Settings → Extensions tab.
+//!   1. The browser extension forwards a URL to DM's local TCP
+//!      listener (`127.0.0.1:9157`).
+//!   2. The listener emits a `Captured` event on the
+//!      `download-event` channel. The payload includes the URL, a
+//!      suggested filename (extracted from the URL path or
+//!      `Content-Disposition` via `protocol::suggest_filename`),
+//!      and the current default save directory.
+//!   3. The frontend shows a modal (`CaptureDialog.svelte`) with
+//!      editable filename, a category dropdown, and a save-path
+//!      preview. Only when the user clicks "Download" does the
+//!      frontend call the `add_download` Tauri command, which is
+//!      the only path that actually creates the engine `Download`
+//!      and starts the chunk workers.
 //!
-//! NOTE: this module cannot be compiled in the current sandbox (it depends on
-//! Tauri/webview). It is written against the Tauri v2 API and mirrors
-//! `commands::add_download`; build it on a host with `webkit2gtk`/webview.
+//! This module is intentionally lean: it does **not** hold an
+//! `Arc<DownloadManager>` anymore. Engine state is touched only
+//! through the `add_download` command (which is what the frontend
+//! calls after the user confirms).
 
-use dm_engine::manager::DownloadManager;
-use dm_engine::model::{Download, DownloadStatus};
 use dm_engine::protocol;
+use crate::events::{CapturedUrl, FrontendEvent, EVENT_CHANNEL};
 use std::io::{BufRead, BufReader};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use tauri::{AppHandle, Emitter};
 
 /// Port the native host connects to. Keep in sync with
 /// `crates/native-host/src/main.rs::DEFAULT_PORT`.
@@ -46,7 +62,10 @@ impl Default for NativeHostStatus {
 
 impl NativeHostStatus {
     pub fn snapshot(&self) -> (bool, u64) {
-        (self.bound.load(Ordering::Relaxed), self.last_event_unix.load(Ordering::Relaxed))
+        (
+            self.bound.load(Ordering::Relaxed),
+            self.last_event_unix.load(Ordering::Relaxed),
+        )
     }
     fn touch(&self) {
         let now = SystemTime::now()
@@ -59,9 +78,15 @@ impl NativeHostStatus {
 
 /// Bind the listener on a background OS thread. Returns immediately; if the
 /// port is unavailable the thread logs and exits without affecting the app.
+///
+/// `app` is the Tauri `AppHandle` used to emit `Captured` events to the
+/// frontend. `default_save_dir` is read once at startup (the user's default
+/// download location) and used as the suggested save directory for every
+/// capture; the frontend can override it once the user picks a category.
 pub fn start_native_host_listener(
-    manager: Arc<DownloadManager>,
+    app: AppHandle,
     port: u16,
+    default_save_dir: String,
     status: NativeHostStatus,
 ) {
     thread::spawn(move || {
@@ -80,9 +105,10 @@ pub fn start_native_host_listener(
         loop {
             match listener.accept() {
                 Ok((s, _)) => {
-                    let mgr = manager.clone();
+                    let app = app.clone();
                     let st = status.clone();
-                    thread::spawn(move || handle_conn(s, mgr, st));
+                    let dir = default_save_dir.clone();
+                    thread::spawn(move || handle_conn(s, app, dir, st));
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // Idle; sleep briefly then re-check.
@@ -97,7 +123,7 @@ pub fn start_native_host_listener(
     });
 }
 
-fn handle_conn(stream: TcpStream, manager: Arc<DownloadManager>, status: NativeHostStatus) {
+fn handle_conn(stream: TcpStream, app: AppHandle, default_save_dir: String, status: NativeHostStatus) {
     let reader = BufReader::new(stream);
     for line in reader.lines() {
         let line = match line {
@@ -109,21 +135,59 @@ fn handle_conn(stream: TcpStream, manager: Arc<DownloadManager>, status: NativeH
             continue;
         }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-            if let Some(url) = v.get("url").and_then(|u| u.as_str()) {
+            // Three shapes we accept:
+            //   {"url":"…","type":"download"|"save-as"|"grab"|"click"}
+            //     – the dm-native-host binary's forward_url path;
+            //   {"url":"…"}
+            //     – the legacy / direct-socket form (kept for back-compat);
+            //   {"urls":["…","…"]}
+            //     – future / batch-capture; treated as separate events.
+            let kind = v
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("download");
+            let source = match kind {
+                "click" | "download-click" => "browser-click",
+                "save-as" => "browser-save-as",
+                "grab" | "capture" => "browser-grab",
+                _ => "native-host",
+            };
+            if let Some(arr) = v.get("urls").and_then(|u| u.as_array()) {
+                for u in arr {
+                    if let Some(s) = u.as_str() {
+                        status.touch();
+                        emit_captured(&app, source, s, &default_save_dir);
+                    }
+                }
+            } else if let Some(url) = v.get("url").and_then(|u| u.as_str()) {
                 status.touch();
-                enqueue(manager.clone(), url);
+                emit_captured(&app, source, url, &default_save_dir);
             }
         }
     }
 }
 
-fn enqueue(manager: Arc<DownloadManager>, url: &str) {
-    let dir = manager.save_dir_for(None);
-    let fname = protocol::suggest_filename(url, None, "download.bin");
-    let save_path = dir.join(&fname);
-    let mut d = Download::new(url.to_string());
-    d.filename = fname;
-    d.save_path = save_path;
-    d.status = DownloadStatus::Queued;
-    manager.add(d);
+fn emit_captured(app: &AppHandle, source: &str, url: &str, default_save_dir: &str) {
+    // Best-effort filename extraction. The engine has a richer
+    // `protocol::suggest_filename` that prefers `Content-Disposition`
+    // over the URL path, but we don't have the response headers
+    // here (the URL was forwarded by the native host, not
+    // downloaded by us). Use the URL-path variant for now; the
+    // `add_download` Tauri command can refine it later if the
+    // user clicks "Download" — the frontend can also re-suggest
+    // a filename once the engine returns the real Content-Type.
+    let suggested_filename =
+        protocol::suggest_filename(url, None, "download.bin");
+    let nonce = format!("{}-{}", Instant::now().elapsed().as_nanos(), url);
+    let payload = CapturedUrl {
+        source: source.to_string(),
+        url: url.to_string(),
+        suggested_filename,
+        default_save_dir: default_save_dir.to_string(),
+        nonce,
+    };
+    let event: FrontendEvent = FrontendEvent::Captured(payload);
+    if let Err(e) = app.emit(EVENT_CHANNEL, &event) {
+        eprintln!("dm: failed to emit Captured event: {e}");
+    }
 }

@@ -107,7 +107,17 @@ pub fn get_settings(state: State<'_, DownloadManager>) -> Settings {
 }
 
 #[tauri::command]
-pub fn update_settings(state: State<'_, DownloadManager>, settings: Settings) {
+pub fn update_settings(
+    state: State<'_, DownloadManager>,
+    close_to_tray: State<'_, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    settings: Settings,
+) {
+    // Mirror `closeToTray` into the shared atomic that the
+    // WindowEvent::CloseRequested handler reads. This is the
+    // hook that makes the SettingsTabs toggle take effect
+    // immediately for the *next* close attempt — without it, the
+    // user would have to restart DM after toggling the checkbox.
+    close_to_tray.store(settings.close_to_tray, std::sync::atomic::Ordering::Relaxed);
     state.update_settings(settings);
 }
 

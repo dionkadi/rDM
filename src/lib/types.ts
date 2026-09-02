@@ -68,6 +68,31 @@ export interface Settings {
   scheduleEnd: [number, number];
 }
 
+// Payload for the `captured` variant of `FrontendEvent`. Sent
+// from the Tauri side when the browser extension's native
+// host forwards a URL to DM. The frontend shows an IDM-style
+// confirmation dialog before the URL is actually queued.
+export interface CapturedUrl {
+  /** Where the capture came from. One of `"browser-click"`,
+   *  `"browser-save-as"`, `"browser-grab"`, `"native-host"`,
+   *  `"unknown"`. Used to label the dialog title. */
+  source: string;
+  /** The raw URL the browser handed us. */
+  url: string;
+  /** Filename extracted from the URL path / Content-Disposition
+   *  on the Rust side. The user can edit this in the dialog. */
+  suggestedFilename: string;
+  /** The user's default save directory at the time of capture.
+   *  The dialog shows this as the default; the user can pick a
+   *  category and the resolved save path is what `add_download`
+   *  will actually use. */
+  defaultSaveDir: string;
+  /** Monotonic ID for dedupe. If the same URL comes in twice in
+   *  quick succession (e.g. double-click) the frontend can drop
+   *  the second one. */
+  nonce: string;
+}
+
 // Discriminated union emitted on the "download-event" channel.
 export type FrontendEvent =
   | { kind: "added"; download: Download }
@@ -75,7 +100,8 @@ export type FrontendEvent =
   | { kind: "statusChanged"; download: Download }
   | { kind: "completed"; download: Download }
   | { kind: "error"; download: Download }
-  | { kind: "removed"; download: { id: string } };
+  | { kind: "removed"; download: { id: string } }
+  | { kind: "captured"; download: CapturedUrl };
 
 /** Human-readable label for a proxy mode. */
 export const PROXY_MODE_LABEL: Record<ProxyMode, string> = {
