@@ -26,7 +26,11 @@
         }
       }
       body {
-        font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+        font-family:
+          system-ui,
+          -apple-system,
+          "Segoe UI",
+          sans-serif;
         width: 260px;
         margin: 0;
         padding: 14px 16px;
@@ -39,6 +43,42 @@
         display: flex;
         align-items: center;
         gap: 8px;
+      }
+      .err-detail {
+        display: none;
+        margin-top: 8px;
+        padding: 8px 10px;
+        background: rgba(255, 122, 143, 0.12);
+        border: 1px solid rgba(255, 122, 143, 0.4);
+        border-radius: 6px;
+        color: var(--danger);
+        font-size: 11.5px;
+        line-height: 1.45;
+        word-break: break-word;
+      }
+      .err-detail.shown {
+        display: block;
+      }
+      .err-detail code {
+        color: inherit;
+        background: rgba(0, 0, 0, 0.08);
+      }
+      .err-detail .hint {
+        display: block;
+        margin-top: 6px;
+        color: var(--muted);
+        font-size: 11px;
+      }
+      .err-detail .err-actions {
+        display: flex;
+        gap: 6px;
+        margin-top: 8px;
+      }
+      .err-detail .err-actions button {
+        margin-top: 0;
+        padding: 5px 8px;
+        font-size: 11.5px;
+        font-weight: 500;
       }
       h3 .logo {
         width: 18px;
@@ -66,14 +106,18 @@
         font-family: inherit;
         transition: all 0.15s;
       }
-      button:hover { background: rgba(0, 0, 0, 0.04); }
+      button:hover {
+        background: rgba(0, 0, 0, 0.04);
+      }
       button.primary {
         background: var(--accent);
         color: #ffffff;
         border-color: transparent;
         font-weight: 600;
       }
-      button.primary:hover { filter: brightness(1.1); }
+      button.primary:hover {
+        filter: brightness(1.1);
+      }
       #status {
         color: var(--muted);
         font-size: 11.5px;
@@ -82,8 +126,12 @@
         padding-top: 8px;
         border-top: 1px solid var(--border);
       }
-      #status.ok { color: var(--success); }
-      #status.err { color: var(--danger); }
+      #status.ok {
+        color: var(--success);
+      }
+      #status.err {
+        color: var(--danger);
+      }
       code {
         font-family: ui-monospace, "SF Mono", Menlo, monospace;
         font-size: 11px;
@@ -98,7 +146,14 @@
     <p class="lead">Send media links from this page to DM.</p>
     <button id="grab" class="primary">Grab page media</button>
     <button id="open">Open DM app</button>
+    <button
+      id="test"
+      style="font-size: 11.5px; padding: 6px 10px; margin-top: 6px"
+    >
+      Test host connection
+    </button>
     <p id="status">Checking…</p>
+    <div id="err-detail" class="err-detail"></div>
     <script src="popup.js"></script>
   </body>
 </html>

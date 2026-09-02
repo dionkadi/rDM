@@ -12,7 +12,7 @@ const HOST_NAME = "com.app.dm.native";
 const STORAGE_KEY_INSTALL_TIME = "dmInstallTime";
 
 // Connection state — visible to the popup via `chrome.runtime.sendMessage`.
-let hostState = {
+const hostState = {
   connected: false,
   lastError: null,
   lastSentAt: 0,
@@ -54,32 +54,73 @@ function setBadge(state) {
 
 let port = null;
 
+function setNativeError(message) {
+  // One funnel for "the host is not reachable" so the popup, the
+  // badge, and the console stay in sync. We deliberately do NOT
+  // include the full stack — `chrome.runtime.lastError.message` is
+  // already user-readable (e.g. "No such native application
+  // com.app.dm.native" on Firefox, or "Specified native messaging
+  // host not found." on Chrome).
+  hostState.connected = false;
+  hostState.lastError = message;
+  setBadge("err");
+  console.warn("DM native host:", message);
+}
+
 function connect() {
   if (port) return port;
+  // Snapshot of the previous state so we only log "connect failed"
+  // when we actually attempt a new connection.
+  let newPort = null;
   try {
-    port = chrome.runtime.connectNative(HOST_NAME);
-    hostState.connected = true;
-    hostState.lastError = null;
-    setBadge("ok");
-    port.onMessage.addListener(() => {
-      // The host may ack; nothing to act on.
-    });
-    port.onDisconnect.addListener(() => {
-      const err = chrome.runtime.lastError
-        ? chrome.runtime.lastError.message
-        : "host disconnected";
-      hostState.connected = false;
-      hostState.lastError = err;
-      port = null;
-      setBadge("err");
-      console.warn("DM native host disconnected:", err);
-    });
+    newPort = chrome.runtime.connectNative(HOST_NAME);
   } catch (e) {
-    hostState.connected = false;
-    hostState.lastError = String(e);
-    setBadge("err");
-    console.warn("DM native host connect failed:", e);
+    // `connectNative` is synchronous in Chrome but **may** throw in
+    // Firefox if the host lookup fails immediately (e.g. the host
+    // manifest is missing or unreadable). In that case we never get
+    // a `port` object, so we set the error and bail.
+    setNativeError(String(e && e.message ? e.message : e));
+    return null;
   }
+  port = newPort;
+  // **CRITICAL (Firefox MV3):** `chrome.runtime.connectNative` is
+  // async — when the host lookup fails, Firefox reports the error
+  // via `chrome.runtime.lastError` *and* via `port.onDisconnect` on
+  // the next event-loop tick. If we don't read `lastError` in the
+  // same tick (before any other chrome.* call), it gets cleared and
+  // we lose the real error message. So we optimistically mark the
+  // connection as up, then check `lastError` immediately and roll
+  // back if it's set. This is the pattern recommended by the
+  // Chrome/Firefox MV3 docs.
+  if (chrome.runtime.lastError) {
+    setNativeError(chrome.runtime.lastError.message);
+    try {
+      port.disconnect();
+    } catch (_) {}
+    port = null;
+    return null;
+  }
+  hostState.connected = true;
+  hostState.lastError = null;
+  setBadge("ok");
+  port.onMessage.addListener(() => {
+    // The host may ack; nothing to act on.
+  });
+  port.onDisconnect.addListener(() => {
+    // This fires when:
+    //   (a) the host process exits (clean shutdown or crash); or
+    //   (b) Firefox rejects the connection asynchronously
+    //       (e.g. the host manifest is missing — Firefox will
+    //       throw "No such native application com.app.dm.native"
+    //       and then disconnect the port).
+    // In case (b) the same error is *also* in `lastError` on this
+    // tick, so we read it before any other runtime API call.
+    const err = chrome.runtime.lastError
+      ? chrome.runtime.lastError.message
+      : "host disconnected";
+    setNativeError(err);
+    port = null;
+  });
   return port;
 }
 
@@ -92,13 +133,37 @@ function send(payload) {
     hostState.lastSentCount++;
     return true;
   } catch (e) {
-    hostState.connected = false;
-    hostState.lastError = String(e);
-    setBadge("err");
-    try { p.disconnect(); } catch (_) {}
+    setNativeError(String(e && e.message ? e.message : e));
+    try {
+      p.disconnect();
+    } catch (_) {}
     port = null;
     return false;
   }
+}
+
+/**
+ * Force a fresh `connectNative` attempt. Used by the popup's
+ * "Test host" button. Disconnects any existing port, clears state,
+ * and returns a `{ok, message}` summary that the popup can render.
+ */
+async function probeHost() {
+  if (port) {
+    try {
+      port.disconnect();
+    } catch (_) {}
+    port = null;
+  }
+  hostState.connected = false;
+  hostState.lastError = null;
+  const p = connect();
+  // Drain a tick so Firefox's async disconnect can run.
+  await new Promise((r) => setTimeout(r, 50));
+  return {
+    ok: hostState.connected,
+    lastError: hostState.lastError,
+    hostName: HOST_NAME,
+  };
 }
 
 // Parse Chrome's `DownloadItem.startTime` (ISO 8601 string) → epoch ms.
@@ -140,9 +205,79 @@ function registerDownloadsListener() {
   if (onDownloadsCreatedRegistered) return;
   chrome.downloads.onCreated.addListener((item) => {
     if (!shouldForwardDownload(item)) return;
+    // Forward the URL to DM. We deliberately **also** cancel Chrome's
+    // own download: the goal of the extension is to take over the
+    // download, not to capture *and* let Chrome also download. If
+    // both proceed the upstream (especially a single-connection
+    // CDN mirror) will sometimes truncate one of them, leaving DM
+    // with a partial body that the engine then wrongly marks
+    // Completed. Cancelling here means Chrome drops its connection,
+    // DM is the only one talking to the mirror, and the body stream
+    // is the real file.
     send({ type: "download", url: item.url, filename: item.filename });
+    // `item.id` is Chrome's internal numeric id for the download.
+    // We pass it through the native host so the *Rust* side (or
+    // the eventual `chrome.downloads.cancel` call below) can target
+    // the right entry. The cancel itself runs in this service
+    // worker — we have the `chrome.downloads` permission here.
+    //
+    // We do the cancel + erase **after** the `send` so the
+    // cancellation can't race ahead of the URL reaching the host.
+    // The two operations are independent (the host doesn't need to
+    // ack the URL for us to cancel Chrome), so we don't await.
+    if (item.id != null) {
+      takeOverChromeDownload(item);
+    }
   });
   onDownloadsCreatedRegistered = true;
+}
+
+/**
+ * Cancel Chrome's own download of `item` and remove the entry from
+ * Chrome's download list (so the user doesn't see a phantom "interrupted"
+ * item in `chrome://downloads` next to the successful DM transfer).
+ *
+ * The cancel is best-effort: if `chrome.downloads.cancel` rejects
+ * (the entry is already gone, or Chrome's UI is in a state that
+ * disallows cancel), we log and move on. The same is true of
+ * `chrome.downloads.erase` — best-effort cleanup.
+ *
+ * We use `removeFromDisk: false` because the file Chrome was writing
+ * is going to be a partial / truncated file (the race we just
+ * described). We don't want DM's download to fail because Chrome
+ * left a stale partial on disk; and we don't want the user to see
+ * "this file is 879 B" in their Downloads folder.
+ */
+function takeOverChromeDownload(item) {
+  const id = item.id;
+  if (id == null) return;
+  try {
+    chrome.downloads.cancel(id, () => {
+      // Whether the cancel succeeded or not (the callback fires
+      // for both), we want to erase the entry. `removeFromDisk:
+      // false` because the partial file Chrome wrote is not the
+      // real file and we don't want to keep it around.
+      try {
+        chrome.downloads.erase({ id, removeFromDisk: false }, () => {
+          // Last error is expected if the entry was already
+          // gone (e.g. user erased it manually, or the cancel
+          // cleaned it up). Silent.
+          if (chrome.runtime.lastError) {
+            // Reference to suppress unused-var lint; the message
+            // is intentionally not surfaced to the user.
+            void chrome.runtime.lastError.message;
+          }
+        });
+      } catch (_) {
+        /* best-effort */
+      }
+    });
+  } catch (e) {
+    // The cancel API can throw if the download is in a state that
+    // disallows cancellation (e.g. "complete"). The DM copy is
+    // already in flight; nothing else to do.
+    console.warn("DM Grabber: chrome.downloads.cancel failed:", e);
+  }
 }
 
 // Messages from content scripts / popup.
@@ -151,6 +286,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "get-status") {
     sendResponse({ ok: true, state: hostState });
     return;
+  }
+  // The popup's "Test host" button. Forces a fresh connectNative
+  // attempt and reports the actual result — including the precise
+  // `chrome.runtime.lastError.message` from Firefox/Chrome. Returns
+  // a Promise (via `sendResponse` after the async `probeHost()`
+  // resolves) so the popup can render the error verbatim.
+  if (msg.type === "probe") {
+    probeHost().then((res) => sendResponse({ ok: true, probe: res }));
+    return true; // tell the browser we'll call sendResponse async
   }
   // The supported capture path is `type === "grab"` (popup button
   // → background → content-script `collect` → explicit response).
@@ -191,6 +335,9 @@ async function loadInstallTime() {
       hostState.installTimeMs = Date.now();
     }
   } catch (e) {
+    // Storage failed — fall back to "now" so we don't drop
+    // brand-new downloads. Logged for diagnostic visibility.
+    console.warn("DM Grabber: loadInstallTime failed:", e);
     hostState.installTimeMs = Date.now();
   }
 }
@@ -216,6 +363,7 @@ async function maybePersistInstallTime() {
     // Storage failed — fall back to "now" so we don't drop
     // brand-new downloads. (Worse than the persisted case, but
     // strictly better than denying all downloads.)
+    console.warn("DM Grabber: maybePersistInstallTime failed:", e);
     hostState.installTimeMs = Date.now();
   }
 }
@@ -254,6 +402,4 @@ chrome.runtime.onStartup.addListener(async () => {
 // extension load are dropped (correct — they predate the
 // install) rather than being forwarded under a default install
 // time of 0 (which would let everything through).
-loadInstallTime()
-  .then(registerDownloadsListener)
-  .then(connect);
+loadInstallTime().then(registerDownloadsListener).then(connect);

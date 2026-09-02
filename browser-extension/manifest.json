@@ -24,8 +24,7 @@
   "permissions": ["nativeMessaging", "downloads", "tabs", "activeTab", "scripting", "storage"],
   "host_permissions": ["<all_urls>"],
   "background": {
-    "service_worker": "background.js",
-    "type": "module"
+    "scripts": ["background.js"]
   },
   "content_scripts": [
     {
@@ -39,5 +38,11 @@
       "resources": ["popup.html", "popup.js"],
       "matches": ["<all_urls>"]
     }
-  ]
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "dm-grabber@dm-project",
+      "strict_min_version": "109.0"
+    }
+  }
 }

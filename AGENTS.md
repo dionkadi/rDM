@@ -71,13 +71,25 @@ DM/
 │   └── native-host/           # Standalone bin: dm-native-host (Chrome native-messaging shim)
 │       └── src/main.rs        # read/write 4-byte-LE-prefixed frames, extract_media_urls, forward_url
 ├── browser-extension/         # MV3 (manifest_version: 3) extension
-│   ├── manifest.json          # Chrome / Edge / Brave / Arc (service worker)
-│   ├── manifest.firefox.json  # Firefox 109+ (event page + gecko id)
-│   ├── background.js          # service_worker (Chrome) / event page (Firefox)
-│   │                          #   → chrome.runtime.connectNative("com.app.dm.native")
+│   ├── manifest.json          # Chrome / Edge / Brave / Arc + Firefox 109+ (unified)
+│   │                          #   Chrome treats this as a service worker; Firefox reads
+│   │                          #   `browser_specific_settings.gecko` and runs the
+│   │                          #   `background.scripts` array as a non-persistent event page.
+│   ├── background.js          # MV3 background page → chrome.runtime.connectNative(...)
+│   │                          #   No ESM imports — works in both service-worker (Chrome)
+│   │                          #   and event-page (Firefox) contexts. `chrome.runtime.lastError`
+│   │                          #   is captured in the same tick as `connectNative` (Firefox
+│   │                          #   clears it on the next runtime API call).
 │   ├── content.js             # scans <video>/<source>/<audio>/<a> for media URLs + HLS/DASH hints
-│   ├── popup.html / popup.js  # "Grab page media" + "Open DM" buttons (themed; shows host status)
-│   ├── com.app.dm.native.json # Native messaging host manifest (path is placeholder)
+│   ├── popup.html / popup.js  # "Grab page media" + "Open DM" + "Test host connection" buttons
+│   │                          #   (themed; shows host status + a red error block with the
+│   │                          #   actual `chrome.runtime.lastError.message` and a hint).
+│   ├── com.app.dm.native.json           # Cross-browser host-manifest template (uses both
+│   │                                    #   `allowed_origins` and `allowed_extensions`).
+│   ├── com.app.dm.native.chrome.json    # Chrome-only template (`allowed_origins` only,
+│   │                                    #   no `REPLACE_WITH_…` placeholder leak).
+│   ├── com.app.dm.native.firefox.json   # Firefox-only template (`allowed_extensions` only,
+│   │                                    #   no `chrome-extension://…` URL at all).
 │   └── INSTALL.md             # Build + register the native host, per-browser notes
 ├── .pkgconfig-shim/           # *.pc shims for libappindicator3 / ayatana-appindicator3
 ├── build-with-shim.sh         # Wraps `npm run tauri build`; prepends .pkgconfig-shim to PKG_CONFIG_PATH
@@ -137,7 +149,7 @@ A pure-stdio binary (`dm-native-host`) reads Chrome native-messaging frames (4-b
 
 `src-tauri/src/native_host.rs` additionally tracks `NativeHostStatus { bound: AtomicBool, last_event_unix: AtomicU64 }`. The `probe_native_host` Tauri command returns a snapshot; the Settings → Extensions tab polls it every 3s.
 
-The browser extension MV3 background service worker (or event page on Firefox) connects via `chrome.runtime.connectNative("com.app.dm.native")` and relays URLs from `chrome.downloads.onCreated`, from the content script's media scrape, and from the popup's manual "Grab" button. `manifest.json` is the Chrome/Edge/Brave/Arc target; `manifest.firefox.json` swaps in `browser_specific_settings.gecko.id = dm-grabber@dm-project` and a `background.scripts` event page (no service worker) so it loads on Firefox 109+.
+The browser extension MV3 background connects via `chrome.runtime.connectNative("com.app.dm.native")` and relays URLs from `chrome.downloads.onCreated`, from the content script's media scrape, and from the popup's manual "Grab" button. **A single `manifest.json` serves both Chrome/Edge/Brave/Arc and Firefox 109+**: Chrome reads `background.scripts` as a service worker (Chrome 121+); Firefox 109+ reads the same array as a non-persistent event page and uses the `browser_specific_settings.gecko.id = dm-grabber@dm-project` block to fix the extension ID. Firefox's `about:debugging` → "Load Temporary Add-on…" requires `background.scripts` and rejects `background.service_worker` (a transitional state in Firefox 109–127), so the array form is mandatory; `background.service_worker` was removed entirely.
 
 **Chrome extension ID must match `allowed_origins` in the host manifest.** Every Chrome extension installed via "Load unpacked" gets a unique random ID. The native-messaging host manifest at `~/.config/google-chrome/NativeMessagingHosts/com.app.dm.native.json` ships with the literal placeholder `chrome-extension://REPLACE_WITH_YOUR_CHROME_EXTENSION_ID/` — the user **must** copy the actual ID from `chrome://extensions` and replace that string in `allowed_origins` (and re-launch Chrome to pick up the manifest change). If they skip this, Chrome refuses to start the host with `Access to the specified native messaging host is blocked`, the badge turns red, the popup shows `Native host not running`, and downloads silently never arrive. INSTALL.md calls this out explicitly but it is the most common install failure. Firefox is fine — the host manifest's `allowed_extensions` already contains the fixed `dm-grabber@dm-project` Gecko ID.
 
@@ -150,6 +162,12 @@ The browser extension MV3 background service worker (or event page on Firefox) c
 **The `media` message type is a hard boundary, not a soft one.** The previous content-script auto-scrape path used to send `{type: "media", urls: [...]}` on every page load / DOM mutation, which flooded DM. The content script no longer auto-sends, and the background's `onMessage` handler now **drops `type === "media"` on the floor** — even if a stale cached content script (or a third-party script) tries to send it, the background refuses. Only `type === "grab"` (the popup button's explicit ask) is accepted. This is a deliberate, documented boundary so the next refactor can't accidentally re-enable passive capture by leaving a "harmless" `media` branch in the handler.
 
 **Reloading the extension is required after pulling new code.** Chrome's MV3 service worker is long-lived and **does not pick up file changes on disk** — the user must click **Reload** on the extension card in `chrome://extensions`, or restart Chrome, for new `background.js` / `content.js` to take effect. If the user reports "I pulled the fix but it's still broken", the first thing to check is the service worker's "Inspect views" / "Service worker" link in `chrome://extensions` and confirm the source actually shows the new code.
+
+**The extension **takes over** Chrome's download, it doesn't double it.** The `chrome.downloads.onCreated` listener in `background.js` does two things: forward the URL to DM **and** call `chrome.downloads.cancel(downloadId)` + `chrome.downloads.erase({id, removeFromDisk: false})` on Chrome's own copy. Without the cancel, the upstream — especially a single-connection CDN mirror — sees two racing connections and may truncate one of them, leaving DM with a tiny stub body that the engine then wrongly auto-completes. With the cancel, DM is the only one talking to the mirror and the body stream is the real file. The `removeFromDisk: false` is intentional: Chrome's partial file is not the real file and we don't want to keep it around in the user's Downloads folder.
+
+**Open-ended auto-completion requires a minimum body size.** When the probe couldn't discover `Content-Length` (e.g. the proxy didn't relay it), the engine creates a single chunk with `end = u64::MAX` and treats end-of-stream as completion. **Without a guard, a 879 B body that closes cleanly is marked `Completed`**, which is the user-reported "879 B downloaded, labeled Completed" failure. The engine now requires `d.downloaded >= OPEN_ENDED_MIN_BYTES` (1 KB, set in `task.rs`) before auto-completing an open-ended transfer; below that, the transfer is marked `Error` with a clear "open-ended transfer truncated at N B" message. 1 KB is below the size of any reasonable user-facing download and well above the size of an HTML error page or 302-redirect stub. Regression test: `truncated_body_marks_error_not_completed` in `crates/engine/tests/proxy_strict_range.rs`.
+
+**`fmtBytes` is unit-aware up to YB; open-ended chunks render a hint instead of a fake size.** The byte formatter in `src/lib/utils/formatters.ts` extends its unit array through `YB` and shows `≥1024 YB` for anything larger (so `u64::MAX` no longer renders as the misleading `"16777216.0 TB"` it used to — that came from capping at `TB` and dividing). Additionally, the chunk display in `DownloadRow.svelte` detects open-ended chunks (`chunk.end` not finite or `> Number.MAX_SAFE_INTEGER`) and renders `879 B · unknown total` instead of `879 B / 16 EB`, so the sentinel can never leak into the UI.
 
 ## Frontend (`src/`)
 

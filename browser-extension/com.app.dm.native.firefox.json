@@ -1,0 +1,9 @@
+{
+  "name": "com.app.dm.native",
+  "description": "DM native-messaging host that forwards browser URLs to the DM app",
+  "path": "/home/tomg/Other/Codes/Projects/DM/target/release/dm-native-host",
+  "type": "stdio",
+  "allowed_extensions": [
+    "dm-grabber@dm-project"
+  ]
+}
