@@ -119,7 +119,9 @@ function collectMedia() {
     });
   // Open Graph and Twitter card video tags.
   document
-    .querySelectorAll('meta[property="og:video"], meta[name="twitter:player:stream"]')
+    .querySelectorAll(
+      'meta[property="og:video"], meta[name="twitter:player:stream"]',
+    )
     .forEach((el) => {
       const c = el.getAttribute("content");
       if (c && /^https?:/i.test(c)) urls.add(c);
@@ -130,23 +132,34 @@ function collectMedia() {
 // Capture-phase click interceptor. Registered once at document
 // load; event delegation means it picks up clicks on dynamically
 // added anchors without an observer.
-if (document.documentElement) {
-  document.documentElement.addEventListener("click", onClickCapture, {
-    capture: true,
-    passive: false, // we call preventDefault, so passive must be false
-  });
-} else {
-  // The page is still being parsed and `documentElement` isn't
-  // there yet — wait for it.
-  document.addEventListener("readystatechange", () => {
-    if (document.documentElement && !document.documentElement.__dmClickBound) {
-      document.documentElement.__dmClickBound = true;
-      document.documentElement.addEventListener("click", onClickCapture, {
-        capture: true,
-        passive: false,
-      });
-    }
-  });
+//
+// **CRITICAL**: only register on real http(s) pages. In Firefox
+// 109+, content scripts DO run on `about:newtab` / `about:home`
+// when the manifest's matches pattern includes `<all_urls>` —
+// and on those pages a capture-phase click listener on
+// `documentElement` breaks the new-tab page itself (the search
+// bar / address bar / tile clicks all stop working, IME input
+// drops events, etc). We bail here if we're on a non-http(s) URL
+// so we never register a listener on privileged pages.
+const _loc = (typeof location !== "undefined" ? location : null);
+const _proto = _loc ? _loc.protocol : "";
+if (_proto === "http:" || _proto === "https:") {
+  const install = () => {
+    if (!document.documentElement) return;
+    if (document.documentElement.__dmClickBound) return;
+    document.documentElement.__dmClickBound = true;
+    document.documentElement.addEventListener("click", onClickCapture, {
+      capture: true,
+      passive: false, // we call preventDefault, so passive must be false
+    });
+  };
+  if (document.documentElement) {
+    install();
+  } else {
+    // The page is still being parsed and `documentElement` isn't
+    // there yet — wait for it.
+    document.addEventListener("readystatechange", install, { once: true });
+  }
 }
 
 // Respond to explicit "collect" messages from the popup / background.
