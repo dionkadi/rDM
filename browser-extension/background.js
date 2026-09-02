@@ -96,7 +96,10 @@ function connect() {
     setNativeError(chrome.runtime.lastError.message);
     try {
       port.disconnect();
-    } catch (_) {}
+    } catch (e) {
+      // The port may already be closed; not interesting.
+      void e;
+    }
     port = null;
     return null;
   }
@@ -136,7 +139,10 @@ function send(payload) {
     setNativeError(String(e && e.message ? e.message : e));
     try {
       p.disconnect();
-    } catch (_) {}
+    } catch (innerErr) {
+      // The port may already be closed; not interesting.
+      void innerErr;
+    }
     port = null;
     return false;
   }
@@ -151,12 +157,18 @@ async function probeHost() {
   if (port) {
     try {
       port.disconnect();
-    } catch (_) {}
+    } catch (e) {
+      // The port may already be closed; not interesting.
+      void e;
+    }
     port = null;
   }
   hostState.connected = false;
   hostState.lastError = null;
-  const p = connect();
+  // Force a fresh `connectNative` attempt. We discard the
+  // returned port — `hostState.connected` and the onDisconnect
+  // listener track the actual state.
+  connect();
   // Drain a tick so Firefox's async disconnect can run.
   await new Promise((r) => setTimeout(r, 50));
   return {
@@ -268,8 +280,9 @@ function takeOverChromeDownload(item) {
             void chrome.runtime.lastError.message;
           }
         });
-      } catch (_) {
-        /* best-effort */
+      } catch (e) {
+        // Best-effort cleanup. Any failure here is non-fatal.
+        void e;
       }
     });
   } catch (e) {
@@ -311,6 +324,20 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         send({ type: "capture", url: res.pageUrl, urls: res.urls });
       }
     });
+  } else if (msg.type === "download-click") {
+    // **Primary takeover path.** The content script has already
+    // synchronously suppressed the browser's default "start a
+    // download" behaviour in its capture-phase click listener.
+    // Forward the URL to DM via the native host. The browser will
+    // not create a download entry because we never let the click
+    // reach the browser's own anchor-click handler.
+    if (msg.url) {
+      send({
+        type: "download",
+        url: msg.url,
+        filename: msg.filename || "",
+      });
+    }
   } else if (msg.type === "open") {
     send({ type: "open" });
   }
