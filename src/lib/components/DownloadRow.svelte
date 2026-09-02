@@ -176,12 +176,19 @@
           {#if download.chunks.length > 0}
             <div class="chunks">
               {#each download.chunks as chunk}
-                {@const size = chunk.end - chunk.start + 1}
-                {@const chunkPct = (chunk.downloaded / size) * 100}
+                {@const isOpenEnded = !Number.isFinite(chunk.end) || chunk.end > Number.MAX_SAFE_INTEGER}
+                {@const size = isOpenEnded ? 0 : chunk.end - chunk.start + 1}
+                {@const chunkPct = isOpenEnded ? 0 : (chunk.downloaded / size) * 100}
                 <div class="chunk">
                   <div class="chunk-head">
                     <span>#{chunk.index}</span>
-                    <span>{fmtBytes(chunk.downloaded)} / {fmtBytes(size)}</span>
+                    <span>
+                      {fmtBytes(chunk.downloaded)}{#if isOpenEnded}
+                        <span class="open-ended-hint">· unknown total</span>
+                      {:else}
+                        &nbsp;/&nbsp;{fmtBytes(size)}
+                      {/if}
+                    </span>
                   </div>
                   <div class="chunk-bar">
                     <div class="chunk-fill" style="width: {chunkPct}%"></div>
@@ -464,6 +471,16 @@
     font-size: 10.5px;
     color: var(--muted);
     margin-bottom: 5px;
+  }
+  /* "unknown total" hint shown next to the running byte count for
+     open-ended chunks (where the proxy didn't relay Content-Length
+     and the engine uses a single chunk with end = u64::MAX). The
+     size column is hidden in that case so the user never sees
+     "879 B / 16777216.0 TB" or similar sentinel-leak. */
+  .open-ended-hint {
+    color: var(--text-faint);
+    font-style: italic;
+    margin-left: 4px;
   }
   .chunk-bar {
     height: 4px;

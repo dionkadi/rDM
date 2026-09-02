@@ -1,0 +1,29 @@
+# CODEOWNERS — GitHub will auto-request review from the listed
+# users/teams when a PR touches a matching path. The match is
+# last-match-wins, so the most specific path should be at the
+# bottom of each block.
+#
+# Replace @your-github-handle with your real GitHub user or team
+# before you push. Until you do, GitHub will silently fall back to
+# "no required reviewers", which is the same as having no file at
+# all — so this file is inert until you fill it in.
+
+# Default owner for everything not explicitly listed below.
+# Comment this out if you'd rather have no global owner.
+/                                         dionkadi
+
+# CI / release machinery
+/.github/                                 dionkadi
+/.github/workflows/                       dionkadi
+
+# Build & packaging scripts
+/scripts/                                 dionkadi
+/browser-extension/scripts/               dionkadi
+/build-with-shim.sh                       dionkadi
+
+# Tauri shell + bundle config (the place where version bumps,
+# bundle targets, signing identities, and CSP live)
+/src-tauri/tauri.conf.json                dionkadi
+/src-tauri/Cargo.toml                     dionkadi
+/src-tauri/capabilities/                  dionkadi
+/src-tauri/icons/                         dionkadi

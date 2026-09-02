@@ -1,0 +1,212 @@
+name: Release
+
+# Pushing a tag matching `v*` (e.g. v0.1.0, v0.1.0-rc.1) runs the full
+# desktop matrix plus a parallel extension-packaging job, then publishes
+# every artifact to a GitHub Release. Tags ending in `-rc.*` are
+# automatically marked as pre-releases.
+#
+# Pre-flight: every push to main / PR runs `.github/workflows/ci.yml`,
+# which runs `cargo check` + `svelte-check` + extension lint, so a tag
+# pushed to a broken main will already have been red on the PR that
+# introduced the break.
+#
+# Required secrets (none for ad-hoc macOS):
+#   - none for this configuration
+#
+# Optional (only needed for the signed macOS / Windows variants — see
+# comments inside the matrix entries):
+#   - APPLE_CERTIFICATE          base64-encoded .p12 Developer ID cert
+#   - APPLE_CERTIFICATE_PASSWORD password for the .p12
+#   - APPLE_SIGNING_IDENTITY     "Developer ID Application: <Name> (<TEAMID>)"
+#   - APPLE_ID                   Apple ID email for notarization
+#   - APPLE_PASSWORD             app-specific password
+#   - APPLE_TEAM_ID              10-char team id
+#   - WINDOWS_CERT_FILE          base64-encoded .pfx code-signing cert
+#   - WINDOWS_CERT_PASSWORD      password for the .pfx
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # required for softprops/action-gh-release to create a release
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────
+  # 1. Desktop builds — one runner per OS, all upload to the same
+  #    release via `tauri-apps/tauri-action`.
+  # ───────────────────────────────────────────────────────────────────
+  desktop:
+    name: Desktop (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu 22.04 has every Tauri Linux dep in the default repos
+          # (libwebkit2gtk-4.1-0, libappindicator3-1, librsvg2, etc.).
+          # The `tauri-action` action's pre-build step installs the
+          # remaining toolchain bits (lld, GTK dev headers) and
+          # configures the workspace target/ for the Tauri CLI.
+          - platform: linux
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            # Tauri produces .deb + .AppImage on Linux out of the box
+            # when bundle.targets is "all" (see tauri.conf.json).
+            args: ""
+
+          # windows-2022 ships with MSVC + WiX (Tauri's MSI bundler
+          # needs WiX 3.x; tauri-action installs it). No signing here
+          # — remove `args:` and set `signingIdentity:` to enable.
+          - platform: windows
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+            args: ""
+
+          # macOS 13 (Ventura) for x86_64 + arm64 in one runner. We
+          # build a universal binary by passing both `--target`s to
+          # tauri-action, which runs the bundler twice and lipo-s the
+          # results. No `signingIdentity` → ad-hoc signed; users get
+          # a Gatekeeper warning on first launch.
+          - platform: macos
+            os: macos-13
+            target: universal-apple-darwin
+            args: "--target universal-apple-darwin"
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target == 'universal-apple-darwin' && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.target }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            crates/engine
+            crates/native-host
+            src-tauri -> target
+
+      - name: Install Linux system dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build frontend (type check + bundle)
+        run: npm run check && npm run build
+
+      - name: Run Tauri build & publish to release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          # GitHub token is required so tauri-action can upload the
+          # produced installers to the same release this workflow
+          # creates below (in the `extension` job). We use
+          # `GITHUB_TOKEN` so the upload is attributed to the bot
+          # account, not a personal PAT.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "DM ${{ github.ref_name }}"
+          releaseBody: |
+            ## DM ${{ github.ref_name }}
+
+            Desktop installers for Linux, Windows, and macOS, plus the
+            browser extension packages for Chrome/Edge/Brave/Arc and Firefox.
+
+            ### Install
+
+            | Platform | Installer | Notes |
+            | --- | --- | --- |
+            | Linux | `.deb` / `.AppImage` | `sudo dpkg -i DM_*_amd64.deb` or `chmod +x DM_*_AppImage && ./DM_*_AppImage` |
+            | Windows | `.msi` / `.exe` | Run the installer; SmartScreen will warn on first launch (unsigned) |
+            | macOS | `.dmg` / `.app` | Drag to Applications. First launch: right-click → Open to bypass Gatekeeper (unsigned) |
+
+            ### Browser extension
+
+            | Browser | File | Install |
+            | --- | --- | --- |
+            | Chrome / Edge / Brave / Arc | `dm-grabber-${{ github.ref_name }}.zip` | `chrome://extensions` → enable Developer mode → "Load unpacked" (extract the .zip first) |
+            | Firefox | `dm-grabber-${{ github.ref_name }}.xpi` | Drag the .xpi onto a Firefox window, or `about:addons` → Install Add-on From File |
+
+            See `browser-extension/INSTALL.md` for the native-messaging
+            host setup, which is required before "Send to DM" will work.
+          releaseDraft: true
+          prerelease: ${{ contains(github.ref_name, '-rc') }}
+          # `includeUpdaterJson` would add a latest.json for Tauri's
+          # built-in updater. Disabled for now because we're not
+          # running the updater plugin; re-enable when an auto-update
+          # path is added.
+          includeUpdaterJson: false
+          args: ${{ matrix.args }}
+
+  # ───────────────────────────────────────────────────────────────────
+  # 2. Browser extension packaging. Runs in parallel with the desktop
+  #    matrix, then uploads the .xpi + .zip to the same release.
+  # ───────────────────────────────────────────────────────────────────
+  extension:
+    name: Browser extension (.xpi + .zip)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Make package script executable
+        working-directory: browser-extension
+        run: chmod +x scripts/package.sh
+
+      - name: Package extension
+        working-directory: browser-extension
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          mkdir -p dist
+          ./scripts/package.sh "$VERSION"
+
+      - name: Verify packages
+        working-directory: browser-extension/dist
+        run: |
+          set -e
+          echo "── contents of .zip ──"
+          unzip -l dm-grabber-${VERSION}.zip | head -30
+          echo
+          echo "── contents of .xpi ──"
+          unzip -l dm-grabber-${VERSION}.xpi | head -30
+          echo
+          echo "── sanity: manifest.json valid JSON? ──"
+          python3 -c "import json, sys, zipfile; z = zipfile.ZipFile('dm-grabber-${VERSION}.zip'); m = json.loads(z.read('manifest.json')); assert m['manifest_version'] == 3, m; print('OK', m['name'], m['version'])"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            browser-extension/dist/dm-grabber-${{ github.ref_name }}.zip
+            browser-extension/dist/dm-grabber-${{ github.ref_name }}.xpi
+          fail_on_unmatched_files: true

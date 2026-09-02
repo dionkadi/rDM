@@ -46,6 +46,28 @@ pub const CHUNK_STALL_SECS: u64 = 5 * 60;
 /// "probe timed out" instead of a 30 s blank screen.
 pub const PROBE_TIMEOUT_SECS: u64 = 15;
 
+/// Minimum body size (in bytes) we accept before auto-completing an
+/// **open-ended** download (one where the probe couldn't discover
+/// `Content-Length` and we created a chunk with `end == u64::MAX`).
+///
+/// When the proxy / CDN doesn't relay `Content-Length` (e.g.
+/// `mirrors.ustc.edu.cn` for GitHub releases, `cdn.akaere.online`,
+/// etc.), the chunk worker treats the body's end-of-stream as
+/// completion. Without this guard, a truncated body — caused by the
+/// proxy aborting the upstream connection because Chrome's own
+/// download was racing ours, or because the upstream sent a 200-OK
+/// with a placeholder body — would be marked `Completed` with a
+/// misleading on-disk size (e.g. 879 B for a 142 MB file).
+///
+/// 1 KB is below the size of any reasonable user-facing download and
+/// well above the size of an HTML error page or 302-redirect stub
+/// that a misbehaving proxy might serve as the "complete" body. A
+/// download that ends with less than this is marked `Error` with a
+/// clear "open-ended transfer truncated at N B" message so the user
+/// can see the problem and try again (with Chrome's own download
+/// cancelled by the extension, see `browser-extension/background.js`).
+pub const OPEN_ENDED_MIN_BYTES: u64 = 1024;
+
 /// How often the aggregator persists the in-memory `downloaded` and
 /// per-chunk `downloaded` counters to SQLite while a transfer is in
 /// flight. Without this, a hard kill (force-quit, power loss, kernel
@@ -421,6 +443,28 @@ pub async fn run_download(ctx: Arc<RunContext>, state: Arc<TaskState>) {
                 ctx.scheduler.release_download_state(&id);
                 return;
             }
+        } else {
+            // Open-ended: we have no `Content-Length` to assert against,
+            // but we can still catch the "the proxy gave us a 879-byte
+            // truncated body and closed the stream" failure mode.
+            // Anything below `OPEN_ENDED_MIN_BYTES` is almost
+            // certainly a redirect HTML, an error page, or a
+            // race-truncated response — not a real file.
+            if d.downloaded < OPEN_ENDED_MIN_BYTES {
+                let msg = format!(
+                    "open-ended transfer truncated at {} B (expected a real file \
+                     but the upstream closed the body stream almost immediately; \
+                     this is usually a CDN mirror that aborted the upstream \
+                     connection — retrying after a few seconds often works)",
+                    d.downloaded
+                );
+                d.status = DownloadStatus::Error;
+                d.error = Some(msg.clone());
+                let _ = ctx.storage.mark_error(&id, &msg);
+                ctx.emit(DownloadEvent::Error(d.clone()));
+                ctx.scheduler.release_download_state(&id);
+                return;
+            }
         }
 
         // Checksum verification.
@@ -476,7 +520,7 @@ pub fn sha256_of(path: &Path) -> Result<String, std::io::Error> {
         if n == 0 {
             break;
         }
-        hasher.update(&buf[..n]);
+        hasher.update(&buf[0..n]);
     }
     Ok(hex::encode(hasher.finalize()))
 }

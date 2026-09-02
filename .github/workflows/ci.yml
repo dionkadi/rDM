@@ -1,0 +1,144 @@
+name: CI
+
+# Runs on every push to main + every PR. Intentionally fast and
+# does NOT produce installers — that lives in release.yml and only
+# fires on a tag. The job here is to fail the PR before anyone tags
+# a broken main.
+#
+# Cost: ~3-5 min on a warm Rust cache. The Rust side is the slowest
+# because we have to compile the engine + tauri shell; we use
+# `cargo check` (not `cargo build`) to skip codegen for the
+# test-only paths.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  # Cancel an in-flight PR run when a new commit lands on the same
+  # branch. Don't cancel the main-branch build — that's the gate
+  # for tags.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────
+  # 1. Rust: cargo check on the whole workspace. Catches missing
+  #    modules, type errors, broken feature flags, and `pub`/private
+  #    drift between crates/engine and src-tauri.
+  # ───────────────────────────────────────────────────────────────────
+  rust:
+    name: Rust (cargo check)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            crates/engine
+            crates/native-host
+            src-tauri -> target
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            build-essential \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev
+
+      - name: cargo check (workspace)
+        run: cargo check --workspace --all-targets
+
+      - name: cargo test (engine, no integration)
+        # Engine unit tests are fast and catch regressions in the
+        # protocol / chunk / scheduler code without needing a
+        # network. Integration tests under tests/ are slower; we
+        # run them on a schedule or before releases, not on every PR.
+        run: cargo test -p dm-engine --lib
+
+  # ───────────────────────────────────────────────────────────────────
+  # 2. Frontend: svelte-check + a production bundle to catch
+  #    runtime-svelte-only issues (a11y warnings, unused props, etc.)
+  # ───────────────────────────────────────────────────────────────────
+  frontend:
+    name: Frontend (svelte-check + build)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: svelte-check
+        # AGENTS.md says `npm run check` must be 0 errors / 0 warnings.
+        # svelte-check exits non-zero on warnings only when --fail-on-warnings
+        # is set; the project treats warnings as errors by convention.
+        run: npm run check
+
+      - name: Production build
+        run: npm run build
+
+  # ───────────────────────────────────────────────────────────────────
+  # 3. Browser extension: manifest validity + script syntax. We
+  #    shell out to Node to validate the manifest JSON, and run
+  #    `node --check` on each .js file to catch parse errors. This
+  #    is the equivalent of a lint pass for the extension; full
+  #    ESLint would be heavier and isn't required for the .xpi/.zip
+  #    packaging to succeed.
+  # ───────────────────────────────────────────────────────────────────
+  extension:
+    name: Browser extension
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: browser-extension
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Validate manifest.json
+        run: |
+          node -e '
+            const fs = require("fs");
+            const m = JSON.parse(fs.readFileSync("manifest.json", "utf8"));
+            if (m.manifest_version !== 3) throw new Error("expected MV3");
+            if (!m.background || !Array.isArray(m.background.scripts)) {
+              throw new Error("background.scripts must be an array (Firefox 109+ event-page compat)");
+            }
+            if (m.background.service_worker) {
+              throw new Error("background.service_worker is set; Firefox 109-127 rejects it. Use background.scripts only.");
+            }
+            if (!m.browser_specific_settings?.gecko?.id) {
+              throw new Error("missing browser_specific_settings.gecko.id (Firefox needs a fixed extension ID)");
+            }
+            console.log("manifest OK:", m.name, m.version);
+          '
+
+      - name: Syntax-check all JS files
+        run: |
+          for f in background.js content.js popup.js; do
+            echo "checking $f"
+            node --check "$f"
+          done

@@ -1,12 +1,27 @@
 // Formatting utilities — used across all components for consistent display
 
+/**
+ * Format a byte count as a human-readable string. The unit array
+ * extends to **YB** (yottabyte) so values up to ~2^80 render as
+ * "1024.0 YB" instead of the old "16777216.0 TB" bug (where
+ * `u64::MAX` rounded through a double and then divided by
+ * `1024^4` produced a meaningless number). Anything above 1024 YB
+ * renders as ">1024 YB" rather than overflowing into scientific
+ * notation or `Infinity`.
+ */
 export function fmtBytes(n: number | null | undefined, decimals = 1): string {
   if (n == null) return "—";
   if (n === 0) return "0 B";
+  if (!Number.isFinite(n) || n < 0) return "—";
   const k = 1024;
-  const sizes = ["B", "KB", "MB", "GB", "TB"];
+  const sizes = ["B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"];
   const i = Math.min(Math.floor(Math.log(n) / Math.log(k)), sizes.length - 1);
-  return `${(n / Math.pow(k, i)).toFixed(i === 0 ? 0 : decimals)} ${sizes[i]}`;
+  if (i === sizes.length - 1 && n >= k ** i) {
+    // Top of the ladder. Don't divide further; show the cap with
+    // a `+` so the user knows the value is at least this big.
+    return `≥1024 ${sizes[i]}`;
+  }
+  return `${(n / k ** i).toFixed(i === 0 ? 0 : decimals)} ${sizes[i]}`;
 }
 
 export function fmtRate(bps: number | null | undefined, decimals = 1): string {
@@ -15,10 +30,13 @@ export function fmtRate(bps: number | null | undefined, decimals = 1): string {
   const k = 1024;
   const sizes = ["B/s", "KB/s", "MB/s", "GB/s"];
   const i = Math.min(Math.floor(Math.log(bps) / Math.log(k)), sizes.length - 1);
-  return `${(bps / Math.pow(k, i)).toFixed(i === 0 ? 0 : decimals)} ${sizes[i]}`;
+  return `${(bps / k ** i).toFixed(i === 0 ? 0 : decimals)} ${sizes[i]}`;
 }
 
-export function fmtPercent(downloaded: number, total: number | null | undefined): string {
+export function fmtPercent(
+  downloaded: number,
+  total: number | null | undefined,
+): string {
   if (!total || total === 0) return "?";
   return `${((downloaded / total) * 100).toFixed(1)}%`;
 }
@@ -41,7 +59,9 @@ export function fmtTime(hours: number, minutes: number): string {
   return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
 }
 
-export function fmtRelativeTime(date: string | Date | null | undefined): string {
+export function fmtRelativeTime(
+  date: string | Date | null | undefined,
+): string {
   if (!date) return "—";
   const d = typeof date === "string" ? new Date(date) : date;
   const diff = Date.now() - d.getTime();
@@ -116,10 +136,13 @@ export function throttle<T extends (...args: any[]) => unknown>(
       fn(...args);
     } else {
       if (timer) clearTimeout(timer);
-      timer = setTimeout(() => {
-        last = Date.now();
-        fn(...args);
-      }, ms - (now - last));
+      timer = setTimeout(
+        () => {
+          last = Date.now();
+          fn(...args);
+        },
+        ms - (now - last),
+      );
     }
   };
 }

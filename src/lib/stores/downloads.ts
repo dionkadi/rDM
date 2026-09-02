@@ -129,7 +129,10 @@ export async function removeDownload(id: string): Promise<void> {
   await refreshDownloads();
 }
 
-export async function setDownloadSpeedLimit(id: string, limit: number | null): Promise<void> {
+export async function setDownloadSpeedLimit(
+  id: string,
+  limit: number | null,
+): Promise<void> {
   await api.setSpeedLimit(id, limit);
   await refreshDownloads();
 }
@@ -179,8 +182,12 @@ export function stopEventListener(): void {
 // ── Derived stores ──────────────────────────────────────────────────
 export const counts = derived(downloads, ($downloads) => ({
   all: $downloads.length,
-  active: $downloads.filter((d) => !["completed", "error", "canceled"].includes(d.status)).length,
-  queued: $downloads.filter((d) => d.status === "queued" || d.status === "scheduled").length,
+  active: $downloads.filter(
+    (d) => !["completed", "error", "canceled"].includes(d.status),
+  ).length,
+  queued: $downloads.filter(
+    (d) => d.status === "queued" || d.status === "scheduled",
+  ).length,
   paused: $downloads.filter((d) => d.status === "paused").length,
   completed: $downloads.filter((d) => d.status === "completed").length,
   errored: $downloads.filter((d) => d.status === "error").length,
@@ -193,12 +200,17 @@ export const totalDownloaded = derived(downloads, ($downloads) =>
 );
 
 export const hasActive = derived(downloads, ($downloads) =>
-  $downloads.some((d) => d.status === "downloading" || d.status === "connecting"),
+  $downloads.some(
+    (d) => d.status === "downloading" || d.status === "connecting",
+  ),
 );
 
 // ── Smart folders (file type groupings) ────────────────────────────
 export const smartFolders = derived(downloads, ($downloads) => {
-  const buckets: Record<string, { count: number; downloaded: number; total: number }> = {
+  const buckets: Record<
+    string,
+    { count: number; downloaded: number; total: number }
+  > = {
     video: { count: 0, downloaded: 0, total: 0 },
     audio: { count: 0, downloaded: 0, total: 0 },
     archive: { count: 0, downloaded: 0, total: 0 },
@@ -209,14 +221,52 @@ export const smartFolders = derived(downloads, ($downloads) => {
   };
 
   const extMap: Record<string, string> = {
-    mp4: "video", mkv: "video", webm: "video", mov: "video", avi: "video", flv: "video", "m3u8": "video",
-    mp3: "audio", wav: "audio", flac: "audio", ogg: "audio", aac: "audio", m4a: "audio",
-    zip: "archive", rar: "archive", "7z": "archive", gz: "archive", tar: "archive", tgz: "archive", bz2: "archive",
-    pdf: "document", doc: "document", docx: "document", xls: "document", xlsx: "document",
-    ppt: "document", pptx: "document", txt: "document", md: "document", rtf: "document",
-    jpg: "image", jpeg: "image", png: "image", gif: "image", webp: "image", svg: "image", bmp: "image",
-    exe: "binary", msi: "binary", appimage: "binary", deb: "binary", rpm: "binary", apk: "binary",
-    iso: "binary", img: "binary", dmg: "binary",
+    mp4: "video",
+    mkv: "video",
+    webm: "video",
+    mov: "video",
+    avi: "video",
+    flv: "video",
+    m3u8: "video",
+    mp3: "audio",
+    wav: "audio",
+    flac: "audio",
+    ogg: "audio",
+    aac: "audio",
+    m4a: "audio",
+    zip: "archive",
+    rar: "archive",
+    "7z": "archive",
+    gz: "archive",
+    tar: "archive",
+    tgz: "archive",
+    bz2: "archive",
+    pdf: "document",
+    doc: "document",
+    docx: "document",
+    xls: "document",
+    xlsx: "document",
+    ppt: "document",
+    pptx: "document",
+    txt: "document",
+    md: "document",
+    rtf: "document",
+    jpg: "image",
+    jpeg: "image",
+    png: "image",
+    gif: "image",
+    webp: "image",
+    svg: "image",
+    bmp: "image",
+    exe: "binary",
+    msi: "binary",
+    appimage: "binary",
+    deb: "binary",
+    rpm: "binary",
+    apk: "binary",
+    iso: "binary",
+    img: "binary",
+    dmg: "binary",
   };
 
   for (const d of $downloads) {

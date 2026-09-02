@@ -141,7 +141,7 @@ function collectMedia() {
 // bar / address bar / tile clicks all stop working, IME input
 // drops events, etc). We bail here if we're on a non-http(s) URL
 // so we never register a listener on privileged pages.
-const _loc = (typeof location !== "undefined" ? location : null);
+const _loc = typeof location === "undefined" ? null : location;
 const _proto = _loc ? _loc.protocol : "";
 if (_proto === "http:" || _proto === "https:") {
   const install = () => {
