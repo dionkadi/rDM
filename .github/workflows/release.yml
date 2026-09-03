@@ -114,7 +114,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "npm"
 
       - name: Install npm dependencies
@@ -180,6 +180,9 @@ jobs:
   extension:
     name: Browser extension (.xpi + .zip)
     runs-on: ubuntu-22.04
+    env:
+      # strip leading "v" from tag so filenames match what package.sh produces
+      VERSION: ${{ github.ref_name }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -190,38 +193,28 @@ jobs:
 
       - name: Package extension
         working-directory: browser-extension
-        env:
-          VERSION: ${{ github.ref_name }}
         run: |
           mkdir -p dist
           ./scripts/package.sh "$VERSION"
 
       - name: Verify packages
         working-directory: browser-extension/dist
-        env:
-          VERSION: ${{ github.ref_name }}
         run: |
           set -e
           echo "── contents of .zip ──"
-          unzip -l "dm-grabber-${VERSION}.zip" | head -30
+          unzip -l "dm-grabber-${VERSION#v}.zip" | head -30
           echo
           echo "── contents of .xpi ──"
-          unzip -l "dm-grabber-${VERSION}.xpi" | head -30
+          unzip -l "dm-grabber-${VERSION#v}.xpi" | head -30
           echo
           echo "── sanity: manifest.json valid JSON? ──"
-          python3 -c "
-            import json, sys, zipfile
-            z = zipfile.ZipFile('dm-grabber-${VERSION}.zip')
-            m = json.loads(z.read('manifest.json'))
-            assert m['manifest_version'] == 3, m
-            print('OK', m['name'], m['version'])
-          "
+          python3 -c "import json, sys, zipfile; z = zipfile.ZipFile('dm-grabber-${VERSION#v}.zip'); m = json.loads(z.read('manifest.json')); assert m['manifest_version'] == 3, m; print('OK', m['name'], m['version'])"  # noqa: line-too-long
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           files: |
-            browser-extension/dist/dm-grabber-${{ github.ref_name }}.zip
-            browser-extension/dist/dm-grabber-${{ github.ref_name }}.xpi
+            browser-extension/dist/dm-grabber-${VERSION#v}.zip
+            browser-extension/dist/dm-grabber-${VERSION#v}.xpi
           fail_on_unmatched_files: true
