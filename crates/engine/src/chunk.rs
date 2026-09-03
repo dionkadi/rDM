@@ -81,6 +81,78 @@ fn status_error(resp: reqwest::Response) -> ChunkError {
     )
 }
 
+/// Apply the user's per-download extra headers to a `RequestBuilder`,
+/// filtering the restricted set that reqwest refuses to set at
+/// `.send()` time (`Host`, `Content-Length`, `Accept-Encoding`).
+/// A restricted header is logged at `warn` and dropped; the rest
+/// are added verbatim. Header names are stored case-sensitively
+/// (reqwest's `HeaderMap` is case-insensitive on the wire, so
+/// `referer` and `Referer` both end up as the same header).
+fn apply_extra_headers(
+    req: &mut reqwest::RequestBuilder,
+    extra: &std::collections::BTreeMap<String, String>,
+) {
+    use std::str::FromStr;
+    const RESTRICTED: [&str; 3] = ["host", "content-length", "accept-encoding"];
+    for (k, v) in extra {
+        if RESTRICTED.iter().any(|r| r.eq_ignore_ascii_case(k)) {
+            log::warn!(
+                "ignoring restricted per-download header {k:?} \
+                 (reqwest refuses to override it)"
+            );
+            continue;
+        }
+        let Ok(name) = reqwest::header::HeaderName::from_str(k) else {
+            log::warn!("ignoring per-download header with invalid name: {k:?}");
+            continue;
+        };
+        let Ok(value) = reqwest::header::HeaderValue::from_str(v) else {
+            log::warn!("ignoring per-download header {k} with invalid value");
+            continue;
+        };
+        // `RequestBuilder::header` takes `self` by value, so we
+        // have to re-assign rather than mutate. This is a
+        // straight-line rewrite — the builder is a thin wrapper
+        // around an `Option<Request>` and `.header()` clones the
+        // inner state.
+        *req = std::mem::replace(req, reqwest::Client::new().get("http://localhost/")).header(name, value);
+    }
+}
+
+/// Base64-encode a byte slice (standard alphabet, with `+` and `/`).
+/// Used to build the `Authorization: Basic …` header for
+/// `AuthSpec::Basic`. We don't pull in a full base64 crate just
+/// for this — it's ~20 lines and avoids a transitive dep.
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: [u8; 64] =
+        *b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(((input.len() + 2) / 3) * 4);
+    let mut i = 0;
+    while i + 3 <= input.len() {
+        let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8) | (input[i + 2] as u32);
+        out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 6) & 0x3F) as usize] as char);
+        out.push(ALPHABET[(n & 0x3F) as usize] as char);
+        i += 3;
+    }
+    let rem = input.len() - i;
+    if rem == 1 {
+        let n = (input[i] as u32) << 16;
+        out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+        out.push('=');
+        out.push('=');
+    } else if rem == 2 {
+        let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8);
+        out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 6) & 0x3F) as usize] as char);
+        out.push('=');
+    }
+    out
+}
+
 /// Download `chunk` of `url` into `file_path`, resuming from already-downloaded
 /// bytes. `on_progress` is called with the number of bytes written per buffer so
 /// the task can update shared counters.
@@ -89,6 +161,18 @@ fn status_error(resp: reqwest::Response) -> ChunkError {
 /// progress before it's cancelled. The task layer passes
 /// `crate::task::CHUNK_STALL_SECS` (5 minutes). Tests pass a much
 /// shorter value so the test suite stays fast.
+///
+/// `extra_headers` are per-download headers the user added (Referer,
+/// custom User-Agent, Authorization, …). The engine filters out the
+/// restricted set (`Host`, `Content-Length`, `Accept-Encoding`) before
+/// applying them — reqwest would otherwise reject them at `.send()`
+/// time with a confusing error.
+///
+/// `auth` is the per-download `Authorization` source. `Basic` /
+/// `Bearer` are pre-baked into the header here; `Digest` is a
+/// placeholder (the engine would need a non-trivial challenge/response
+/// loop to do real digest auth) and is downgraded to `Basic` with a
+/// clear error in the download's `error` field.
 pub async fn download_chunk(
     client: &reqwest::Client,
     url: &str,
@@ -98,6 +182,8 @@ pub async fn download_chunk(
     control: &SharedControl,
     stall_timeout: Duration,
     mut on_progress: impl FnMut(u64),
+    extra_headers: &std::collections::BTreeMap<String, String>,
+    auth: Option<&crate::model::AuthSpec>,
 ) -> Result<u64, ChunkError> {
     use futures_util::StreamExt;
     let start = chunk.resume_offset();
@@ -189,6 +275,41 @@ pub async fn download_chunk(
     let mut req = client.get(url);
     if !range.is_empty() {
         req = req.header(reqwest::header::RANGE, &range);
+    }
+
+    // ── Per-download headers + auth ─────────────────────────────────
+    //
+    // Apply the user's extra headers first, then the auth header on
+    // top so the auth can't be shadowed by a user-supplied
+    // `Authorization`. We filter the restricted set
+    // (`Host`, `Content-Length`, `Accept-Encoding`) because reqwest
+    // refuses to set them at `.send()` time and a confusing error
+    // is worse than a silent drop. A restricted header in
+    // `extra_headers` is logged and ignored.
+    apply_extra_headers(&mut req, extra_headers);
+
+    // `Digest` is a placeholder for a future digest auth
+    // implementation (the engine would need a challenge/response
+    // loop, which is non-trivial). For v1 we downgrade to `Basic`
+    // and surface a clear error in the download's `error` field
+    // if the server actually challenges us.
+    if let Some(spec) = auth {
+        match spec {
+            crate::model::AuthSpec::Basic { username, password } => {
+                let token = base64_encode(format!("{username}:{password}").as_bytes());
+                req = req.header(reqwest::header::AUTHORIZATION, format!("Basic {token}"));
+            }
+            crate::model::AuthSpec::Bearer { token } => {
+                req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            crate::model::AuthSpec::Digest { username, password } => {
+                log::warn!(
+                    "digest auth not yet implemented; downgrading to Basic for {url} (user={username})"
+                );
+                let token = base64_encode(format!("{username}:{password}").as_bytes());
+                req = req.header(reqwest::header::AUTHORIZATION, format!("Basic {token}"));
+            }
+        }
     }
     let resp = match req.send().await {
         Ok(r) => r,
@@ -384,6 +505,8 @@ mod tests {
             &control,
             Duration::from_millis(1000),
             |_| {},
+            &std::collections::BTreeMap::new(),
+            None,
         )
         .await;
         let elapsed = start.elapsed();

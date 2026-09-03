@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
+  import { get } from "svelte/store";
   import { fly, fade } from "svelte/transition";
   import { flip } from "svelte/animate";
   import { cubicOut } from "svelte/easing";
@@ -14,8 +15,10 @@
     StatusBar,
     Toast,
     CaptureDialog,
+    BulkActionBar,
   } from "./lib/components";
   import * as api from "./lib/api";
+  import { setDownloadPriority as setPriority } from "./lib/api";
   import {
     downloads,
     aggregateSpeed,
@@ -28,6 +31,11 @@
     cancelDownload,
     removeDownload,
     setDownloadSpeedLimit,
+    bulkPause,
+    bulkResume,
+    bulkRemove,
+    bulkSetLimit,
+    reorderDownloads,
     startSpeedMonitor,
     stopSpeedMonitor,
     startEventListener,
@@ -45,6 +53,14 @@
     dragActive,
     demoMode,
     showToast,
+    selectedIds,
+    hasSelection,
+    selectAll,
+    clearSelection,
+    lastSelectedId,
+    selectOne,
+    toggleSelect,
+    selectRange,
     type FilterKey,
   } from "./lib/stores/ui";
   import { settings, loadSettings } from "./lib/stores/settings";
@@ -274,6 +290,14 @@
       else if (type === "cancel") await cancelDownload(id);
       else if (type === "remove") await removeDownload(id);
       else if (type === "set-limit") await setDownloadSpeedLimit(id, limit);
+      else if (type === "set-priority") {
+        // Per-download priority (0 = low, 1 = normal, 2 = high).
+        // The engine clamps to `[0, 2]`. We don't refresh the
+        // full list because the engine emits a `StatusChanged`
+        // event with the new priority, which the event
+        // listener merges into the store.
+        await setPriority(id, limit);
+      }
       else if (type === "open-folder") {
         // Find the download's save_path and hand it to the Rust opener.
         // The command opens the parent directory (or reveals the file
@@ -293,6 +317,157 @@
       }
     } catch (err) {
       showToast({ kind: "error", title: "Action failed", message: String(err) });
+    }
+  }
+
+  // ── Bulk action handler ──────────────────────────────────────
+  //
+  // The `BulkActionBar` dispatches `{ type, ids, limit? }` events
+  // with an *array* of ids (vs. the single-id per-row events from
+  // `onAction`). We fan them out to the bulk store helpers, which
+  // run all the per-row Tauri calls in parallel via `Promise.allSettled`.
+  // We *do not* clear the selection on success — the user can see
+  // the rows re-render and decide whether to clear or do another
+  // action. We *do* clear on remove (the rows are gone anyway).
+  async function onBulkAction(e: CustomEvent) {
+    const { type, ids, limit } = e.detail as {
+      type: string;
+      ids: string[];
+      limit?: number | null;
+    };
+    if (!ids || ids.length === 0) return;
+
+    if ($demoMode) {
+      // Demo mode: mutate the local store directly, mirroring
+      // the single-row branch in `onAction`.
+      const idSet = new Set(ids);
+      downloads.update((list) => {
+        if (type === "remove") return list.filter((d) => !idSet.has(d.id));
+        return list.map((d) => {
+          if (!idSet.has(d.id)) return d;
+          if (type === "pause") return { ...d, status: "paused" as const };
+          if (type === "resume") return { ...d, status: "downloading" as const };
+          if (type === "set-limit") return { ...d, speedLimit: limit ?? null };
+          return d;
+        });
+      });
+      if (type === "remove") clearSelection();
+      showToast({ kind: "info", title: `${ids.length} ${verbFor(type)}` });
+      return;
+    }
+
+    try {
+      if (type === "pause") await bulkPause(ids);
+      else if (type === "resume") await bulkResume(ids);
+      else if (type === "remove") await bulkRemove(ids);
+      else if (type === "set-limit") await bulkSetLimit(ids, limit ?? null);
+      showToast({ kind: "info", title: `${ids.length} ${verbFor(type)}` });
+      if (type === "remove") clearSelection();
+    } catch (err) {
+      showToast({ kind: "error", title: "Bulk action failed", message: String(err) });
+    }
+  }
+
+  function verbFor(type: string): string {
+    switch (type) {
+      case "pause": return "paused";
+      case "resume": return "resumed";
+      case "remove": return "removed";
+      case "set-limit": return "limit set";
+      default: return type;
+    }
+  }
+
+  // ── Row selection wiring ──────────────────────────────────────────
+  //
+  // `DownloadRow` dispatches `select` with the row's id and the
+  // shift/ctrl modifiers we captured in its own click handler.
+  // We translate that into the right store action so the rest of
+  // the UI (the bulk-action bar, the visible-row index for
+  // shift-range) stays decoupled from the row component.
+  function onRowSelect(
+    e: CustomEvent<{ id: string; shift: boolean; ctrlOrMeta: boolean }>,
+    visibleIds: string[],
+  ) {
+    const { id, shift, ctrlOrMeta } = e.detail;
+    if (shift) {
+      // Shift-click extends the selection as a contiguous range
+      // from the most recently clicked id. We treat it as an
+      // "adding" action when the current row is *not* already in
+      // the selection, and as a "removing" action when it is —
+      // that mirrors Finder / Explorer behaviour and matches
+      // what users expect from "shift-click to extend".
+      const isInSel = (get(selectedIds) as Set<string>).has(id);
+      selectRange(visibleIds, get(lastSelectedId), id, !isInSel);
+    } else if (ctrlOrMeta) {
+      // Cmd/Ctrl-click toggles the single row's membership; the
+      // other selected rows are left alone.
+      toggleSelect(id);
+    } else {
+      // Plain click in selection-mode (= row is the only one
+      // selected). Plain click outside selection-mode does
+      // nothing — the row still receives a single-click `action`
+      // event for things like pause/resume.
+      const sel = get(selectedIds) as Set<string>;
+      if (sel.size > 0) {
+        // Replace the selection with just this row.
+        clearSelection();
+        selectOne(id);
+      }
+    }
+  }
+
+  // ── Row reorder wiring (drag-and-drop + Alt+↑/↓) ─────────────
+  //
+  // Both the drag-and-drop payload (`reorder`) and the
+  // keyboard alternative (`reorder-keyboard`) bubble up here.
+  // We build the new visible-order id list and pass it to
+  // `reorderDownloads`, which calls the Rust
+  // `reorder_downloads` command. The engine assigns fresh
+  // `sort_key` values and emits per-row `StatusChanged`
+  // events; the store's event listener merges them and the
+  // list re-renders with the new order.
+  async function onRowReorder(
+    e: CustomEvent<{
+      sourceId: string;
+      targetId: string;
+      position: "before" | "after";
+    } | {
+      id: string;
+      from: number;
+      to: number;
+    }>,
+    visibleIds: string[],
+  ) {
+    // Compute the new id list for either the drag-and-drop or
+    // the keyboard case. Both reduce to a "new order" array.
+    let newOrder: string[];
+    if ("sourceId" in e.detail) {
+      const { sourceId, targetId, position } = e.detail;
+      if (sourceId === targetId) return;
+      const fromIdx = visibleIds.indexOf(sourceId);
+      const toIdx = visibleIds.indexOf(targetId);
+      if (fromIdx < 0 || toIdx < 0) return;
+      const next = visibleIds.slice();
+      next.splice(fromIdx, 1);
+      const insertAt = position === "before" ? next.indexOf(targetId) : next.indexOf(targetId) + 1;
+      next.splice(insertAt, 0, sourceId);
+      newOrder = next;
+    } else {
+      const { from, to } = e.detail;
+      // `from` and `to` are 1-based; convert to 0-based.
+      const fromIdx = from - 1;
+      const toIdx = to - 1;
+      if (fromIdx < 0 || fromIdx >= visibleIds.length) return;
+      const next = visibleIds.slice();
+      const [moved] = next.splice(fromIdx, 1);
+      next.splice(toIdx, 0, moved);
+      newOrder = next;
+    }
+    try {
+      await reorderDownloads(newOrder);
+    } catch (err) {
+      showToast({ kind: "error", title: "Reorder failed", message: String(err) });
     }
   }
 
@@ -469,10 +644,24 @@
         handler: () => showCommandPalette.set(true),
       },
       {
-        key: "Escape", description: "Close modal", category: "Navigation",
+        key: "a", ctrl: true, meta: true, description: "Select all visible downloads", category: "Actions",
         handler: () => {
-          if ($showSettings) showSettings.set(false);
-          if ($showCommandPalette) showCommandPalette.set(false);
+          // Only act when the download list is in focus (i.e. no
+          // modal is open that would hijack Cmd+A). We mirror the
+          // input-aware guard from `useKeyboardShortcuts` here too
+          // — the engine stops here, so the OS doesn't grab the
+          // event for "select all in the focused text field".
+          selectAll(visible.map((d) => d.id));
+        },
+      },
+      {
+        key: "Escape", description: "Close modal / clear selection", category: "Navigation",
+        handler: () => {
+          if ($showSettings) { showSettings.set(false); return; }
+          if ($showCommandPalette) { showCommandPalette.set(false); return; }
+          // No modal open — if the user has a selection, clear it
+          // first (so a stray Esc doesn't dismiss anything else).
+          if ($hasSelection) clearSelection();
         },
       },
       {
@@ -692,9 +881,23 @@
         {/if}
       </div>
     {:else}
-      {#each visible as d (d.id)}
+      <BulkActionBar
+        visibleIds={visible.map((d) => d.id)}
+        on:action={onBulkAction}
+      />
+      {#each visible as d, i (d.id)}
         <div animate:flip={{ duration: 280 }} in:fly={{ y: 8, duration: 280, easing: cubicOut }}>
-          <DownloadRow download={d} on:action={onAction} />
+          <DownloadRow
+            download={d}
+            selectable
+            selected={$selectedIds.has(d.id)}
+            index={i + 1}
+            total={visible.length}
+            on:action={onAction}
+            on:select={(e) => onRowSelect(e, visible.map((x) => x.id))}
+            on:reorder={(e) => onRowReorder(e, visible.map((x) => x.id))}
+            on:reorder-keyboard={(e) => onRowReorder(e, visible.map((x) => x.id))}
+          />
         </div>
       {/each}
     {/if}

@@ -2,7 +2,7 @@
 //! held in managed state.
 
 use dm_engine::manager::DownloadManager;
-use dm_engine::model::{ChecksumSpec, Download, DownloadStatus, ProxyMode, Settings};
+use dm_engine::model::{AuthSpec, ChecksumSpec, Download, DownloadStatus, ProxyMode, Settings};
 use dm_engine::protocol;
 use tauri::State;
 use tauri_plugin_notification::NotificationExt;
@@ -81,6 +81,75 @@ pub fn set_speed_limit(state: State<'_, DownloadManager>, id: String, limit: Opt
 #[tauri::command]
 pub fn set_global_speed_limit(state: State<'_, DownloadManager>, limit: Option<u64>) {
     state.set_global_speed_limit(limit);
+}
+
+/// Reorder a subset of downloads to the order given by `ids`.
+///
+/// The frontend calls this after a drag-and-drop or
+/// Alt+↑/↓ keyboard reorder. Each id in `ids` is assigned a
+/// fresh `sort_key` spaced by 1000, so subsequent interleaved
+/// reorders still have integer room to land. Rows that are
+/// not in `ids` are left alone. Per-row `StatusChanged` events
+/// are emitted so the list re-renders without a full refresh.
+#[tauri::command]
+pub fn reorder_downloads(state: State<'_, DownloadManager>, ids: Vec<String>) {
+    state.reorder(&ids);
+}
+
+/// Set the per-download priority.
+///
+/// `priority` is clamped to the `[0, 2]` range by the engine,
+/// where `0` = low, `1` = normal (default), `2` = high. Higher
+/// priority downloads run before lower priority when the
+/// scheduler picks the next transfer.
+#[tauri::command]
+pub fn set_download_priority(
+    state: State<'_, DownloadManager>,
+    id: String,
+    priority: u8,
+) {
+    state.set_priority(&id, priority);
+}
+
+/// Set per-download HTTP headers and optional `Authorization`
+/// credentials. Both live in memory only for v1 — a restart
+/// clears them. Auth secrets don't sit in plain-text SQLite
+/// by design; the use case is "I'm downloading one file from
+/// a site that needs login", not "every future download uses
+/// these credentials".
+///
+/// `headers` is a JSON object `{ "Header-Name": "value" }`. The
+/// engine filters restricted headers (`Host`, `Content-Length`,
+/// `Accept-Encoding`) and logs + drops them. `auth` is one of
+/// `{ kind: "basic", username, password }`,
+/// `{ kind: "bearer", token }`, or
+/// `{ kind: "digest", username, password }` (downgraded to basic).
+/// Pass `null` to clear.
+#[tauri::command]
+pub fn set_download_auth(
+    state: State<'_, DownloadManager>,
+    id: String,
+    headers: std::collections::BTreeMap<String, String>,
+    auth: Option<AuthSpec>,
+) {
+    state.set_headers_auth(&id, headers, auth);
+}
+
+/// Set the mirror list for a download. The engine tries `url`
+/// first; on transient failure (4xx/5xx/timeout) it walks
+/// `mirrors` in order and replaces the primary URL with the
+/// first mirror that returns a successful probe. The new
+/// primary is persisted and a `StatusChanged` event is
+/// emitted so the UI updates without a full refresh.
+///
+/// Pass an empty vec to clear the mirror list.
+#[tauri::command]
+pub fn set_download_mirrors(
+    state: State<'_, DownloadManager>,
+    id: String,
+    mirrors: Vec<String>,
+) {
+    state.set_mirrors(&id, mirrors);
 }
 
 /// Switch the global proxy policy. `mode` is `"none" | "system" | "manual"`.

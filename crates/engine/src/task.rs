@@ -277,9 +277,15 @@ pub async fn run_download(ctx: Arc<RunContext>, state: Arc<TaskState>) {
     let per_download_limit = state.download.lock().unwrap().speed_limit.unwrap_or(0);
     let limiter = Arc::new(CombinedLimiter::new(ctx.global_limiter.rate(), per_download_limit));
 
-    let (url, save_path, chunks) = {
+    let (url, save_path, chunks, headers, auth) = {
         let d = state.download.lock().unwrap();
-        (d.url.clone(), d.save_path.clone(), d.chunks.clone())
+        (
+            d.url.clone(),
+            d.save_path.clone(),
+            d.chunks.clone(),
+            d.headers.clone(),
+            d.auth.clone(),
+        )
     };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<(usize, u64)>();
@@ -311,6 +317,15 @@ pub async fn run_download(ctx: Arc<RunContext>, state: Arc<TaskState>) {
         let chunk_index = chunk.index;
         let tx = tx.clone();
         let url = url.clone();
+        // Clone per-download headers and auth so the `async move`
+        // closure can take ownership of them. The chunk workers
+        // are spawned per-chunk and run concurrently; each
+        // needs its own `BTreeMap` (cheap: usually 0–4 entries)
+        // and `AuthSpec` (a `String` or two) so the closure
+        // doesn't borrow from a value that's already been
+        // moved into a sibling worker.
+        let headers = headers.clone();
+        let auth = auth.clone();
         let handle = tokio::spawn(async move {
             let _conn = ctx.scheduler.acquire_connection(&state.id).await;
             let res = download_chunk(
@@ -324,6 +339,8 @@ pub async fn run_download(ctx: Arc<RunContext>, state: Arc<TaskState>) {
                 move |written| {
                     let _ = tx.send((chunk_index, written));
                 },
+                &headers,
+                auth.as_ref(),
             )
             .await;
             (chunk_index, res)

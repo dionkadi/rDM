@@ -42,6 +42,10 @@ export interface Download {
  createdAt: string;
  finishedAt: string | null;
  canResume: boolean;
+ /** User-controlled queue position. Smaller values run first. */
+ sortKey: number;
+ /** 0 = low, 1 = normal (default), 2 = high. */
+ priority: number;
 }
 
 export interface Category {

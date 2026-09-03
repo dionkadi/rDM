@@ -158,6 +158,128 @@ export function recordNativeHostEvent(): void {
   }));
 }
 
+// ── Selection (bulk operations) ────────────────────────────────
+//
+// `selectedIds` is a Svelte store holding the *visible* selection —
+// the ids the user has explicitly picked in the current view. It is
+// intentionally a `Set` so toggle/add/remove are O(1) and so the
+// "select all" / "clear" operations don't iterate to dedupe.
+//
+// The set is *ephemeral* (not persisted to localStorage): a
+// selection across an app restart would be a UX bug, not a feature
+// (the user expects to start fresh).
+export const selectedIds = writable<Set<string>>(new Set());
+/** The id that was most recently clicked. Used as the "anchor" of
+ *  the next shift-click range. Cleared when the selection is cleared. */
+export const lastSelectedId = writable<string | null>(null);
+
+/** True when the user has at least one row selected. Derived so
+ *  components can `class:active={$hasSelection}` without re-deriving
+ *  from a Set in every template. */
+export const hasSelection = derived(selectedIds, ($s) => $s.size > 0);
+
+/** Add a single id to the selection (no-op if already in the set). */
+export function selectOne(id: string): void {
+  selectedIds.update((s) => {
+    if (s.has(id)) return s;
+    const next = new Set(s);
+    next.add(id);
+    return next;
+  });
+  lastSelectedId.set(id);
+}
+
+/** Remove a single id. */
+export function deselectOne(id: string): void {
+  selectedIds.update((s) => {
+    if (!s.has(id)) return s;
+    const next = new Set(s);
+    next.delete(id);
+    return next;
+  });
+  lastSelectedId.update((last) => (last === id ? null : last));
+}
+
+/** Toggle a single id, returning the new membership state. */
+export function toggleSelect(id: string): boolean {
+  let nowSelected = false;
+  selectedIds.update((s) => {
+    const next = new Set(s);
+    if (next.has(id)) {
+      next.delete(id);
+      nowSelected = false;
+    } else {
+      next.add(id);
+      nowSelected = true;
+    }
+    return next;
+  });
+  lastSelectedId.set(id);
+  return nowSelected;
+}
+
+/**
+ * Range-select: select every id between `lastId` and `currentId` in
+ * `orderedIds`, taking the same on/off state as the action that
+ * triggered this call (`adding === true` mimics shift-click-down,
+ * `false` mimics shift-click-up of a previously-selected row).
+ *
+ * If `lastId` is missing (e.g. the user shift-clicks on a fresh
+ * selection), this falls back to selecting just `currentId`.
+ */
+export function selectRange(
+  orderedIds: readonly string[],
+  lastId: string | null,
+  currentId: string,
+  adding: boolean,
+): void {
+  if (!orderedIds.includes(currentId)) return;
+  if (!lastId || !orderedIds.includes(lastId) || lastId === currentId) {
+    if (adding) selectOne(currentId);
+    else deselectOne(currentId);
+    return;
+  }
+  const a = orderedIds.indexOf(lastId);
+  const b = orderedIds.indexOf(currentId);
+  const [lo, hi] = a < b ? [a, b] : [b, a];
+  const range = orderedIds.slice(lo, hi + 1);
+  selectedIds.update((s) => {
+    const next = new Set(s);
+    for (const id of range) {
+      if (adding) next.add(id);
+      else next.delete(id);
+    }
+    return next;
+  });
+  lastSelectedId.set(currentId);
+}
+
+/** Replace the selection with the entire provided id list. */
+export function selectAll(orderedIds: readonly string[]): void {
+  selectedIds.set(new Set(orderedIds));
+  if (orderedIds.length > 0) lastSelectedId.set(orderedIds[orderedIds.length - 1]);
+}
+
+/** Clear the selection entirely. */
+export function clearSelection(): void {
+  selectedIds.set(new Set());
+  lastSelectedId.set(null);
+}
+
+/** Mark the selection as no-longer-valid because a row left the
+ *  store (e.g. removed). Called from the event listener. */
+export function pruneSelection(remainingIds: ReadonlySet<string>): void {
+  selectedIds.update((s) => {
+    let changed = false;
+    const next = new Set<string>();
+    for (const id of s) {
+      if (remainingIds.has(id)) next.add(id);
+      else changed = true;
+    }
+    return changed ? next : s;
+  });
+}
+
 /** Mark the listener bind failed (e.g. port in use). */
 export function recordNativeHostError(msg: string): void {
   extensionStatus.update((s) => ({

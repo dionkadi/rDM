@@ -137,6 +137,84 @@ export async function setDownloadSpeedLimit(
   await refreshDownloads();
 }
 
+// ── Bulk operations ──────────────────────────────────────────────
+//
+// `Promise.allSettled` rather than `Promise.all`: a single bad id
+// (e.g. a row that was removed in the same tick) shouldn't abort
+// the whole batch and surface as a hard error. Instead we collect
+// failures and report them via a single toast. One `refreshDownloads`
+// at the end is enough — the engine's `StatusChanged` events will
+// also have fired for each row, but the store-level merge handles
+// dedupe.
+
+/** Apply an action to a list of ids in parallel; return the
+ *  number of successful applications and the first error message
+ *  (if any). The caller decides whether the error warrants a toast. */
+async function bulkApply(
+  ids: readonly string[],
+  action: (id: string) => Promise<void>,
+): Promise<{ ok: number; failed: number; firstError: string | null }> {
+  const results = await Promise.allSettled(ids.map((id) => action(id)));
+  let ok = 0;
+  let failed = 0;
+  let firstError: string | null = null;
+  for (const r of results) {
+    if (r.status === "fulfilled") ok++;
+    else {
+      failed++;
+      if (!firstError) firstError = String(r.reason);
+    }
+  }
+  return { ok, failed, firstError };
+}
+
+export async function bulkPause(ids: readonly string[]): Promise<void> {
+  const r = await bulkApply(ids, pauseDownload);
+  await refreshDownloads();
+  if (r.failed > 0) throw new Error(`${r.ok} paused, ${r.failed} failed: ${r.firstError}`);
+}
+
+export async function bulkResume(ids: readonly string[]): Promise<void> {
+  const r = await bulkApply(ids, resumeDownload);
+  await refreshDownloads();
+  if (r.failed > 0) throw new Error(`${r.ok} resumed, ${r.failed} failed: ${r.firstError}`);
+}
+
+export async function bulkRemove(ids: readonly string[]): Promise<void> {
+  const r = await bulkApply(ids, removeDownload);
+  await refreshDownloads();
+  if (r.failed > 0) throw new Error(`${r.ok} removed, ${r.failed} failed: ${r.firstError}`);
+}
+
+export async function bulkSetLimit(
+  ids: readonly string[],
+  limit: number | null,
+): Promise<void> {
+  const r = await bulkApply(ids, (id) => setDownloadSpeedLimit(id, limit));
+  await refreshDownloads();
+  if (r.failed > 0) throw new Error(`${r.ok} updated, ${r.failed} failed: ${r.firstError}`);
+}
+
+// ── Reorder / priority ──────────────────────────────────────
+//
+// `reorder` calls the Rust `reorder_downloads` command, which
+// assigns fresh `sort_key` values and emits per-row
+// `StatusChanged` events. The events carry the new `sort_key`
+// and the frontend store's merge handler picks them up — we
+// don't need to manually re-sort or call `refreshDownloads`
+// because the events are the source of truth.
+
+export async function reorderDownloads(ids: string[]): Promise<void> {
+  await api.reorderDownloads(ids);
+}
+
+export async function setDownloadPriority(
+  id: string,
+  priority: number,
+): Promise<void> {
+  await api.setDownloadPriority(id, priority);
+}
+
 // ── Event handling (Tauri live updates) ────────────────────────────
 let unlistenFn: (() => void) | null = null;
 
@@ -155,7 +233,12 @@ export async function startEventListener(): Promise<void> {
         return;
       }
       if (e.kind === "removed") {
-        downloads.update((list) => list.filter((d) => d.id !== e.download.id));
+        const removedId = e.download.id;
+        downloads.update((list) => list.filter((d) => d.id !== removedId));
+        // Lazy-import to avoid a circular dependency: `ui.ts` is
+        // also imported by the download store, so reaching back
+        // into it from a top-level `import` would be a cycle.
+        import("./ui").then((ui) => ui.pruneSelection(new Set(get(downloads).map((d) => d.id))));
         return;
       }
       const d = e.download;

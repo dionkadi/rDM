@@ -59,6 +59,26 @@ export function setGlobalSpeedLimit(limit: number | null): Promise<void> {
   return invoke("set_global_speed_limit", { limit });
 }
 
+/**
+ * Persist a new queue order for the given download ids. The
+ * engine assigns fresh `sort_key` values spaced by 1000 so a
+ * future interleaved reorder still has integer room to land.
+ * Per-row `StatusChanged` events are emitted; the frontend
+ * store merges them without a full refresh.
+ */
+export function reorderDownloads(ids: string[]): Promise<void> {
+  return invoke("reorder_downloads", { ids });
+}
+
+/**
+ * Set the per-download priority. `0` = low, `1` = normal
+ * (default), `2` = high. Out-of-range values are clamped by
+ * the engine to `[0, 2]`.
+ */
+export function setDownloadPriority(id: string, priority: number): Promise<void> {
+  return invoke("set_download_priority", { id, priority });
+}
+
 export function getSettings(): Promise<Settings> {
   return invoke("get_settings");
 }

@@ -62,7 +62,9 @@ impl Storage {
                 error TEXT,
                 created_at TEXT NOT NULL,
                 finished_at TEXT,
-                can_resume INTEGER NOT NULL DEFAULT 0
+                can_resume INTEGER NOT NULL DEFAULT 0,
+                sort_key INTEGER NOT NULL DEFAULT 0,
+                priority INTEGER NOT NULL DEFAULT 1
             );
             CREATE TABLE IF NOT EXISTS history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,6 +88,45 @@ impl Storage {
             );
             "#,
         )?;
+        // Idempotent column adds for pre-existing databases that
+        // were created before `sort_key` / `priority` existed. We
+        // use `PRAGMA table_info` to detect whether the column is
+        // already present; `ALTER TABLE ... ADD COLUMN` would error
+        // with "duplicate column" otherwise. The default values
+        // (sort_key = created_at epoch ms, priority = 1) preserve
+        // the pre-migration order: oldest downloads keep the
+        // smallest sort_key, so the list view doesn't jump after
+        // upgrading.
+        Self::ensure_column(&conn, "downloads", "sort_key", "INTEGER NOT NULL DEFAULT 0")?;
+        Self::ensure_column(&conn, "downloads", "priority", "INTEGER NOT NULL DEFAULT 1")?;
+        Ok(())
+    }
+
+    /// Idempotent `ALTER TABLE ... ADD COLUMN`. No-op when the
+    /// column already exists. Used by `migrate()` to add new
+    /// columns to a pre-existing database without breaking the
+    /// `CREATE TABLE IF NOT EXISTS` baseline.
+    fn ensure_column(
+        conn: &Connection,
+        table: &str,
+        column: &str,
+        definition: &str,
+    ) -> Result<(), StorageError> {
+        // `PRAGMA table_info` returns one row per column; the
+        // second field (index 1) is the column name. We collect
+        // them into a `Vec<String>` to avoid borrowing `stmt`
+        // while we run the `ALTER TABLE`.
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+        if names.iter().any(|n| n == column) {
+            return Ok(());
+        }
+        let sql = format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, definition);
+        conn.execute_batch(&sql)?;
         Ok(())
     }
 
@@ -281,6 +322,14 @@ fn self_row_to_download(
     let created_at: String = row.get(14).unwrap();
     let finished_at: Option<String> = row.get(15).unwrap();
     let can_resume: i64 = row.get(16).unwrap();
+    // Columns 17/18 (`sort_key`, `priority`) were added by a
+    // later migration. Pre-migration rows have neither, so
+    // `row.get` returns `Err` rather than `Ok`. The struct uses
+    // `#[serde(default)]` to keep these tolerant on the wire
+    // and on freshly-loaded rows: missing columns fall back to
+    // `sort_key = 0` and `priority = 1` (normal).
+    let sort_key: i64 = row.get::<_, Option<i64>>(17).unwrap_or(None).unwrap_or(0);
+    let priority: i64 = row.get::<_, Option<i64>>(18).unwrap_or(None).unwrap_or(1);
 
     Download {
         id,
@@ -307,6 +356,21 @@ fn self_row_to_download(
                 .map(|d| d.with_timezone(&chrono::Utc))
         }),
         can_resume: can_resume != 0,
+        sort_key,
+        priority: priority.clamp(0, 2) as u8,
+        // `headers`, `auth`, `mirrors`, and `media` live in
+        // memory only for v1 — the SQLite schema predates
+        // them, and we don't want to blow up the schema for
+        // auth secrets or per-transfer mirror lists. All four
+        // are reconstructed fresh on the wire (the frontend
+        // doesn't read them back, so persistence is a non-goal
+        // for this iteration). The `serde(default)` on the
+        // struct means a row loaded from disk always ends up
+        // with empty headers / no auth / no mirrors / no media.
+        headers: std::collections::BTreeMap::new(),
+        auth: None,
+        mirrors: Vec::new(),
+        media: None,
     }
 }
 
@@ -334,6 +398,12 @@ mod tests {
             created_at: chrono::Utc::now(),
             finished_at: None,
             can_resume: true,
+            sort_key: 0,
+            priority: 1,
+            headers: std::collections::BTreeMap::new(),
+            auth: None,
+            mirrors: Vec::new(),
+            media: None,
         }
     }
 

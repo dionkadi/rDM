@@ -15,8 +15,63 @@
   export let compact: boolean = false;
   export let selectable: boolean = false;
   export let selected: boolean = false;
+  /**
+   * Position of this row in the *visible* list (1-based). When
+   * provided, Alt+↑ / Alt+↓ keyboard shortcuts move the row in
+   * the list by one slot. The parent owns the list ordering and
+   * the actual `reorder` call; this row just dispatches the
+   * `move-up` / `move-down` event with the right id.
+   */
+  export let index: number = 0;
+  /** Total number of rows in the visible list. */
+  export let total: number = 0;
 
   const dispatch = createEventDispatcher();
+
+  // ── Drag and drop ────────────────────────────────────────
+  // We use the native HTML5 drag API rather than a library
+  // because the use case is small: drag a row by its handle,
+  // drop on another row, the parent reorders the array. The
+  // browser handles the visual feedback (the row is
+  // automatically half-transparent while dragged). We do
+  // *not* use the `dataTransfer` payload for ordering — the
+  // parent knows the source id from the `dragstart` event.
+  let dragOver: "above" | "below" | null = null;
+  function onDragStart(e: DragEvent) {
+    if (!e.dataTransfer) return;
+    e.dataTransfer.setData("text/x-dm-download-id", download.id);
+    // `effectAllowed = "move"` is the default for most browsers
+    // but setting it explicitly prevents some browsers from
+    // showing the "copy" cursor when the row is over a text
+    // field by accident.
+    e.dataTransfer.effectAllowed = "move";
+  }
+  function onDragOver(e: DragEvent) {
+    e.preventDefault();
+    if (!e.dataTransfer) return;
+    e.dataTransfer.dropEffect = "move";
+    // The top/bottom half of the row determines whether the
+    // drop is "insert above" or "insert below". A 12 px deadband
+    // near the row edges keeps the cursor steady when the
+    // pointer hovers exactly on the boundary.
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const y = e.clientY - r.top;
+    dragOver = y < r.height / 2 ? "above" : "below";
+  }
+  function onDragLeave() {
+    dragOver = null;
+  }
+  function onDrop(e: DragEvent) {
+    e.preventDefault();
+    dragOver = null;
+    const sourceId = e.dataTransfer?.getData("text/x-dm-download-id");
+    if (!sourceId || sourceId === download.id) return;
+    dispatch("reorder", {
+      sourceId,
+      targetId: download.id,
+      position: dragOver === "above" ? "before" : "after",
+    });
+  }
 
   let expanded = false;
   let menuOpen = false;
@@ -66,7 +121,54 @@
     if (e.key === "Enter") {
       e.preventDefault();
       toggleExpand();
+      return;
     }
+    // Alt+ArrowUp / Alt+ArrowDown: keyboard-equivalent of the
+    // drag-and-drop reorder. The row's `index` is 1-based and
+    // `total` is the visible list size; we clamp the move to
+    // `[1, total]` so the user can't go past either end.
+    if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+      e.preventDefault();
+      if (e.key === "ArrowUp" && index > 1) {
+        dispatch("reorder-keyboard", { id: download.id, from: index, to: index - 1 });
+      } else if (e.key === "ArrowDown" && index < total) {
+        dispatch("reorder-keyboard", { id: download.id, from: index, to: index + 1 });
+      }
+    }
+  }
+
+  /**
+   * Click anywhere on the row (outside the interactive controls)
+   * → fire a `select` event with the row's id plus the shift /
+   * ctrl-or-meta modifiers. The parent decides what to do with it
+   * (toggle / range / replace). The action buttons and the
+   * dropdown trigger call `e.stopPropagation()` so they don't
+   * double-fire the event.
+   */
+  function onRowClick(e: MouseEvent) {
+    if (!selectable) return;
+    dispatch("select", {
+      id: download.id,
+      shift: e.shiftKey,
+      ctrlOrMeta: e.ctrlKey || e.metaKey,
+    });
+  }
+
+  /**
+   * Read the priority value out of the `<select>` change event
+   * and dispatch it as an `action` of type `set-priority`. The
+   * parent handler (`onAction` in `App.svelte`) dispatches it
+   * to the Rust engine and refreshes the list. We extract this
+   * to a named function because the Svelte template parser
+   * rejects inline TypeScript `as` casts inside arrow
+   * functions — the cast lives here in the `<script>` block
+   * where TypeScript is allowed.
+   */
+  function onPriorityChange(e: Event) {
+    const target = e.currentTarget as HTMLSelectElement;
+    const priority = Number(target.value);
+    if (Number.isNaN(priority)) return;
+    dispatch("action", { type: "set-priority", id: download.id, priority });
   }
 </script>
 
@@ -75,10 +177,18 @@
   class:expanded
   class:compact
   class:selected
+  class:drag-above={dragOver === "above"}
+  class:drag-below={dragOver === "below"}
+  draggable="true"
   role="button"
   aria-label="Download: {download.filename || download.url}, press Enter to {expanded ? 'collapse' : 'expand'} details"
   tabindex="0"
   on:keydown={onKeydown}
+  on:click={onRowClick}
+  on:dragstart={onDragStart}
+  on:dragover={onDragOver}
+  on:dragleave={onDragLeave}
+  on:drop={onDrop}
 >
   <div class="lead">
     {#if selectable}
@@ -102,6 +212,20 @@
         <StatusBadge status={download.status} />
       </div>
       <div class="actions">
+        <select
+          class="priority"
+          class:hi={download.priority === 2}
+          class:lo={download.priority === 0}
+          value={download.priority}
+          on:change={onPriorityChange}
+          on:click|stopPropagation
+          title="Priority — higher runs first when slots are full"
+          aria-label="Download priority"
+        >
+          <option value={0}>Low</option>
+          <option value={1}>Normal</option>
+          <option value={2}>High</option>
+        </select>
         <InlineSpeedLimit
           value={download.speedLimit}
           on:change={(e) => dispatch("action", { type: "set-limit", id: download.id, limit: e.detail })}
@@ -297,6 +421,25 @@
     border-color: var(--color-info);
     background: color-mix(in srgb, var(--color-info) 8%, var(--surface));
   }
+  /* Drag-and-drop reorder affordances. A 2 px accent line on the
+     edge where the row will land tells the user exactly where
+     the drop will insert. The line fades in within 80 ms so the
+     feedback is fast enough that the user can target a slot
+     mid-drag without overshooting. We avoid a box-shadow on
+     the whole row — it would shift the layout and the user's
+     pointer would no longer line up with the slot they aimed at. */
+  .drow.drag-above {
+    box-shadow: inset 0 2px 0 0 var(--accent);
+  }
+  .drow.drag-below {
+    box-shadow: inset 0 -2px 0 0 var(--accent);
+  }
+  .drow[draggable="true"] {
+    cursor: grab;
+  }
+  .drow[draggable="true"]:active {
+    cursor: grabbing;
+  }
   .drow.status-completed {
     border-color: var(--color-success-strong);
   }
@@ -382,6 +525,54 @@
   .action-btn svg {
     width: 14px;
     height: 14px;
+  }
+
+  /* Priority badge: a small 2-letter chip that shows the current
+     priority. We use a `<select>` (not a button) so screen readers
+     announce it as a form control and the keyboard picker works
+     natively. The chip color shifts with the priority level so
+     the user can scan the list and find "high" items at a glance. */
+  .priority {
+    height: 22px;
+    padding: 0 6px 0 8px;
+    background: var(--color-primary-dim);
+    border: 1px solid color-mix(in srgb, var(--accent) 20%, transparent);
+    border-radius: 99px;
+    color: var(--accent);
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    cursor: pointer;
+    outline: none;
+    appearance: none;
+    -webkit-appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%237af0c8' stroke-width='1.6'%3E%3Cpath d='M3 5l3 3 3-3'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 4px center;
+    background-size: 9px 9px;
+    padding-right: 18px;
+  }
+  .priority:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent);
+  }
+  .priority.hi {
+    background-color: var(--color-warning-dim, rgba(255, 180, 0, 0.16));
+    border-color: color-mix(in srgb, #ffb400 40%, transparent);
+    color: #ffb400;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%23ffb400' stroke-width='1.6'%3E%3Cpath d='M3 5l3 3 3-3'/%3E%3C/svg%3E");
+  }
+  .priority.lo {
+    background-color: var(--surface);
+    border-color: var(--border);
+    color: var(--text-faint);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%23808080' stroke-width='1.6'%3E%3Cpath d='M3 5l3 3 3-3'/%3E%3C/svg%3E");
+  }
+  .priority option {
+    background: var(--surface);
+    color: var(--text);
   }
 
   .meta {

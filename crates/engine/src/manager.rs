@@ -490,10 +490,121 @@ impl DownloadManager {
 
     pub fn list(&self) -> Vec<Download> {
         let tasks = self.inner.tasks.lock().unwrap();
-        tasks
+        let mut out: Vec<Download> = tasks
             .values()
             .map(|e| e.state.download.lock().unwrap().clone())
-            .collect()
+            .collect();
+        // Stable sort by (sort_key ASC, created_at ASC). This is the
+        // user-facing order: the list view in the frontend should
+        // match what we hand back here. `sort_by_key` + a tuple of
+        // the same key is what gives us a stable, two-key sort
+        // without pulling in `itertools`.
+        out.sort_by(|a, b| {
+            a.sort_key
+                .cmp(&b.sort_key)
+                .then(a.created_at.cmp(&b.created_at))
+        });
+        out
+    }
+
+    /// Reorder a subset of downloads to the order given by `ids`.
+    ///
+    /// Each id in `ids` gets a fresh `sort_key` spaced by `1000` so
+    /// a future reorder that inserts *between* two existing rows
+    /// has integer room to land (e.g. inserting at the midpoint
+    /// `(a + b) / 2` works without collisions for ~10 reorder
+    /// rounds). Rows that are *not* in `ids` are left alone, so
+    /// the caller can reorder just the visible list (which is the
+    /// common case from the drag-and-drop UI). The new keys are
+    /// persisted to SQLite and a `StatusChanged` event is emitted
+    /// for each affected row so the frontend can update the list
+    /// order without a full refresh.
+    pub fn reorder(&self, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        // Use a unique `base` per call so a re-reorder of the same
+        // set within the same millisecond still gets distinct keys.
+        let base = now + (ids.len() as i64);
+        for (i, id) in ids.iter().enumerate() {
+            let entry = {
+                let tasks = self.inner.tasks.lock().unwrap();
+                tasks.get(id).map(|e| e.state.clone())
+            };
+            if let Some(state) = entry {
+                let mut d = state.download.lock().unwrap();
+                d.sort_key = base + (i as i64) * 1000;
+                let _ = self.inner.storage.save_download(&d);
+                self.emit(DownloadEvent::StatusChanged(d.clone()));
+            }
+        }
+    }
+
+    /// Set the per-download priority. Higher-priority downloads
+    /// run before lower-priority ones when the scheduler needs to
+    /// pick the next transfer. Persisted to SQLite, emitted as a
+    /// `StatusChanged` event so the UI updates without a refresh.
+    pub fn set_priority(&self, id: &str, priority: u8) {
+        let entry = {
+            let tasks = self.inner.tasks.lock().unwrap();
+            tasks.get(id).map(|e| e.state.clone())
+        };
+        if let Some(state) = entry {
+            let mut d = state.download.lock().unwrap();
+            d.priority = priority.min(crate::model::PRIORITY_HIGH);
+            let _ = self.inner.storage.save_download(&d);
+            self.emit(DownloadEvent::StatusChanged(d.clone()));
+        }
+    }
+
+    /// Set per-download HTTP headers and optional `Authorization`
+    /// credentials. Both live in memory only — they are not
+    /// persisted to SQLite, so a restart clears them. This is
+    /// intentional: auth secrets shouldn't sit in a plain-text
+    /// database file, and the use case is "I'm downloading one
+    /// file from a site that needs login", not "I want every
+    /// future download to use these credentials". The
+    /// chunk worker applies the headers + auth at request
+    /// build time (see `chunk.rs::apply_extra_headers`).
+    pub fn set_headers_auth(
+        &self,
+        id: &str,
+        headers: std::collections::BTreeMap<String, String>,
+        auth: Option<crate::model::AuthSpec>,
+    ) {
+        let entry = {
+            let tasks = self.inner.tasks.lock().unwrap();
+            tasks.get(id).map(|e| e.state.clone())
+        };
+        if let Some(state) = entry {
+            let mut d = state.download.lock().unwrap();
+            d.headers = headers;
+            d.auth = auth;
+            // We deliberately do *not* call `save_download` or
+            // emit a `StatusChanged` event here — headers and
+            // auth are in-memory only, so a status-changed event
+            // would be a lie (the on-disk row didn't change).
+            // The frontend doesn't read these back, so a silent
+            // update is fine.
+        }
+    }
+
+    /// Replace the mirror list for a download. The engine tries
+    /// `url` first; on transient failure (4xx/5xx/timeout) the
+    /// task layer walks `mirrors` in order and replaces the
+    /// primary URL with the first mirror that returns a
+    /// successful probe. Mirrors live in memory only (same
+    /// rationale as `set_headers_auth`).
+    pub fn set_mirrors(&self, id: &str, mirrors: Vec<String>) {
+        let entry = {
+            let tasks = self.inner.tasks.lock().unwrap();
+            tasks.get(id).map(|e| e.state.clone())
+        };
+        if let Some(state) = entry {
+            let mut d = state.download.lock().unwrap();
+            d.mirrors = mirrors;
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<Download> {
@@ -549,6 +660,12 @@ mod tests {
             created_at: chrono::Utc::now(),
             finished_at: None,
             can_resume: false,
+            sort_key: 0,
+            priority: 1,
+            headers: std::collections::BTreeMap::new(),
+            auth: None,
+            mirrors: Vec::new(),
+            media: None,
         }
     }
 
@@ -560,6 +677,47 @@ mod tests {
         let list = mgr.list();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, "a");
+    }
+
+    /// Reordering changes the order `list()` returns. A subsequent
+    /// reorder that interleaves between two previously-reordered
+    /// rows must still produce a stable, unique ordering (i.e. no
+    /// two rows end up with the same `sort_key`).
+    #[tokio::test]
+    async fn reorder_changes_list_order() {
+        let storage = Storage::open_memory().unwrap();
+        let mgr = DownloadManager::new(storage);
+        mgr.add(new_download("a", "https://example.com/a.bin"));
+        mgr.add(new_download("b", "https://example.com/b.bin"));
+        mgr.add(new_download("c", "https://example.com/c.bin"));
+        // Reorder to b, a, c.
+        mgr.reorder(&["b".to_string(), "a".to_string(), "c".to_string()]);
+        let list = mgr.list();
+        assert_eq!(list.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(), vec!["b", "a", "c"]);
+        // Interleave: move c to the front.
+        mgr.reorder(&["c".to_string(), "b".to_string(), "a".to_string()]);
+        let list = mgr.list();
+        assert_eq!(list.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(), vec!["c", "b", "a"]);
+        // The sort_keys must all be unique after interleaving.
+        let mut keys: Vec<i64> = list.iter().map(|d| d.sort_key).collect();
+        keys.sort();
+        let unique: std::collections::HashSet<i64> = keys.iter().copied().collect();
+        assert_eq!(keys.len(), unique.len(), "sort_key collisions after reorder: {keys:?}");
+    }
+
+    /// Setting priority on a download updates both the in-memory
+    /// row and the persisted SQLite row, so a restart preserves
+    /// the user's choice.
+    #[tokio::test]
+    async fn set_priority_persists() {
+        let storage = Storage::open_memory().unwrap();
+        let mgr = DownloadManager::new(storage);
+        mgr.add(new_download("a", "https://example.com/a.bin"));
+        mgr.set_priority("a", crate::model::PRIORITY_HIGH);
+        assert_eq!(mgr.get("a").unwrap().priority, crate::model::PRIORITY_HIGH);
+        // Out-of-range priorities are clamped (PRIORITY_HIGH = 2).
+        mgr.set_priority("a", 99);
+        assert_eq!(mgr.get("a").unwrap().priority, crate::model::PRIORITY_HIGH);
     }
 
     #[tokio::test]

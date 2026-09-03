@@ -105,7 +105,97 @@ pub struct Download {
     pub finished_at: Option<DateTime<Utc>>,
     /// Whether the server advertised range support (drive resume/segmentation).
     pub can_resume: bool,
+    /// User-controlled queue position. Lower values run first; the
+    /// scheduler picks the next-eligible download with the smallest
+    /// `sort_key` (then `created_at` as a tie-breaker). Reorders
+    /// space new keys by 1000 to leave room for interleaving.
+    #[serde(default)]
+    pub sort_key: i64,
+    /// User priority: `0` = low, `1` = normal (default), `2` = high.
+    /// Higher-priority downloads run before lower-priority ones when
+    /// the slot budget is full and a new slot opens.
+    #[serde(default = "default_priority")]
+    pub priority: u8,
+    /// Per-download HTTP headers to add to every request. The
+    /// keys are header names (case-insensitive on the wire, but
+    /// stored exactly as the user typed them), the values are
+    /// the raw header values. Use this for `Referer`, custom
+    /// `User-Agent`, `Authorization: Bearer …`, etc.
+    ///
+    /// Restricted headers (`Host`, `Content-Length`,
+    /// `Accept-Encoding`) are filtered out at the engine
+    /// boundary — reqwest refuses to set them anyway, and we
+    /// want a clear error rather than a silent drop.
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    /// Optional HTTP authentication. The engine uses these
+    /// credentials to add an `Authorization` header to every
+    /// request; if the server returns 401 and the
+    /// `Authorization` header was already present, the request
+    /// is retried with the `Bearer` scheme (i.e. it converts
+    /// to a bearer token without the user having to do
+    /// anything).
+    #[serde(default)]
+    pub auth: Option<AuthSpec>,
+    /// Mirror URLs to fall back to when the primary URL fails.
+    /// The engine tries `url` first; on transient failure
+    /// (4xx/5xx/timeout), it moves to `mirrors[0]`, then
+    /// `mirrors[1]`, and so on. The first mirror to return a
+    /// successful probe becomes the new "primary" for the
+    /// remainder of the transfer; subsequent chunks reuse it.
+    /// Empty by default.
+    #[serde(default)]
+    pub mirrors: Vec<String>,
+    /// Optional media manifest hint. When the URL points at an
+    /// HLS `.m3u8` or DASH `.mpd` manifest, the engine's task
+    /// layer can pick the right downloader. `None` means
+    /// "plain HTTP" (the default path). For v1 this is a
+    /// marker only — a full HLS/DASH implementation (segment
+    /// fetching, retry, optional ffmpeg remux) is a separate
+    /// piece of work tracked in TODO.md.
+    #[serde(default)]
+    pub media: Option<MediaKind>,
 }
+
+/// HLS / DASH manifest kinds. The presence of `Some(kind)`
+/// tells the engine to dispatch to a media-specific downloader
+/// instead of the plain HTTP path. For v1 we only mark the
+/// kind; actual segment fetching is a follow-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MediaKind {
+    /// HTTP Live Streaming manifest (`.m3u8`).
+    Hls,
+    /// MPEG-DASH manifest (`.mpd`).
+    Dash,
+}
+
+/// Per-download authentication.
+///
+/// `Basic` sends `Authorization: Basic base64(user:pass)`.
+/// `Bearer` sends `Authorization: Bearer <token>`.
+/// `Digest` is a future-proofing placeholder; the engine
+/// currently downgrades to `Basic` and surfaces a clear
+/// error in the download's `error` field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum AuthSpec {
+    Basic { username: String, password: String },
+    Bearer { token: String },
+    Digest { username: String, password: String },
+}
+
+fn default_priority() -> u8 {
+    1
+}
+
+/// Symbolic priority constants. The wire format stays a small
+/// integer so adding new tiers doesn't require a protocol bump, but
+/// the constants are public so the rest of the engine (scheduler,
+/// Tauri command surface, frontend) refers to a name.
+pub const PRIORITY_LOW: u8 = 0;
+pub const PRIORITY_NORMAL: u8 = 1;
+pub const PRIORITY_HIGH: u8 = 2;
 
 impl Download {
     /// Create a fresh, queued download for `url` with a generated id.
@@ -128,6 +218,12 @@ impl Download {
             created_at: Utc::now(),
             finished_at: None,
             can_resume: false,
+            sort_key: 0,
+            priority: default_priority(),
+            headers: std::collections::BTreeMap::new(),
+            auth: None,
+            mirrors: Vec::new(),
+            media: None,
         }
     }
 
