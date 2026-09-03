@@ -1,6 +1,6 @@
 [package]
 name = "dm-native-host"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "Native-messaging host that forwards browser-captured URLs/video links to DM"
 publish = false

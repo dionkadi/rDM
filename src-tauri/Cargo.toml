@@ -1,6 +1,6 @@
 [package]
 name = "dm-tauri"
-version = "0.2.1"
+version = "0.3.0"
 description = "DM - a cross-platform download manager (IDM-style) built with Tauri + Rust"
 edition = "2021"
 default-run = "dm-tauri"

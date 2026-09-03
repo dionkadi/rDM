@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "DM Download Grabber",
   "short_name": "DM Grabber",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Detect media/download links and send them to DM for accelerated, resumable downloads.",
   "author": "DM Project",
   "icons": {
