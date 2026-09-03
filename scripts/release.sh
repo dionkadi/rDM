@@ -156,19 +156,16 @@ bump_json() {
 }
 
 bump_toml_version() {
-  # Matches the first `version = "..."` line under [package]. We
-  # only expect one in each Cargo.toml so a naive sed is fine.
+  # Replaces the first `version = "..."` line after [package].
+  # Using awk to find the line in the [package] section.
   local file="$1"
-  python3 -c "
-    import re, sys
-    p = '$file'
-    with open(p) as f: t = f.read()
-    new = re.sub(r'(^\[package\][^\[]*?^version\s*=\s*\")[^\"]*(\")',
-                 r'\g<1>$VERSION\g<2>', t, count=1, flags=re.M | re.S)
-    if new == t:
-      print('error: no [package] version found in', p, file=sys.stderr); sys.exit(1)
-    with open(p, 'w') as f: f.write(new)
-  " || {
+  awk -v ver="$VERSION" '
+    /^\[package\]/ { in_pkg=1 }
+    in_pkg && /^\[/ && !/^\[package\]/ { in_pkg=0 }
+    in_pkg && /^version[[:space:]]*=/ { sub(/"[^"]*"/, "\"" ver "\""); done=1 }
+    { print }
+    END { if (!done) exit 1 }
+  ' "$file" > "$file.tmp" && mv "$file.tmp" "$file" || {
     echo "bump failed in $file" >&2
     exit 5
   }
