@@ -79,6 +79,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -110,12 +116,6 @@ jobs:
             file \
             libxdo-dev \
             libssl-dev
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: "npm"
 
       - name: Install npm dependencies
         run: npm ci
@@ -221,21 +221,19 @@ jobs:
           unzip -l "dm-grabber-${STRIPPED}.xpi" | head -30
           echo
           echo "── sanity: manifest.json valid JSON? ──"
-          python3 -c "
+          python3 <<'PY'
             import json, sys, zipfile
             z = zipfile.ZipFile('dm-grabber-${STRIPPED}.zip')
             m = json.loads(z.read('manifest.json'))
             assert m['manifest_version'] == 3, m
             print('OK', m['name'], m['version'])
-          "
+          PY
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           files: |
-            browser-extension/dist/dm-grabber-${{
-            steps.strip-version.outputs.stripped }}.zip
-            browser-extension/dist/dm-grabber-${{
-            steps.strip-version.outputs.stripped }}.xpi
+            browser-extension/dist/dm-grabber-${{ steps.strip-version.outputs.stripped }}.zip
+            browser-extension/dist/dm-grabber-${{ steps.strip-version.outputs.stripped }}.xpi
           fail_on_unmatched_files: true
