@@ -22,7 +22,9 @@ concurrency:
   # branch. Don't cancel the main-branch build — that's the gate
   # for tags.
   group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
+  cancel-in-progress: >-
+    ${{ github.ref != 'refs/heads/main' &&
+    github.ref != 'refs/heads/master' }}
 
 jobs:
   # ───────────────────────────────────────────────────────────────────
@@ -53,12 +55,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev \
-            libappindicator3-dev \
+            libayatana-appindicator3-dev \
             librsvg2-dev \
             build-essential \
             libxdo-dev \
-            libssl-dev \
-            libayatana-appindicator3-dev
+            libssl-dev
 
       - name: cargo check (workspace)
         run: cargo check --workspace --all-targets
@@ -125,13 +126,21 @@ jobs:
             const m = JSON.parse(fs.readFileSync("manifest.json", "utf8"));
             if (m.manifest_version !== 3) throw new Error("expected MV3");
             if (!m.background || !Array.isArray(m.background.scripts)) {
-              throw new Error("background.scripts must be an array (Firefox 109+ event-page compat)");
+              throw new Error(
+                "background.scripts must be an array (Firefox 109+ event-page compat)"
+              );
             }
             if (m.background.service_worker) {
-              throw new Error("background.service_worker is set; Firefox 109-127 rejects it. Use background.scripts only.");
+              throw new Error(
+                "background.service_worker is set; Firefox 109-127 rejects it."
+                + " Use background.scripts only."
+              );
             }
             if (!m.browser_specific_settings?.gecko?.id) {
-              throw new Error("missing browser_specific_settings.gecko.id (Firefox needs a fixed extension ID)");
+              throw new Error(
+                "missing browser_specific_settings.gecko.id "
+                + "(Firefox needs a fixed extension ID)"
+              );
             }
             console.log("manifest OK:", m.name, m.version);
           '

@@ -63,13 +63,13 @@ jobs:
             target: x86_64-pc-windows-msvc
             args: ""
 
-          # macOS 13 (Ventura) for x86_64 + arm64 in one runner. We
+          # macOS 14 (Sonoma) for x86_64 + arm64 in one runner. We
           # build a universal binary by passing both `--target`s to
           # tauri-action, which runs the bundler twice and lipo-s the
           # results. No `signingIdentity` → ad-hoc signed; users get
           # a Gatekeeper warning on first launch.
           - platform: macos
-            os: macos-13
+            os: macos-14
             target: universal-apple-darwin
             args: "--target universal-apple-darwin"
 
@@ -82,7 +82,9 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target == 'universal-apple-darwin' && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.target }}
+          targets: >
+            ${{ matrix.target == 'universal-apple-darwin' &&
+            'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.target }}
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
@@ -99,7 +101,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev \
-            libappindicator3-dev \
+            libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf \
             build-essential \
@@ -107,8 +109,7 @@ jobs:
             wget \
             file \
             libxdo-dev \
-            libssl-dev \
-            libayatana-appindicator3-dev
+            libssl-dev
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -144,20 +145,26 @@ jobs:
 
             | Platform | Installer | Notes |
             | --- | --- | --- |
-            | Linux | `.deb` / `.AppImage` | `sudo dpkg -i DM_*_amd64.deb` or `chmod +x DM_*_AppImage && ./DM_*_AppImage` |
-            | Windows | `.msi` / `.exe` | Run the installer; SmartScreen will warn on first launch (unsigned) |
-            | macOS | `.dmg` / `.app` | Drag to Applications. First launch: right-click → Open to bypass Gatekeeper (unsigned) |
+            | Linux | `.deb` / `.AppImage` | `sudo dpkg -i DM_*_amd64.deb` |
+            | | | or `chmod +x DM_*_AppImage && ./DM_*_AppImage` |
+            | Windows | `.msi` / `.exe` | Run the installer; SmartScreen will
+            | | | warn on first launch (unsigned) |
+            | macOS | `.dmg` / `.app` | Drag to Applications. First
+            | | | launch: right-click → Open to bypass Gatekeeper (unsigned) |
 
             ### Browser extension
 
             | Browser | File | Install |
             | --- | --- | --- |
-            | Chrome / Edge / Brave / Arc | `dm-grabber-${{ github.ref_name }}.zip` | `chrome://extensions` → enable Developer mode → "Load unpacked" (extract the .zip first) |
-            | Firefox | `dm-grabber-${{ github.ref_name }}.xpi` | Drag the .xpi onto a Firefox window, or `about:addons` → Install Add-on From File |
+            | Chrome / Edge / Brave / Arc |
+            | | `dm-grabber-${{ github.ref_name }}.zip` |
+            | | | `chrome://extensions` → Developer mode → Load unpacked |
+            | Firefox | `dm-grabber-${{ github.ref_name }}.xpi` |
+            | | | Drag .xpi onto Firefox, or about:addons → Install From File |
 
             See `browser-extension/INSTALL.md` for the native-messaging
             host setup, which is required before "Send to DM" will work.
-          releaseDraft: true
+          releaseDraft: false
           prerelease: ${{ contains(github.ref_name, '-rc') }}
           # `includeUpdaterJson` would add a latest.json for Tauri's
           # built-in updater. Disabled for now because we're not
@@ -191,16 +198,24 @@ jobs:
 
       - name: Verify packages
         working-directory: browser-extension/dist
+        env:
+          VERSION: ${{ github.ref_name }}
         run: |
           set -e
           echo "── contents of .zip ──"
-          unzip -l dm-grabber-${VERSION}.zip | head -30
+          unzip -l "dm-grabber-${VERSION}.zip" | head -30
           echo
           echo "── contents of .xpi ──"
-          unzip -l dm-grabber-${VERSION}.xpi | head -30
+          unzip -l "dm-grabber-${VERSION}.xpi" | head -30
           echo
           echo "── sanity: manifest.json valid JSON? ──"
-          python3 -c "import json, sys, zipfile; z = zipfile.ZipFile('dm-grabber-${VERSION}.zip'); m = json.loads(z.read('manifest.json')); assert m['manifest_version'] == 3, m; print('OK', m['name'], m['version'])"
+          python3 -c "
+            import json, sys, zipfile
+            z = zipfile.ZipFile('dm-grabber-${VERSION}.zip')
+            m = json.loads(z.read('manifest.json'))
+            assert m['manifest_version'] == 3, m
+            print('OK', m['name'], m['version'])
+          "
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
