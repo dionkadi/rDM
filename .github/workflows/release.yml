@@ -221,13 +221,7 @@ jobs:
           unzip -l "dm-grabber-${STRIPPED}.xpi" | head -30
           echo
           echo "── sanity: manifest.json valid JSON? ──"
-          python3 <<'PY'
-            import json, sys, zipfile
-            z = zipfile.ZipFile('dm-grabber-${STRIPPED}.zip')
-            m = json.loads(z.read('manifest.json'))
-            assert m['manifest_version'] == 3, m
-            print('OK', m['name'], m['version'])
-          PY
+          python3 -c "import json, sys, zipfile; z = zipfile.ZipFile('dm-grabber-${STRIPPED}.zip'); m = json.loads(z.read('manifest.json')); assert m['manifest_version'] == 3, m; print('OK', m['name'], m['version'])"
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
