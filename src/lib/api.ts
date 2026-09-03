@@ -6,57 +6,57 @@ import { invoke } from "@tauri-apps/api/core";
 import type { Download, ProxyMode, Settings } from "./types";
 
 export function ping(): Promise<string> {
-  return invoke("ping");
+ return invoke("ping");
 }
 
 export function addDownload(opts: {
-  url: string;
-  category?: string | null;
-  filename?: string | null;
-  speedLimit?: number | null;
-  checksum?: { algorithm: string; expected: string } | null;
-  proxy?: string | null;
+ url: string;
+ category?: string | null;
+ filename?: string | null;
+ speedLimit?: number | null;
+ checksum?: { algorithm: string; expected: string } | null;
+ proxy?: string | null;
 }): Promise<Download> {
-  return invoke("add_download", {
-    url: opts.url,
-    category: opts.category ?? null,
-    filename: opts.filename ?? null,
-    speedLimit: opts.speedLimit ?? null,
-    checksum: opts.checksum ?? null,
-    proxy: opts.proxy ?? null,
-  });
+ return invoke("add_download", {
+  url: opts.url,
+  category: opts.category ?? null,
+  filename: opts.filename ?? null,
+  speedLimit: opts.speedLimit ?? null,
+  checksum: opts.checksum ?? null,
+  proxy: opts.proxy ?? null,
+ });
 }
 
 export function listDownloads(): Promise<Download[]> {
-  return invoke("list_downloads");
+ return invoke("list_downloads");
 }
 
 export function getDownload(id: string): Promise<Download | null> {
-  return invoke("get_download", { id });
+ return invoke("get_download", { id });
 }
 
 export function pauseDownload(id: string): Promise<void> {
-  return invoke("pause_download", { id });
+ return invoke("pause_download", { id });
 }
 
 export function resumeDownload(id: string): Promise<void> {
-  return invoke("resume_download", { id });
+ return invoke("resume_download", { id });
 }
 
 export function cancelDownload(id: string): Promise<void> {
-  return invoke("cancel_download", { id });
+ return invoke("cancel_download", { id });
 }
 
 export function removeDownload(id: string): Promise<void> {
-  return invoke("remove_download", { id });
+ return invoke("remove_download", { id });
 }
 
 export function setSpeedLimit(id: string, limit: number | null): Promise<void> {
-  return invoke("set_speed_limit", { id, limit });
+ return invoke("set_speed_limit", { id, limit });
 }
 
 export function setGlobalSpeedLimit(limit: number | null): Promise<void> {
-  return invoke("set_global_speed_limit", { limit });
+ return invoke("set_global_speed_limit", { limit });
 }
 
 /**
@@ -67,7 +67,7 @@ export function setGlobalSpeedLimit(limit: number | null): Promise<void> {
  * store merges them without a full refresh.
  */
 export function reorderDownloads(ids: string[]): Promise<void> {
-  return invoke("reorder_downloads", { ids });
+ return invoke("reorder_downloads", { ids });
 }
 
 /**
@@ -75,38 +75,41 @@ export function reorderDownloads(ids: string[]): Promise<void> {
  * (default), `2` = high. Out-of-range values are clamped by
  * the engine to `[0, 2]`.
  */
-export function setDownloadPriority(id: string, priority: number): Promise<void> {
-  return invoke("set_download_priority", { id, priority });
+export function setDownloadPriority(
+ id: string,
+ priority: number,
+): Promise<void> {
+ return invoke("set_download_priority", { id, priority });
 }
 
 export function getSettings(): Promise<Settings> {
-  return invoke("get_settings");
+ return invoke("get_settings");
 }
 
 export function updateSettings(settings: Settings): Promise<void> {
-  return invoke("update_settings", { settings });
+ return invoke("update_settings", { settings });
 }
 
 /** Switch the global proxy policy. `url` is only used when `mode === "manual"`. */
 export function setProxy(
-  mode: ProxyMode,
-  url?: string | null,
+ mode: ProxyMode,
+ url?: string | null,
 ): Promise<Settings> {
-  return invoke("set_proxy", { mode, url: url ?? null });
+ return invoke("set_proxy", { mode, url: url ?? null });
 }
 
 export function saveDirFor(category?: string | null): Promise<string> {
-  return invoke("save_dir_for", { category: category ?? null });
+ return invoke("save_dir_for", { category: category ?? null });
 }
 
 export interface NativeHostProbe {
-  bound: boolean;
-  port: number;
-  lastEventUnix: number;
+ bound: boolean;
+ port: number;
+ lastEventUnix: number;
 }
 
 export function probeNativeHost(): Promise<NativeHostProbe> {
-  return invoke("probe_native_host");
+ return invoke("probe_native_host");
 }
 
 /**
@@ -124,8 +127,8 @@ export function probeNativeHost(): Promise<NativeHostProbe> {
  * show it in a toast.
  */
 export function openFolder(
-  path: string,
-  selectFile: boolean = false,
+ path: string,
+ selectFile: boolean = false,
 ): Promise<void> {
-  return invoke("open_folder", { path, selectFile });
+ return invoke("open_folder", { path, selectFile });
 }

@@ -5,9 +5,10 @@ import { browser } from "../utils/env";
 // ── Theme ───────────────────────────────────────────────────────────
 export type ThemeKey = "dark" | "light" | "system";
 const THEME_KEY = "dm-theme";
-const mediaQuery = typeof window !== "undefined"
-  ? window.matchMedia("(prefers-color-scheme: light)")
-  : null;
+const mediaQuery =
+  typeof window === "undefined"
+    ? null
+    : window.matchMedia("(prefers-color-scheme: light)");
 
 function readStoredTheme(): ThemeKey {
   if (typeof localStorage === "undefined") return "dark";
@@ -26,7 +27,9 @@ function applyTheme(theme: "dark" | "light"): void {
   if (typeof document === "undefined") return;
   document.documentElement.setAttribute("data-theme", theme);
   // Also nudge native form controls
-  const meta = document.querySelector<HTMLMetaElement>('meta[name="color-scheme"]');
+  const meta = document.querySelector<HTMLMetaElement>(
+    'meta[name="color-scheme"]',
+  );
   if (meta) meta.content = theme;
 }
 
@@ -35,7 +38,8 @@ export const theme = writable<ThemeKey>(readStoredTheme());
 // React to theme changes
 if (browser) {
   theme.subscribe((stored) => {
-    if (typeof localStorage !== "undefined") localStorage.setItem(THEME_KEY, stored);
+    if (typeof localStorage !== "undefined")
+      localStorage.setItem(THEME_KEY, stored);
     const eff = effectiveTheme(stored);
     applyTheme(eff);
   });
@@ -257,7 +261,8 @@ export function selectRange(
 /** Replace the selection with the entire provided id list. */
 export function selectAll(orderedIds: readonly string[]): void {
   selectedIds.set(new Set(orderedIds));
-  if (orderedIds.length > 0) lastSelectedId.set(orderedIds[orderedIds.length - 1]);
+  if (orderedIds.length > 0)
+    lastSelectedId.set(orderedIds[orderedIds.length - 1]);
 }
 
 /** Clear the selection entirely. */
@@ -290,4 +295,3 @@ export function recordNativeHostError(msg: string): void {
     lastError: msg,
   }));
 }
-

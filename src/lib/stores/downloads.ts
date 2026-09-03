@@ -171,19 +171,22 @@ async function bulkApply(
 export async function bulkPause(ids: readonly string[]): Promise<void> {
   const r = await bulkApply(ids, pauseDownload);
   await refreshDownloads();
-  if (r.failed > 0) throw new Error(`${r.ok} paused, ${r.failed} failed: ${r.firstError}`);
+  if (r.failed > 0)
+    throw new Error(`${r.ok} paused, ${r.failed} failed: ${r.firstError}`);
 }
 
 export async function bulkResume(ids: readonly string[]): Promise<void> {
   const r = await bulkApply(ids, resumeDownload);
   await refreshDownloads();
-  if (r.failed > 0) throw new Error(`${r.ok} resumed, ${r.failed} failed: ${r.firstError}`);
+  if (r.failed > 0)
+    throw new Error(`${r.ok} resumed, ${r.failed} failed: ${r.firstError}`);
 }
 
 export async function bulkRemove(ids: readonly string[]): Promise<void> {
   const r = await bulkApply(ids, removeDownload);
   await refreshDownloads();
-  if (r.failed > 0) throw new Error(`${r.ok} removed, ${r.failed} failed: ${r.firstError}`);
+  if (r.failed > 0)
+    throw new Error(`${r.ok} removed, ${r.failed} failed: ${r.firstError}`);
 }
 
 export async function bulkSetLimit(
@@ -192,7 +195,8 @@ export async function bulkSetLimit(
 ): Promise<void> {
   const r = await bulkApply(ids, (id) => setDownloadSpeedLimit(id, limit));
   await refreshDownloads();
-  if (r.failed > 0) throw new Error(`${r.ok} updated, ${r.failed} failed: ${r.firstError}`);
+  if (r.failed > 0)
+    throw new Error(`${r.ok} updated, ${r.failed} failed: ${r.firstError}`);
 }
 
 // ── Reorder / priority ──────────────────────────────────────
@@ -238,7 +242,9 @@ export async function startEventListener(): Promise<void> {
         // Lazy-import to avoid a circular dependency: `ui.ts` is
         // also imported by the download store, so reaching back
         // into it from a top-level `import` would be a cycle.
-        import("./ui").then((ui) => ui.pruneSelection(new Set(get(downloads).map((d) => d.id))));
+        import("./ui").then((ui) =>
+          ui.pruneSelection(new Set(get(downloads).map((d) => d.id))),
+        );
         return;
       }
       const d = e.download;
