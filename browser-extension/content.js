@@ -86,6 +86,21 @@ function onClickCapture(e) {
       type: "download-click",
       url: anchor.href,
       filename: anchor.getAttribute("download") || anchor.textContent || "",
+      // Forward the source page's URL as the Referer hint
+      // and the browser's current User-Agent. The native
+      // host relays these to the Tauri side, which
+      // pre-fills the per-download headers so the user
+      // can confirm them in the CaptureDialog. Some
+      // servers (paywalled content, mobile-only mirrors)
+      // gate downloads on these headers, and clicking a
+      // link is the moment we know what the page Referer
+      // is. Both fields are best-effort: if the browser
+      // doesn't expose them (rare, but possible on a
+      // hardened Firefox build), the native host falls
+      // back to empty strings and the Tauri side shows
+      // an empty input in the dialog.
+      referer: location.href,
+      userAgent: navigator.userAgent,
     });
   } catch (err) {
     // If the runtime is gone (e.g. the extension was reloaded

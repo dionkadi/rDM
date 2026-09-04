@@ -287,6 +287,16 @@ pub async fn run_download(ctx: Arc<RunContext>, state: Arc<TaskState>) {
             d.auth.clone(),
         )
     };
+    // The chunk workers write to `<save_path>.part` so a crash
+    // mid-transfer can't leave a half-written file at the
+    // final filename. On success the task layer renames
+    // `.part` → `save_path` atomically; on failure the `.part`
+    // file is left in place (so the user can inspect it or
+    // resume) and the final filename is never created.
+    let part_path = {
+        let d = state.download.lock().unwrap();
+        d.part_path()
+    };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<(usize, u64)>();
 
@@ -309,12 +319,16 @@ pub async fn run_download(ctx: Arc<RunContext>, state: Arc<TaskState>) {
             continue;
         }
         let client = client.clone();
-        let file_path = save_path.clone();
         let limiter = limiter.clone();
         let control = state.control.clone();
         let state = state.clone();
         let ctx = ctx.clone();
         let chunk_index = chunk.index;
+        // Clone `part_path` per chunk worker so each
+        // `async move` closure owns its own copy. The chunk
+        // worker writes to `<save_path>.part`; on success the
+        // task layer renames it to the final filename.
+        let file_path = part_path.clone();
         let tx = tx.clone();
         let url = url.clone();
         // Clone per-download headers and auth so the `async move`
@@ -511,6 +525,31 @@ pub async fn run_download(ctx: Arc<RunContext>, state: Arc<TaskState>) {
 
         d.status = DownloadStatus::Completed;
         d.finished_at = Some(chrono::Utc::now());
+
+        // Atomic rename: `<save_path>.part` → `save_path`. The
+        // chunk workers wrote to `.part` so a crash mid-transfer
+        // can't leave a half-written file at the final
+        // filename. On success we promote the `.part` to the
+        // real filename in a single `rename` syscall (atomic
+        // on the same filesystem). If the rename fails — e.g.
+        // a permission error, or the `.part` file is missing
+        // because an earlier error already cleaned it up — we
+        // log the error and continue (the download is still
+        // marked Completed; the user can manually rename the
+        // `.part` file). We do NOT roll back the status: the
+        // bytes are on disk, just under a different name.
+        let part_path = d.part_path();
+        match std::fs::rename(&part_path, &save_path) {
+            Ok(()) => {}
+            Err(e) => {
+                log::error!(
+                    "failed to rename .part to final filename id={id} part={} final={} err={e}",
+                    part_path.display(),
+                    save_path.display()
+                );
+            }
+        }
+
         let _ = ctx.storage.save_download(&d);
         let _ = ctx.storage.add_history(
             Some(&id),

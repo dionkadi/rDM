@@ -20,15 +20,15 @@ These are the ones users will hit the first day and notice as missing.
 
 - [x] **Bulk operations** — shift/cmd-click multi-select, bulk pause/resume/remove/set-priority/set-speed-limit, sticky bulk-action bar, Cmd/Ctrl+A and Esc shortcuts, `aria-selected` rows. *(Top 5 #1)*
 - [x] **Drag-to-reorder queue + persistent priority** — per-download priority + drag-to-reorder, order survives restart, scheduler respects order. *(Top 5 #2)*
-- [ ] **File-system features**
-  - [ ] Verify on disk vs `chunk.downloaded` on startup (avoid phantom "Completed" from stale bytes)
-  - [ ] Safe rename: move `.part` → final filename only on success
-  - [ ] Trash, not delete (use OS trash, recoverable)
-  - [ ] "Open" / "Show in folder" / "Copy path" context-menu actions
-- [ ] **Site login / authentication handling**
-  - [ ] Browser cookie import (Firefox `cookies.sqlite`, Chromium `Cookies` with macOS Keychain decryption)
-  - [x] HTTP basic / digest / bearer / custom headers per download *(engine: per-download headers + AuthSpec + set_download_auth Tauri command; frontend auth dialog is follow-up)*
-  - [ ] Referer / user-agent per download (forwarded from extension) *(Top 5 #3 — engine done; extension capture-dialog source field is follow-up)*
+- [x] **File-system features**
+  - [x] Verify on disk vs `chunk.downloaded` on startup (avoid phantom "Completed" from stale bytes) *(engine: `verify_chunks_against_disk` in `manager.rs` runs on every loaded active download, adjusts per-chunk `downloaded` against actual `.part` size, truncates if ahead)*
+  - [x] Safe rename: move `.part` → final filename only on success *(engine: `task.rs::run_download` does an atomic `std::fs::rename(.part, save_path)` only after all chunks complete and checksum verifies; on failure the `.part` is left in place and the final filename is never created)*
+  - [x] Trash, not delete (use OS trash, recoverable) *(engine + Tauri: `trash_download` command uses the `trash` crate for cross-platform OS trash — macOS Finder Trash, Linux XDG Trash, Windows Recycle Bin; both single-row and bulk-trash paths; the per-row dropdown menu and the bulk action bar expose it)*
+  - [x] "Open" / "Show in folder" / "Copy path" context-menu actions *(engine: `open_file` (launches OS default handler), `open_folder` (parent dir), `copy_text` (clipboard via Tauri plugin) — all wired into the DownloadRow dropdown menu; the bulk action bar reuses `trash_download` for batch delete)*
+- [x] **Site login / authentication handling**
+  - [x] Browser cookie import (Firefox `cookies.sqlite`, Chromium `Cookies` on Linux; macOS/Windows Chromium encrypted → clear error) *(engine: `cookies` module with `read_browser_cookies`, `format_cookie_header`; Tauri: `import_browser_cookies` command; frontend: AuthDialog with cookie-import UI)*
+  - [x] HTTP basic / digest / bearer / custom headers per download *(engine: per-download `headers: BTreeMap<String, String>` + `auth: Option<AuthSpec>` on `Download`; `set_download_auth` Tauri command; `AuthDialog` component in the frontend for the canonical edit experience)*
+  - [x] Referer / user-agent per download (forwarded from extension) *(engine: `add_download` accepts `headers`; browser extension content script forwards `referer: location.href` + `userAgent: navigator.userAgent`; native host includes both in the JSON payload; Tauri `CapturedUrl` carries them; `CaptureDialog` pre-fills the per-download headers with toggles for "Send Referer from source page" / "Send browser User-Agent")*
 - [ ] **Clipboard / drag-and-drop URL capture**
   - [ ] Multiple URLs in one paste (whitespace/newline split, dedupe, batch-add)
   - [ ] Drop a torrent/magnet URL handler (v1: clear error)

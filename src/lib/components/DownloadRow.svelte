@@ -103,12 +103,45 @@
     }
     items.push({ separator: true, label: "" });
     items.push({ label: "Copy link", icon: "M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71", shortcut: "⌘C", action: () => { close(); navigator.clipboard?.writeText(d.url); } });
+    if (d.savePath) {
+      // "Copy path" duplicates the absolute save path to the
+      // clipboard. Routed through the Tauri command surface
+      // (the `copyText` api wrapper) so it works in the
+      // embedded webview where `navigator.clipboard.writeText`
+      // is sometimes blocked outside a user gesture.
+      items.push({ label: "Copy path", icon: "M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2M9 5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v0a2 2 0 0 1-2 2h-2a2 2 0 0 1-2-2v0zM9 13h6M9 17h6", action: () => { close(); dispatch("action", { type: "copy-path", id: d.id }); } });
+    }
+    // "Auth…" opens the per-download auth dialog so the
+    // user can attach HTTP basic / bearer credentials,
+    // custom headers (Referer, User-Agent, Cookie, …) or
+    // import cookies from their browser. Available on every
+    // status (the user might want to set auth *before* a
+    // 401 surfaces, not after).
+    items.push({ label: "Auth…", icon: "M12 11V7a4 4 0 1 1 8 0v4M5 11h14a2 2 0 0 1 2 2v8H3v-8a2 2 0 0 1 2-2z", action: () => { close(); dispatch("action", { type: "auth", id: d.id }); } });
     items.push({ label: "Open in browser", icon: "M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3", action: () => { close(); window.open(d.url, "_blank"); } });
     if (d.savePath) {
+      // "Open" launches the OS default handler (PDF reader,
+      // video player, etc.). Only offered for completed
+      // downloads — for in-flight ones the file may not
+      // exist yet, in which case the Rust side returns a
+      // clear "still downloading" error and the toast tells
+      // the user to wait.
+      if (d.status === "completed") {
+        items.push({ label: "Open", icon: "M9 11l3 3L22 4M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11", action: () => { close(); dispatch("action", { type: "open-file", id: d.id }); } });
+      }
       items.push({ label: "Open folder", icon: "M3 7l4-4h4l2 2h8v13H3V7z", action: () => { close(); dispatch("action", { type: "open-folder", id: d.id }); } });
     }
     items.push({ separator: true, label: "" });
-    items.push({ label: "Remove", icon: "M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13", danger: true, action: () => { close(); dispatch("action", { type: "remove", id: d.id }); } });
+    // Two destructive-but-recoverable actions at the bottom
+    // of the menu, separated by a divider from the rest of
+    // the actions. "Move to Trash" is the recoverable default
+    // — the file goes to the OS trash and the SQLite row is
+    // removed. "Remove" is the older "delete the row but
+    // leave the file on disk" action, kept for users who
+    // want to keep the file outside the engine (e.g. they
+    // archived it already) but want it gone from the list.
+    items.push({ label: "Move to Trash", icon: "M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6", action: () => { close(); dispatch("action", { type: "trash", id: d.id }); } });
+    items.push({ label: "Remove (keep file)", icon: "M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13", danger: true, action: () => { close(); dispatch("action", { type: "remove", id: d.id }); } });
     return items;
   }
 

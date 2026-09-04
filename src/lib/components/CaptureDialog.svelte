@@ -42,6 +42,19 @@
   let showChecksum = false;
   let busy = false;
 
+  // Per-download Referer / User-Agent. The browser extension
+  // forwards the source page's Referer and the browser's
+  // current User-Agent as part of the `CapturedUrl` payload.
+  // We pre-fill the fields with these values and let the
+  // user confirm or edit them. `sendReferer` / `sendUserAgent`
+  // default to `true` when the native host provided values
+  // and `false` otherwise — most users want the Referer
+  // forwarded, but a privacy-conscious user can opt out.
+  let referer = "";
+  let userAgent = "";
+  let sendReferer = false;
+  let sendUserAgent = false;
+
   // Source label for the dialog title. Maps the engine's
   // `CapturedUrl.source` to a human-readable string.
   const SOURCE_LABEL: Record<string, string> = {
@@ -64,6 +77,13 @@
     checksumExpected = "";
     showChecksum = false;
     checksumAlgo = "sha256";
+    referer = current.referer ?? "";
+    userAgent = current.userAgent ?? "";
+    // Default the toggles to on when the native host
+    // actually provided a value; off otherwise. The user
+    // can still toggle before clicking "Download".
+    sendReferer = !!(current.referer && current.referer.length > 0);
+    sendUserAgent = !!(current.userAgent && current.userAgent.length > 0);
   }
 
   // Compute the save path preview from the currently selected
@@ -145,6 +165,16 @@
       const checksum = showChecksum && checksumExpected.trim()
         ? { algorithm: checksumAlgo, expected: checksumExpected.trim() }
         : null;
+      // Build the per-download headers from the Referer /
+      // User-Agent form fields. We only include a header if
+      // the user has the matching toggle on AND the value
+      // is non-empty — the engine filters restricted keys
+      // (Host, Content-Length, Accept-Encoding) and warns
+      // on the rest, but we save a round-trip by not
+      // sending empty / disabled headers at all.
+      const headers: Record<string, string> = {};
+      if (sendReferer && referer.trim()) headers["Referer"] = referer.trim();
+      if (sendUserAgent && userAgent.trim()) headers["User-Agent"] = userAgent.trim();
       // `category === ""` means "use the default save dir" (the
       // engine's `save_dir_for(None)`). We pass null rather than
       // an empty string so the Rust side can pattern-match on
@@ -155,6 +185,7 @@
         filename: filename.trim(),
         speedLimit: limit,
         checksum,
+        headers: Object.keys(headers).length > 0 ? headers : null,
       });
       showToast({
         kind: "success",
@@ -265,7 +296,7 @@
       </label>
 
       <details class="adv" bind:open={showChecksum}>
-        <summary>Advanced (optional speed limit / checksum)</summary>
+        <summary>Advanced (optional speed limit / checksum / referer)</summary>
         <div class="adv-body">
           <label class="field">
             <span class="lbl">Speed limit (KB/s)</span>
@@ -281,6 +312,38 @@
               </select>
               <input class="inp" type="text" placeholder="expected hex" bind:value={checksumExpected} spellcheck="false" />
             </div>
+          </label>
+          <label class="field">
+            <span class="lbl">
+              <label class="chk-inline">
+                <input type="checkbox" bind:checked={sendReferer} />
+                Send Referer from source page
+              </label>
+            </span>
+            <input
+              class="inp"
+              type="text"
+              bind:value={referer}
+              placeholder="https://example.com/page-that-had-the-link"
+              spellcheck="false"
+              disabled={!sendReferer}
+            />
+          </label>
+          <label class="field">
+            <span class="lbl">
+              <label class="chk-inline">
+                <input type="checkbox" bind:checked={sendUserAgent} />
+                Send browser User-Agent
+              </label>
+            </span>
+            <input
+              class="inp"
+              type="text"
+              bind:value={userAgent}
+              placeholder="Mozilla/5.0 …"
+              spellcheck="false"
+              disabled={!sendUserAgent}
+            />
           </label>
         </div>
       </details>
@@ -465,6 +528,25 @@
   }
   .chk-row .sel { flex: 0 0 100px; }
   .chk-row .inp { flex: 1 1 0; min-width: 0; }
+  /* Inline checkbox + label pair used inside the
+   * `.lbl` span of the Referer / User-Agent rows. The
+   * outer label still owns the field, but the click
+   * target for the toggle is the inline `<input type="checkbox">`
+   * + its adjacent text. */
+  .chk-inline {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    text-transform: none;
+    letter-spacing: 0;
+    color: var(--color-text);
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .chk-inline input[type="checkbox"] {
+    margin: 0;
+    accent-color: var(--color-accent);
+  }
   .ft {
     display: flex;
     align-items: center;

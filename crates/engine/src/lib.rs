@@ -5,6 +5,7 @@
 
 pub mod chunk;
 pub mod config;
+pub mod cookies;
 pub mod control;
 pub mod limiter;
 pub mod manager;
@@ -16,6 +17,7 @@ pub mod task;
 
 pub use chunk::ChunkError;
 pub use config::{categorize, default_categories, load_or_default};
+pub use cookies::{read_browser_cookies, BrowserCookie, BrowserKind, CookieError, format_cookie_header};
 pub use control::DownloadControl;
 pub use limiter::{CombinedLimiter, TokenBucket};
 pub use manager::{DownloadEvent, DownloadManager, EventSink, RunContext};

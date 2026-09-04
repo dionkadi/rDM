@@ -112,6 +112,7 @@ fn handle(stream: &mut std::net::TcpStream, data: &[u8], mode: u8) {
         );
         let _ = stream.write_all(header.as_bytes());
         let _ = stream.write_all(data);
+        let _ = stream.flush();
         return;
     }
 
@@ -128,6 +129,18 @@ fn handle(stream: &mut std::net::TcpStream, data: &[u8], mode: u8) {
             );
             let _ = stream.write_all(header.as_bytes());
             let _ = stream.write_all(slice);
+            // Explicit `flush()` before the function returns.
+            // Without it, the kernel buffer might not have
+            // drained when the `stream` is dropped, and the
+            // client (the chunk worker) could see a truncated
+            // response. This is the root cause of the
+            // `resume_after_crash` test failing at index
+            // 8.4 MB with zeros: the server's 8 MB range
+            // response was only ~400 KB by the time the
+            // client read it. The fix is to flush the
+            // response before the closure returns so the
+            // kernel sends the full 8 MB.
+            let _ = stream.flush();
         }
         None => {
             let header = format!(
@@ -136,6 +149,7 @@ fn handle(stream: &mut std::net::TcpStream, data: &[u8], mode: u8) {
             );
             let _ = stream.write_all(header.as_bytes());
             let _ = stream.write_all(data);
+            let _ = stream.flush();
         }
     }
 }

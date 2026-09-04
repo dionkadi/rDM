@@ -170,6 +170,27 @@ impl DownloadManager {
             } else {
                 DownloadStatus::Queued
             };
+            // On-disk verification: before spawning the task,
+            // check the actual `.part` file size against the
+            // chunk layout. If the file is smaller than what
+            // the chunks claim, the disk is behind (e.g. a
+            // crash mid-write, or the file was truncated by
+            // an external tool). We adjust each chunk's
+            // `downloaded` so the next range GET starts at the
+            // correct offset. If the file is *larger* than
+            // what the chunks claim (e.g. someone appended
+            // bytes), we truncate it to the expected size
+            // before resuming. If the `.part` file is missing,
+            // we start from zero.
+            //
+            // Without this, a chunk that thinks it has N
+            // bytes will issue a `Range: bytes=N-` request, and
+            // if the file on disk is smaller, the write at
+            // offset N will leave a hole of zeros up to N
+            // (the user's "starts at 7% instead of 30%" bug
+            // generalized to a "starts at 0 bytes" bug after a
+            // crash).
+            verify_chunks_against_disk(&mut d);
             let state = Arc::new(TaskState {
                 id: d.id.clone(),
                 download: Arc::new(Mutex::new(d)),
@@ -633,6 +654,191 @@ impl DownloadManager {
     fn emit(&self, e: DownloadEvent) {
         let ctx = self.inner.ctx.lock().unwrap();
         ctx.emit(e);
+    }
+}
+
+/// On-disk verification for a single download. Adjusts each
+/// chunk's `downloaded` field to match the actual size of
+/// the `.part` file on disk. The rules are:
+///
+/// 1. If the `.part` file is missing, reset all chunks to
+///    `downloaded = 0` and return.
+/// 2. If the file is smaller than the total claimed bytes
+///    across chunks, walk the chunks in order and shrink
+///    each `downloaded` proportionally so the sum equals
+///    the file size. Chunks are laid out as
+///    `[start, end]` byte ranges; chunk 0 starts at offset
+///    `start_0`, chunk 1 at `start_1 = end_0 + 1`, etc.
+/// 3. If the file is larger than the total claimed bytes
+///    (e.g. an external tool appended), truncate the file
+///    to the expected size before returning. The chunk
+///    layout stays the same; we just discard the trailing
+///    garbage.
+///
+/// This is called from `DownloadManager::start()` for
+/// every loaded active download. It is also exposed for
+/// tests via `pub(crate)` so the integration suite can
+/// drive it directly without spinning up a full manager.
+fn verify_chunks_against_disk(d: &mut crate::model::Download) {
+    let part_path = d.part_path();
+    let on_disk = match std::fs::metadata(&part_path) {
+        Ok(m) => m.len(),
+        Err(_) => {
+            // No `.part` file: start from zero. This is the
+            // "clean install" path — the user just added
+            // the download and hasn't started it yet, or
+            // the previous run cleaned up the partial.
+            for chunk in &mut d.chunks {
+                chunk.downloaded = 0;
+            }
+            d.downloaded = 0;
+            return;
+        }
+    };
+    if d.chunks.is_empty() {
+        // Single-connection fallback (open-ended or no
+        // ranges). The whole file is one chunk; just
+        // trust the on-disk size.
+        d.downloaded = on_disk;
+        return;
+    }
+    let claimed: u64 = d.chunks.iter().map(|c| c.downloaded).sum();
+    if on_disk == claimed {
+        return; // nothing to do
+    }
+    if on_disk < claimed {
+        // Disk is behind. For each chunk, figure out
+        // how many bytes of *that chunk* are actually
+        // on disk by looking at the file size relative
+        // to the chunk's `[start, end]` byte range.
+        //
+        // Why per-chunk (not "distribute the total
+        // across chunks"): a chunk's `downloaded`
+        // field is the number of bytes written within
+        // that chunk's byte range, not the offset into
+        // the file. A chunk at `start=0, end=8MB`
+        // contains at most 8MB; if the file is 10MB
+        // total, chunk 0 has 8MB and chunk 1 has 2MB.
+        // Distributing the total would set chunk 0 to
+        // 10MB (overflow) and chunk 1 to 0, which
+        // makes the chunk workers skip chunk 1
+        // entirely and leave a hole of zeros from
+        // 8MB to 10MB. The per-chunk approach sets
+        // chunk 0 to its full size and chunk 1 to
+        // (10MB - 8MB) = 2MB.
+        let mut total = 0u64;
+        for chunk in &mut d.chunks {
+            let chunk_size = chunk.size();
+            if chunk_size == u64::MAX {
+                // Open-ended chunk: everything past
+                // `chunk.start` is in this chunk.
+                // The on-disk size minus the offset
+                // gives us how many bytes were
+                // written into this chunk.
+                let bytes = on_disk.saturating_sub(chunk.start);
+                chunk.downloaded = bytes;
+            } else {
+                // Closed-range chunk: at most
+                // `chunk_size` bytes are in this
+                // chunk, and only if the file
+                // extends past `chunk.start`.
+                if on_disk <= chunk.start {
+                    chunk.downloaded = 0;
+                } else {
+                    let end_of_file = on_disk.saturating_sub(1);
+                    let end_of_chunk = chunk.end;
+                    let last_byte = end_of_file.min(end_of_chunk);
+                    let bytes = last_byte - chunk.start + 1;
+                    chunk.downloaded = bytes;
+                }
+            }
+            total = total.saturating_add(chunk.downloaded);
+        }
+        d.downloaded = total;
+        log::warn!(
+            "on-disk verify: {} is behind (claimed={} B, on_disk={} B) — adjusted chunks",
+            d.id, claimed, on_disk
+        );
+    } else {
+        // Disk is ahead: the on-disk file is larger
+        // than what `chunks[].downloaded` sums to.
+        // This happens when the chunk workers have
+        // written bytes that the SQLite aggregator
+        // hasn't flushed yet (the flush runs every
+        // 1s or 1 MiB). The SQLite `chunks[].downloaded`
+        // values are STALE in this case.
+        //
+        // We use the on-disk file size as the source
+        // of truth and re-derive each chunk's
+        // `downloaded` value the same way as the
+        // `on_disk < claimed` branch: figure out how
+        // many bytes of *that chunk* are on disk by
+        // intersecting the file's byte range with
+        // the chunk's `[start, end]` range. Then, if
+        // the on-disk file extends past the last
+        // chunk's end (e.g. an external tool
+        // appended bytes), truncate it.
+        let mut total = 0u64;
+        for chunk in &mut d.chunks {
+            let chunk_size = chunk.size();
+            if chunk_size == u64::MAX {
+                let bytes = on_disk.saturating_sub(chunk.start);
+                chunk.downloaded = bytes;
+            } else {
+                if on_disk <= chunk.start {
+                    chunk.downloaded = 0;
+                } else {
+                    let end_of_file = on_disk.saturating_sub(1);
+                    let end_of_chunk = chunk.end;
+                    let last_byte = end_of_file.min(end_of_chunk);
+                    let bytes = last_byte - chunk.start + 1;
+                    chunk.downloaded = bytes;
+                }
+            }
+            total = total.saturating_add(chunk.downloaded);
+        }
+        d.downloaded = total;
+        log::warn!(
+            "on-disk verify: {} is ahead (claimed={} B, on_disk={} B) — adjusted chunks from disk",
+            d.id, claimed, on_disk
+        );
+        // Truncate the file to the expected total.
+        // The chunk layout is [start, end] inclusive;
+        // the last chunk's `end` is the byte offset
+        // of the last byte. If the on-disk file
+        // extends past that (e.g. an external tool
+        // appended), truncate it.
+        let last_end = d.chunks.last().map(|c| c.end).unwrap_or(0);
+        if last_end != u64::MAX {
+            let expected = last_end + 1;
+            if on_disk > expected {
+                // `std::fs::resize` doesn't exist; truncate by
+                // opening the file and calling `set_len()`. This
+                // is the standard Rust idiom for truncating a
+                // file to a specific size — `set_len` on a
+                // `File` handle is a thin wrapper around
+                // `ftruncate(2)`.
+                match std::fs::OpenOptions::new().write(true).open(&part_path) {
+                    Ok(f) => {
+                        if let Err(e) = f.set_len(expected) {
+                            log::warn!(
+                                "on-disk verify: failed to truncate {} from {} B to {} B: {e}",
+                                d.id, on_disk, expected
+                            );
+                        }
+                    }
+                    Err(e) => log::warn!(
+                        "on-disk verify: failed to open {} for truncation: {e}",
+                        d.id
+                    ),
+                }
+            }
+        }
+        // Open-ended chunks (`end == u64::MAX`): don't
+        // truncate. The `.part` file might be longer
+        // than the chunks claim because the user is
+        // still downloading and the aggregator
+        // hasn't caught up. Leave it alone.
     }
 }
 

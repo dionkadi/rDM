@@ -184,6 +184,10 @@ fn main() {
             commands::notify_on_complete,
             commands::probe_native_host,
             commands::open_folder,
+            commands::open_file,
+            commands::copy_text,
+            commands::trash_download,
+            commands::import_browser_cookies,
         ])
         .run(tauri::generate_context!())
         .expect("error while running DM");

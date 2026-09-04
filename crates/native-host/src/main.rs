@@ -96,10 +96,33 @@ pub fn extract_media_urls(html: &str) -> Vec<String> {
 }
 
 /// Forward a single URL to the running DM app over the localhost socket.
-pub fn forward_url(url: &str, port: u16) -> std::io::Result<()> {
+///
+/// `referer` and `user_agent` are the page-level hints the
+/// browser extension captured for the *source* page. We
+/// include them in the JSON payload so the Tauri side can
+/// pre-fill the per-download Referer / User-Agent form
+/// fields. Either is optional — the app surfaces a clear
+/// empty field when the browser didn't relay one.
+pub fn forward_url(
+    url: &str,
+    port: u16,
+    referer: Option<&str>,
+    user_agent: Option<&str>,
+) -> std::io::Result<()> {
     let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
-    let payload = serde_json::json!({ "url": url }).to_string() + "\n";
-    stream.write_all(payload.as_bytes())?;
+    let mut payload = serde_json::json!({ "url": url });
+    if let Some(r) = referer {
+        if !r.is_empty() {
+            payload["referer"] = serde_json::Value::String(r.to_string());
+        }
+    }
+    if let Some(ua) = user_agent {
+        if !ua.is_empty() {
+            payload["userAgent"] = serde_json::Value::String(ua.to_string());
+        }
+    }
+    let body = payload.to_string() + "\n";
+    stream.write_all(body.as_bytes())?;
     stream.flush()
 }
 
@@ -125,7 +148,14 @@ fn handle_message(msg: &serde_json::Value, port: u16) {
         }
     }
     for u in urls {
-        if forward_url(&u, port).is_err() {
+        // Pull the page-level Referer / User-Agent off the
+        // top-level message so the per-URL call below
+        // doesn't have to redo the work. The browser
+        // extension sets these on every capture, so
+        // they're the same for every URL in the batch.
+        let referer = msg.get("referer").and_then(|v| v.as_str());
+        let user_agent = msg.get("userAgent").and_then(|v| v.as_str());
+        if forward_url(&u, port, referer, user_agent).is_err() {
             // App not listening (or unreachable) — drop silently; the extension
             // will retry on the next capture.
             eprintln!("dm-native-host: could not forward {u}");

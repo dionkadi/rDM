@@ -91,6 +91,22 @@ export interface CapturedUrl {
   *  category and the resolved save path is what `add_download`
   *  will actually use. */
  defaultSaveDir: string;
+ /** `Referer` header value the browser captured for the
+  *  *source* page (i.e. the page that contained the link
+  *  the user clicked). This is the high-leverage auth hint
+  *  for the Tier-1 "Referer / user-agent per download" item:
+  *  the frontend pre-fills the per-download Referer row
+  *  with this value, and the user can confirm or edit
+  *  before clicking "Download". `null` when the browser
+  *  didn't send one (e.g. a copy-paste capture with no
+  *  originating page). */
+ referer: string | null;
+ /** User-Agent the browser was using at the time of
+  *  capture. Some servers gate downloads on UA fingerprint
+  *  (e.g. mobile-only mirrors) so pre-filling this in the
+  *  per-download headers is the path of least surprise.
+  *  `null` when the native host didn't relay one. */
+ userAgent: string | null;
  /** Monotonic ID for dedupe. If the same URL comes in twice in
   *  quick succession (e.g. double-click) the frontend can drop
   *  the second one. */
@@ -120,3 +136,33 @@ export const PROXY_MODE_DESC: Record<ProxyMode, string> = {
  system: "Use the HTTP_PROXY / HTTPS_PROXY / NO_PROXY environment variables.",
  manual: "Use a specific proxy URL. Supports http://, https://, socks5://.",
 };
+
+// ── Browser cookies (per-download auth) ────────────────────────
+//
+// Returned by the `import_browser_cookies` Tauri command. The
+// frontend shows a checklist of these so the user can pick
+// which cookies to send with their next download. The
+// `header` field is the pre-formatted `Cookie: a=1; b=2; …`
+// value (ready to paste into the per-download headers
+// dialog) and is what we actually send to the engine.
+
+export type BrowserKind = "firefox" | "chromium";
+
+export interface BrowserCookie {
+ name: string;
+ value: string;
+ host: string;
+ path: string;
+ secure: boolean;
+ /** Unix seconds; `null` = session cookie. */
+ expiresUnix: number | null;
+}
+
+export interface CookieImportResult {
+ count: number;
+ /** Pre-formatted `Cookie:` header value (without the
+  *  leading `Cookie:` token). The user can apply this as-is
+  *  via the per-download headers dialog. */
+ header: string;
+ cookies: BrowserCookie[];
+}

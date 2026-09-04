@@ -4,6 +4,7 @@
 use dm_engine::manager::DownloadManager;
 use dm_engine::model::{AuthSpec, ChecksumSpec, Download, DownloadStatus, ProxyMode, Settings};
 use dm_engine::protocol;
+use dm_engine::cookies;
 use tauri::State;
 use tauri_plugin_notification::NotificationExt;
 
@@ -14,6 +15,16 @@ pub fn ping() -> String {
 }
 
 /// Enqueue a new download. Returns the created `Download` (status `Queued`).
+///
+/// Optional `headers` and `auth` arguments attach per-download
+/// auth data to the freshly-created row. They are in-memory
+/// only (not persisted to SQLite) so a restart clears them —
+/// auth secrets don't sit in a plain-text database file, and
+/// the use case is "I'm downloading one file from a site that
+/// needs login", not "every future download uses these
+/// credentials". The `add_download` command wires the auth
+/// data through the same `set_headers_auth` path that the
+/// `AuthDialog` uses after creation.
 #[tauri::command]
 pub fn add_download(
     state: State<'_, DownloadManager>,
@@ -22,6 +33,8 @@ pub fn add_download(
     filename: Option<String>,
     speed_limit: Option<u64>,
     checksum: Option<ChecksumSpec>,
+    headers: Option<std::collections::BTreeMap<String, String>>,
+    auth: Option<AuthSpec>,
 ) -> Download {
     let dir = state.save_dir_for(category.as_deref());
     let fname = filename.unwrap_or_else(|| protocol::suggest_filename(&url, None, "download.bin"));
@@ -36,6 +49,14 @@ pub fn add_download(
     d.status = DownloadStatus::Queued;
 
     state.add(d.clone());
+    // Headers and auth are in-memory only (see the
+    // `DownloadManager::set_headers_auth` doc). We attach
+    // them after the row is in the map so the per-download
+    // `state.set_headers_auth(id, …)` call is a simple
+    // lookup, not a fresh insertion.
+    if headers.is_some() || auth.is_some() {
+        state.set_headers_auth(&d.id, headers.unwrap_or_default(), auth);
+    }
     d
 }
 
@@ -199,6 +220,96 @@ pub fn save_dir_for(state: State<'_, DownloadManager>, category: Option<String>)
         .to_string()
 }
 
+/// Result of a `import_browser_cookies` Tauri command. Mirrors
+/// `dm_engine::cookies::BrowserCookie` for the frontend (the
+/// engine type is `pub` but the frontend shouldn't depend on
+/// the engine crate). `camelCase` on the wire so it round-trips
+/// with the `serde(rename_all = "camelCase")` derive on the
+/// engine side.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserCookieDto {
+    pub name: String,
+    pub value: String,
+    pub host: String,
+    pub path: String,
+    pub secure: bool,
+    pub expires_unix: Option<i64>,
+}
+
+/// Read cookies from a browser's local SQLite database. Used by
+/// the per-download auth dialog to populate a `Cookie:` header
+/// from the user's existing browser session.
+///
+/// `kind` is `"firefox"` or `"chromium"`. The engine picks the
+/// default on-disk path for the current OS; `path_override`
+/// lets the user pick a custom file (e.g. a snap install or a
+/// portable browser). `host` filters by suffix match — pass
+/// the URL's host (e.g. `"example.com"`) to get only the
+/// cookies that apply. Pass an empty string for the full list.
+///
+/// Errors are surfaced verbatim as a Tauri command error so
+/// the frontend can show the exact reason in a toast (e.g.
+/// "Chromium cookies on macOS are encrypted — see the docs").
+#[tauri::command]
+pub fn import_browser_cookies(
+    kind: String,
+    host: Option<String>,
+    path_override: Option<String>,
+) -> Result<CookieImportResult, String> {
+    let parsed_kind = match kind.to_ascii_lowercase().as_str() {
+        "firefox" | "ff" => cookies::BrowserKind::Firefox,
+        "chromium" | "chrome" | "edge" | "brave" => cookies::BrowserKind::Chromium,
+        other => return Err(format!("unknown browser kind: {other}")),
+    };
+    let host_filter = host
+        .as_deref()
+        .filter(|s| !s.is_empty());
+    let path = path_override
+        .as_deref()
+        .map(std::path::Path::new);
+    let cookies = cookies::read_browser_cookies(
+        parsed_kind,
+        host_filter,
+        path,
+    )
+    .map_err(|e| e.to_string())?;
+    let header = cookies::format_cookie_header(&cookies);
+    Ok(CookieImportResult {
+        count: cookies.len(),
+        header,
+        cookies: cookies
+            .into_iter()
+            .map(|c| BrowserCookieDto {
+                name: c.name,
+                value: c.value,
+                host: c.host,
+                path: c.path,
+                secure: c.secure,
+                expires_unix: c.expires_unix,
+            })
+            .collect(),
+    })
+}
+
+/// What the cookie-import command returns: the full
+/// `Cookie:` header value (the user can apply it as-is via the
+/// per-download headers) plus the per-cookie breakdown (so the
+/// frontend can show a checklist and let the user toggle each
+/// cookie individually before applying).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CookieImportResult {
+    /// Number of cookies that matched the filter.
+    pub count: usize,
+    /// Pre-formatted `Cookie:` header value, ready to paste
+    /// into the per-download headers dialog.
+    pub header: String,
+    /// Per-cookie detail, for the "pick which cookies to send"
+    /// picker UI.
+    pub cookies: Vec<BrowserCookieDto>,
+}
+
 /// Show a desktop notification (used when a download completes).
 #[tauri::command]
 pub fn notify_on_complete(app: tauri::AppHandle, title: String, body: String) {
@@ -230,6 +341,164 @@ pub fn probe_native_host(
         port: crate::native_host::DEFAULT_PORT,
         last_event_unix,
     }
+}
+
+/// Move a download's on-disk file (and its `.part` sibling if any)
+/// to the OS trash, then drop the in-memory entry and the SQLite
+/// row.
+///
+/// This is the command the "Trash" entry in the download row's
+/// dropdown menu calls. It is the recoverable counterpart to
+/// `remove_download` (which only deletes the SQLite row — the
+/// on-disk file is left where the engine put it). Using the OS
+/// trash means the user can undelete via Finder / Explorer /
+/// Files if they click Trash by accident; the SQLite row is the
+/// irreversible half (it must be gone before the next `start()`
+/// re-loads active downloads, otherwise the row reappears with
+/// no file to back it).
+///
+/// We try to trash **both** the final filename and the `.part`
+/// file (if present) in a single `trash::delete_all` call. The
+/// `.part` file is the partial bytes from an interrupted
+/// download; trashing it cleans up the directory as a side
+/// effect. A missing `.part` is not an error (the user is
+/// trashing a *completed* download and the file was already
+/// renamed to its final name by `task.rs::run_download`).
+///
+/// On platforms where the trash crate cannot reach the OS
+/// trash (rare, but the libcanberra / dbus stack on stripped
+/// Linux images sometimes refuses), the trash call returns an
+/// error and the in-memory state is left intact — we
+/// deliberately do **not** fall back to `std::fs::remove_file`
+/// because that would bypass the user's recoverable-delete
+/// intent. The frontend should show a clear "trash failed"
+/// toast and offer a "Force delete" follow-up.
+#[tauri::command]
+pub fn trash_download(
+    state: State<'_, DownloadManager>,
+    id: String,
+) -> Result<(), String> {
+    // 1. Resolve the on-disk paths from the in-memory state. We
+    //    snapshot both the final filename and the `.part` path so
+    //    the trash call below doesn't race with the chunk
+    //    workers' writes (it shouldn't — the download is
+    //    either completed or already errored, so the chunk
+    //    workers are not active — but defending against a
+    //    delete-while-transferring race is cheap).
+    let (save_path, part_path) = {
+        let Some(d) = state.get(&id) else {
+            return Err(format!("download not found: {id}"));
+        };
+        (d.save_path.clone(), d.part_path())
+    };
+
+    // 2. Build the list of paths to trash. We include the
+    //    `.part` file only if it exists (its absence is not an
+    //    error — a completed download has already been renamed
+    //    to its final filename by `task.rs::run_download`).
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    if save_path.exists() {
+        paths.push(save_path.clone());
+    }
+    if part_path.exists() {
+        paths.push(part_path.clone());
+    }
+    if paths.is_empty() {
+        // Nothing on disk to trash. That's fine — we still
+        // drop the in-memory + SQLite row. (The file may have
+        // been deleted out from under us by another process
+        // between when the user added the download and now.)
+        log::info!(
+            "trash_download: no on-disk file for id={id} (path={}); \
+             dropping the database row only",
+            save_path.display()
+        );
+    } else {
+        // 3. Trash. `trash::delete_all` is the cross-platform
+        //    "move to Recycle Bin / Trash" call: macOS Finder
+        //    Trash, Linux XDG Trash, Windows Recycle Bin. It
+        //    does **not** follow symlinks (the link is removed
+        //    and the target is kept intact) — the right
+        //    behaviour for a download manager.
+        trash::delete_all(&paths).map_err(|e| {
+            format!(
+                "failed to move to trash: {e} (file kept on disk; \
+                 engine state untouched — the user can retry or force-delete)"
+            )
+        })?;
+        log::info!(
+            "trash_download: trashed {} path(s) for id={id}: {:?}",
+            paths.len(),
+            paths
+        );
+    }
+
+    // 4. Drop the in-memory entry and the SQLite row, and emit
+    //    a `Removed` event. The same path `remove()` takes,
+    //    including the deliberate skip of `cancel()` (see the
+    //    long comment in `DownloadManager::remove` for why
+    //    this matters).
+    state.remove(&id);
+    Ok(())
+}
+
+/// Open **the file itself** (not its parent) in the OS's default
+/// handler.
+///
+/// This is the command the "Open" entry in the download row's
+/// dropdown menu calls. It is distinct from `open_folder`, which
+/// opens the parent directory. If the file does not exist
+/// (the transfer is still in flight and the `.part` has not been
+/// renamed yet), we surface a clear error so the frontend can
+/// tell the user to wait for the download to finish.
+#[tauri::command]
+pub async fn open_file(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+
+    let p = std::path::PathBuf::from(&path);
+    if !p.exists() {
+        return Err(format!(
+            "file does not exist (still downloading?): {path}"
+        ));
+    }
+    if p.is_dir() {
+        // Defensive: opening a directory in the OS default
+        // handler does open it in the file manager, but the
+        // user-facing "Open" entry in the row is meant for
+        // files. Surface a clear error rather than silently
+        // redirecting.
+        return Err(format!("path is a directory, not a file: {path}"));
+    }
+    let s = p.to_string_lossy().into_owned();
+    log::info!("open_file: opening {s}");
+    app.opener()
+        .open_path(s, None::<&str>)
+        .map_err(|e| format!("opener failed: {e}"))?;
+    Ok(())
+}
+
+/// Copy a text string to the OS clipboard.
+///
+/// Used by the "Copy path" entry in the download row's dropdown
+/// menu. We route through the Tauri command surface (rather than
+/// calling `navigator.clipboard.writeText` directly in the
+/// webview) because some webview configurations refuse clipboard
+/// writes outside a user gesture, and the Tauri side does not
+/// have that restriction. The text is what the frontend hands us
+/// — the Rust side does not interpret it.
+#[tauri::command]
+pub async fn copy_text(
+    app: tauri::AppHandle,
+    text: String,
+) -> Result<(), String> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    app.clipboard()
+        .write_text(text)
+        .map_err(|e| format!("clipboard write failed: {e}"))?;
+    Ok(())
 }
 
 /// Open the **containing folder** of `path` in the OS file manager.

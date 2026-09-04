@@ -239,6 +239,20 @@ impl Download {
     pub fn is_complete(&self) -> bool {
         matches!(self.total_size, Some(t) if t > 0 && t == self.downloaded)
     }
+
+    /// The path the chunk workers actually write to. During a
+    /// transfer the bytes land in `<save_path>.part` so a
+    /// crash mid-transfer can't leave the user with a
+    /// half-written file at the final filename. On success
+    /// the task layer renames `.part` → `save_path`
+    /// atomically. On resume, the on-disk verifier checks the
+    /// `.part` file (if present) against `chunk.downloaded`
+    /// and resets the chunks if the disk is behind.
+    pub fn part_path(&self) -> std::path::PathBuf {
+        let mut p = self.save_path.as_os_str().to_owned();
+        p.push(".part");
+        std::path::PathBuf::from(p)
+    }
 }
 
 /// Category that auto-routes downloads by file extension to a folder.

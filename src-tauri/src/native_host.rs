@@ -156,18 +156,29 @@ fn handle_conn(stream: TcpStream, app: AppHandle, default_save_dir: String, stat
                 for u in arr {
                     if let Some(s) = u.as_str() {
                         status.touch();
-                        emit_captured(&app, source, s, &default_save_dir);
+                        let referer = v.get("referer").and_then(|r| r.as_str());
+                        let ua = v.get("userAgent").and_then(|r| r.as_str());
+                        emit_captured(&app, source, s, &default_save_dir, referer, ua);
                     }
                 }
             } else if let Some(url) = v.get("url").and_then(|u| u.as_str()) {
                 status.touch();
-                emit_captured(&app, source, url, &default_save_dir);
+                let referer = v.get("referer").and_then(|r| r.as_str());
+                let ua = v.get("userAgent").and_then(|r| r.as_str());
+                emit_captured(&app, source, url, &default_save_dir, referer, ua);
             }
         }
     }
 }
 
-fn emit_captured(app: &AppHandle, source: &str, url: &str, default_save_dir: &str) {
+fn emit_captured(
+    app: &AppHandle,
+    source: &str,
+    url: &str,
+    default_save_dir: &str,
+    referer: Option<&str>,
+    user_agent: Option<&str>,
+) {
     // Best-effort filename extraction. The engine has a richer
     // `protocol::suggest_filename` that prefers `Content-Disposition`
     // over the URL path, but we don't have the response headers
@@ -184,6 +195,18 @@ fn emit_captured(app: &AppHandle, source: &str, url: &str, default_save_dir: &st
         url: url.to_string(),
         suggested_filename,
         default_save_dir: default_save_dir.to_string(),
+        // The browser extension can forward the source page's
+        // Referer and the browser's current User-Agent string.
+        // We surface them as `Option`s so the frontend can
+        // pre-fill the per-download headers (or skip the row
+        // entirely if the value is empty / absent). This is
+        // the Tier-1 "Referer / user-agent per download" hook:
+        // a user clicking a download link on a paywalled page
+        // usually has the page's Referer set, and the server
+        // rejects requests without it. Capturing it at the
+        // browser level is the cleanest path.
+        referer: referer.map(|s| s.to_string()).filter(|s| !s.is_empty()),
+        user_agent: user_agent.map(|s| s.to_string()).filter(|s| !s.is_empty()),
         nonce,
     };
     let event: FrontendEvent = FrontendEvent::Captured(payload);

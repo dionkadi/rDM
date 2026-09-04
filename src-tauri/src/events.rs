@@ -46,6 +46,22 @@ pub struct CapturedUrl {
     /// the user picks a category, and the resolved path is what
     /// the `add_download` command will actually use.
     pub default_save_dir: String,
+    /// `Referer` header value the browser captured for the
+    /// *source* page (i.e. the page that contained the link the
+    /// user clicked). This is the high-leverage auth hint for
+    /// the Tier-1 "Referer / user-agent per download" item:
+    /// the frontend pre-fills the per-download Referer row
+    /// with this value, and the user can confirm or edit
+    /// before clicking "Download". `None` when the browser
+    /// didn't send one (e.g. a copy-paste capture with no
+    /// originating page).
+    pub referer: Option<String>,
+    /// User-Agent the browser was using at the time of
+    /// capture. Some servers gate downloads on UA fingerprint
+    /// (e.g. mobile-only mirrors) so pre-filling this in the
+    /// per-download headers is the path of least surprise.
+    /// `None` when the native host didn't relay one.
+    pub user_agent: Option<String>,
     /// Monotonic ID so the frontend can dedupe in case the same URL
     /// comes in twice in quick succession (e.g. the user double-
     /// clicks).

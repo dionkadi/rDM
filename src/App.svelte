@@ -16,6 +16,8 @@
     Toast,
     CaptureDialog,
     BulkActionBar,
+    AuthDialog,
+    authTarget,
   } from "./lib/components";
   import * as api from "./lib/api";
   import { setDownloadPriority as setPriority } from "./lib/api";
@@ -34,6 +36,7 @@
     bulkPause,
     bulkResume,
     bulkRemove,
+    bulkTrash,
     bulkSetLimit,
     reorderDownloads,
     startSpeedMonitor,
@@ -65,7 +68,7 @@
   } from "./lib/stores/ui";
   import { settings, loadSettings } from "./lib/stores/settings";
   import { initKeyboardShortcuts, registerShortcuts } from "./lib/hooks/useKeyboardShortcuts";
-  import { fmtBytes, fmtRate, filenameFromUrl, isUrl } from "./lib/utils/formatters";
+  import { fmtBytes, fmtRate, filenameFromUrl, isUrl, truncate } from "./lib/utils/formatters";
   import type { Download } from "./lib/types";
 
   // ── Form state ────────────────────────────────────────────────
@@ -315,6 +318,73 @@
         }
         await api.openFolder(path, false);
       }
+      else if (type === "open-file") {
+        // Open the file itself in the OS default handler
+        // (PDF reader, video player, image viewer, …). The
+        // Rust side returns a clear "file does not exist"
+        // error for in-flight downloads — we surface that
+        // verbatim in a toast so the user can see why the
+        // action did nothing.
+        const d = $downloads.find((x) => x.id === id);
+        const path = d?.savePath;
+        if (!path) {
+          showToast({
+            kind: "error",
+            title: "No save path",
+            message: "This download has no save path yet.",
+          });
+          return;
+        }
+        await api.openFile(path);
+      }
+      else if (type === "copy-path") {
+        // Copy the absolute save path to the OS clipboard.
+        // The Rust side uses Tauri's clipboard plugin, which
+        // works in the embedded webview without a user
+        // gesture (unlike `navigator.clipboard.writeText`).
+        const d = $downloads.find((x) => x.id === id);
+        const path = d?.savePath;
+        if (!path) {
+          showToast({
+            kind: "error",
+            title: "No save path",
+            message: "This download has no save path yet.",
+          });
+          return;
+        }
+        await api.copyText(path);
+        showToast({
+          kind: "success",
+          title: "Path copied",
+          message: truncate(path, 60),
+        });
+      }
+      else if (type === "trash") {
+        // Recoverable delete: move the on-disk file + .part
+        // to the OS trash, then drop the engine state. The
+        // user can undelete via Finder / Explorer / Files if
+        // they hit Trash by accident. The Rust side returns
+        // a clear "trash failed" error if the OS refuses
+        // (rare, but it happens on locked-down Linux images
+        // without a writable Trash dir) and we surface it
+        // verbatim.
+        await api.trashDownload(id);
+        showToast({ kind: "info", title: "Moved to Trash" });
+      }
+      else if (type === "auth") {
+        // Open the per-download auth dialog so the user can
+        // attach HTTP basic / bearer credentials, custom
+        // headers (Referer, User-Agent, Cookie, …) or
+        // imported browser cookies. The dialog is a
+        // singleton rendered once at the App level; we just
+        // set the target store and it pops open.
+        const d = $downloads.find((x) => x.id === id);
+        if (!d) {
+          showToast({ kind: "error", title: "Download not found" });
+          return;
+        }
+        authTarget.set({ id, download: d });
+      }
     } catch (err) {
       showToast({ kind: "error", title: "Action failed", message: String(err) });
     }
@@ -360,9 +430,10 @@
       if (type === "pause") await bulkPause(ids);
       else if (type === "resume") await bulkResume(ids);
       else if (type === "remove") await bulkRemove(ids);
+      else if (type === "trash") await bulkTrash(ids);
       else if (type === "set-limit") await bulkSetLimit(ids, limit ?? null);
       showToast({ kind: "info", title: `${ids.length} ${verbFor(type)}` });
-      if (type === "remove") clearSelection();
+      if (type === "remove" || type === "trash") clearSelection();
     } catch (err) {
       showToast({ kind: "error", title: "Bulk action failed", message: String(err) });
     }
@@ -373,6 +444,7 @@
       case "pause": return "paused";
       case "resume": return "resumed";
       case "remove": return "removed";
+      case "trash": return "moved to Trash";
       case "set-limit": return "limit set";
       default: return type;
     }
@@ -945,6 +1017,15 @@
      browser extension forwards. It is the *only* path that
      calls `addDownload` for browser-captured URLs. -->
 <CaptureDialog />
+
+<!-- ── Per-download auth dialog ───────────────────────────────── -->
+<!-- The `AuthDialog` is opened by the "Auth…" entry in the
+     download row's dropdown menu. It lets the user attach
+     HTTP basic / bearer credentials, custom headers
+     (Referer, User-Agent, …), or imported browser cookies
+     to a single transfer. All auth data is in-memory only
+     and is not persisted to SQLite. -->
+<AuthDialog />
 
 <!-- ── Status bar ────────────────────────────────────────────── -->
 <StatusBar />

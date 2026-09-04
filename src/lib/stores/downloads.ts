@@ -99,6 +99,14 @@ export async function addDownload(opts: {
   filename?: string | null;
   speedLimit?: number | null;
   checksum?: { algorithm: string; expected: string } | null;
+  /** Per-download HTTP headers (Referer, User-Agent, Cookie, …).
+   *  In-memory only — a restart clears them. The Tauri command
+   *  attaches them via the same `set_headers_auth` path that the
+   *  AuthDialog uses. */
+  headers?: Record<string, string> | null;
+  /** Per-download auth spec (Basic / Bearer / Digest). In-memory
+   *  only. */
+  auth?: import("../api").HeadersAuth | null;
 }): Promise<void> {
   try {
     await api.addDownload(opts);
@@ -187,6 +195,23 @@ export async function bulkRemove(ids: readonly string[]): Promise<void> {
   await refreshDownloads();
   if (r.failed > 0)
     throw new Error(`${r.ok} removed, ${r.failed} failed: ${r.firstError}`);
+}
+
+/**
+ * Move every selected download to the OS trash in parallel.
+ * Each per-id call goes through `api.trashDownload`, which
+ * (a) moves the on-disk file + `.part` to the OS trash and
+ * (b) drops the SQLite row + in-memory entry. We deliberately
+ * do **not** swallow individual failures — the user picked
+ * these downloads on purpose and a partial trash is worse
+ * than a loud error. The toast on success says "N moved to
+ * Trash".
+ */
+export async function bulkTrash(ids: readonly string[]): Promise<void> {
+  const r = await bulkApply(ids, (id) => api.trashDownload(id));
+  await refreshDownloads();
+  if (r.failed > 0)
+    throw new Error(`${r.ok} trashed, ${r.failed} failed: ${r.firstError}`);
 }
 
 export async function bulkSetLimit(
