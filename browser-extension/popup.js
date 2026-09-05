@@ -159,16 +159,127 @@ function setStatus(state) {
 }
 
 // Probe the background service worker for current state.
+//
+// MV3 service workers are *terminated* after ~30 s of inactivity and
+// re-launched on the next event. The very first `sendMessage` to a
+// freshly-launched (or still-loading) SW can race the SW registering
+// its `chrome.runtime.onMessage` listener — the browser then throws
+// "Could not establish connection. Receiving end does not exist."
+// (or, on some Chromium versions, silently resolves to `undefined`).
+//
+// That message is **not** a real failure; it's a cold-start blip. We
+// retry with exponential backoff so the popup doesn't flash a scary
+// red error for the first ~1 s after the user clicks the toolbar
+// icon. The total cold-start budget is ~680 ms — well under the
+// 1.5 s polling interval, so a successful reply still wins the race
+// against the next `setInterval` tick. After the budget is
+// exhausted we surface the actual `lastError` so the user can
+// diagnose a real failure.
+//
+// We also use the callback form of `sendMessage` so we always see
+// `chrome.runtime.lastError` in the same tick as the call — a
+// `await` over the promise form can swallow `lastError` and we'd
+// then have to fall back to the "no response" branch, which is
+// less informative.
+const COLD_START_BACKOFF_MS = [80, 200, 400];
+const MAX_COLD_START_RETRIES = COLD_START_BACKOFF_MS.length;
+
+let probeInFlight = false;
+
+function isColdStartError(msg) {
+  // The exact Chromium text. Brave inherits this verbatim.
+  // Firefox's equivalent (when the SW is a non-persistent event
+  // page that's not currently loaded) is the same string, so this
+  // check is cross-browser-safe.
+  //
+  // `"no response from background"` is our own sentinel for the
+  // silent-no-response case: some Chromium versions accept the
+  // message and resolve the callback to `undefined` with no
+  // `lastError` set, when the SW is still in its boot sequence.
+  // That's the same root cause (cold start) and deserves the same
+  // gentle retry.
+  if (!msg) return false;
+  const m = msg.toLowerCase();
+  return (
+    m.includes("receiving end does not exist") ||
+    m.includes("message port closed before a response") ||
+    m.includes("no such native application") ||
+    m === "no response from background"
+  );
+}
+
+/**
+ * Send a single `get-status` message to the SW. Resolves to
+ * `{ ok: true, state }` on success, or `{ ok: false, error }` on
+ * any failure (cold-start, no-response, or real error). Never
+ * throws.
+ */
+function probeOnce() {
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage({ type: "get-status" }, (res) => {
+        // CRITICAL: read `lastError` in the same tick as the
+        // callback, before any other `chrome.*` call. Chromium and
+        // Firefox both clear it on the next runtime API call.
+        const lastErr = chrome.runtime.lastError;
+        if (lastErr) {
+          resolve({ ok: false, error: lastErr.message || String(lastErr) });
+          return;
+        }
+        if (res && res.state) {
+          resolve({ ok: true, state: res.state });
+          return;
+        }
+        // No error, no `state` — the SW accepted the message but
+        // didn't reply. This happens on a fresh cold start when the
+        // SW was still in the middle of its boot sequence
+        // (`loadInstallTime().then(registerDownloadsListener)…`)
+        // when the message arrived. Treat as a cold-start transient.
+        resolve({ ok: false, error: "no response from background" });
+      });
+    } catch (e) {
+      // `sendMessage` is documented as callback-only and shouldn't
+      // throw, but Firefox in some versions throws synchronously
+      // when the SW is in a bad state. Catch defensively.
+      resolve({ ok: false, error: (e && e.message) || String(e) });
+    }
+  });
+}
+
 async function refresh() {
+  if (probeInFlight) return; // never overlap probes
+  probeInFlight = true;
   try {
-    const res = await chrome.runtime.sendMessage({ type: "get-status" });
-    if (res && res.state) setStatus(res.state);
-  } catch (e) {
+    // First attempt, then retry cold-start failures only. A
+    // non-cold-start error (e.g. host manifest missing) is
+    // surfaced immediately — there's no benefit to retrying it.
+    let r = await probeOnce();
+    let attempts = 0;
+    while (
+      !r.ok &&
+      isColdStartError(r.error) &&
+      attempts < MAX_COLD_START_RETRIES
+    ) {
+      const wait = COLD_START_BACKOFF_MS[attempts];
+      attempts++;
+      await new Promise((res2) => setTimeout(res2, wait));
+      r = await probeOnce();
+    }
+    if (r.ok && r.state) {
+      setStatus(r.state);
+      return;
+    }
+    // We never got a state from the SW. Show the actual error
+    // from the last attempt — it's the most informative one, and
+    // for cold-start exhaustion it'll be the genuine
+    // "Receiving end does not exist" the user can paste into a
+    // bug report.
     setStatus({
       connected: false,
-      lastError:
-        "background not reachable: " + (e && e.message ? e.message : e),
+      lastError: r.error || "background not reachable",
     });
+  } finally {
+    probeInFlight = false;
   }
 }
 refresh();
