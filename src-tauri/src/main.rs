@@ -6,6 +6,7 @@ mod events;
 mod logging;
 mod native_host;
 mod tray;
+mod ws;
 
 use dm_engine::manager::DownloadManager;
 use dm_engine::storage::Storage;

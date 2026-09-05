@@ -22,7 +22,6 @@
     }
   },
   "permissions": [
-    "nativeMessaging",
     "downloads",
     "tabs",
     "activeTab",
@@ -30,7 +29,8 @@
     "storage"
   ],
   "host_permissions": [
-    "<all_urls>"
+    "<all_urls>",
+    "ws://127.0.0.1:9157/*"
   ],
   "background": {
     "scripts": [
