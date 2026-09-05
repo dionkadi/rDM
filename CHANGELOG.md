@@ -11,6 +11,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-09-05
+
+A focused patch release that fixes three regressions introduced
+by 0.4.1's WebSocket direct-transport work.
+
+### Fixed
+
+- **Chrome silently rejected the browser extension** ([#4]).
+  The 0.4.1 manifest used `background.scripts`, which Chrome's
+  MV3 parser strictly rejects with `'background.scripts'
+  requires manifest version of 2 or lower`. The extension
+  failed to install on every Chromium browser. The
+  `scripts/package.sh` and `scripts/package.ps1` now produce
+  **two distinct manifests** at packaging time: the `.zip`
+  ships `background.service_worker: "background.js"` (Chrome /
+  Edge / Brave / Arc / Vivaldi / Opera), the `.xpi` keeps the
+  source's `background.scripts` + `browser_specific_settings.
+  gecko.id` (Firefox 109+). A new self-verify step in the
+  packaging script fails loudly if either archive ends up
+  with the wrong shape, so the regression can't recur silently.
+  The source `manifest.json` keeps the Firefox shape so devs
+  can sideload on Firefox without running the package script.
+
+- **"Open DM app" button showed an unclosable alert** ([#4]).
+  The previous version called `alert(...)` from the popup,
+  which in MV3 is a synchronous, unclosable native dialog
+  that takes focus from the popup and (in some Chromium
+  versions) can't be dismissed without killing the popup or
+  the tab. The button is now repurposed as a **"Re-check
+  host"** control: when the host is down, clicking it
+  re-issues the status probe (the next 1.5 s tick picks up
+  the result and re-renders the status pill); when the host
+  is up, the button is disabled with a `title` explaining
+  that DM is already running and the extension can't launch
+  a Tauri app from a browser.
+
+- **Settings → About and Extensions were stale** ([#4]).
+  The About panel hard-coded `Version: 0.1.0` and
+  `Engine: dm-engine 0.1.0` since the very first commit.
+  New Rust `app_info` Tauri command returns
+  `{appVersion, engineVersion, tauriVersion}` from
+  `env!("CARGO_PKG_VERSION")`, `dm_engine::VERSION` (a new
+  `pub const` mirroring `crates/engine/Cargo.toml`), and
+  `tauri::VERSION`. Wired through `src/lib/api.ts` and
+  rendered in the About tab (with `—` placeholders if the
+  call fails, so the user sees an honest empty state
+  instead of a stale `0.1.0`). Also fixed the misleading
+  `Frontend: Svelte 5` line (the project is on Svelte 4).
+  The Extensions tab is rewritten with the new 3-step
+  WebSocket flow for Chromium and a trimmed 3-step Firefox
+  flow.
+
+### Drive-by
+
+- `release.yml`: the long `python3 -c "..."` one-liner in the
+  `Verify packages` step is now a heredoc, and the two long
+  `files:` entries are wrapped to fit the project's 80-col
+  convention. Same behaviour, no functional change.
+
 ## [0.4.1] — 2026-09-05
 
 A focused patch release that fixes the browser-extension install
