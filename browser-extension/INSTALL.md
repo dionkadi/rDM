@@ -69,12 +69,73 @@ $EDITOR ~/Library/Application\ Support/Google/Chrome/NativeMessagingHosts/com.ap
 
 ### Windows (PowerShell)
 
+Unlike Linux and macOS — where the browser looks for the host
+manifest in a per-vendor `NativeMessagingHosts/` directory —
+**Windows browsers read a per-vendor registry key** that points at
+the manifest file. The manifest file itself can live anywhere on
+disk; the registry is the only lookup mechanism. See the
+[Chrome docs](https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging#native-messaging-host-location)
+for the canonical explanation; the per-vendor keys are:
+
+| Browser | Registry key (under `HKCU\`) |
+| --- | --- |
+| Google Chrome | `Software\Google\Chrome\NativeMessagingHosts\com.app.dm.native` |
+| Microsoft Edge | `Software\Microsoft\Edge\NativeMessagingHosts\com.app.dm.native` |
+| Brave | `Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.app.dm.native` |
+| Arc (Chromium fork) | falls back to Chrome's key — no separate registration needed |
+| Vivaldi | `Software\Vivaldi\NativeMessagingHosts\com.app.dm.native` |
+
+**Why a separate Brave key is necessary.** Brave does **not** fall
+back to Chrome's registry key on Windows (the fallback chain is
+documented in the Microsoft Edge docs and applies to Chromium and
+Edge, but Brave ships its own vendor key). Copying the manifest
+into `%LOCALAPPDATA%\Google\Chrome\User Data\NativeMessagingHosts\`
+will *not* make Brave see it — you must add a Brave-specific
+registry entry. This is the most common cause of "Native host not
+running" on Windows + Brave specifically.
+
+The `path` field inside the manifest can be absolute or relative
+to the directory that contains the manifest file (Windows-only
+behaviour). We recommend absolute for clarity.
+
 ```powershell
-New-Item -ItemType Directory -Force -Path "$env:LOCALAPPDATA\Google\Chrome\User Data\NativeMessagingHosts"
-Copy-Item browser-extension\com.app.dm.native.chrome.json `
-    "$env:LOCALAPPDATA\Google\Chrome\User Data\NativeMessagingHosts\com.app.dm.native.json"
-notepad "$env:LOCALAPPDATA\Google\Chrome\User Data\NativeMessagingHosts\com.app.dm.native.json"
-# set "path" to C:\\path\\to\\dm-native-host.exe (escape backslashes)
+# 1. Place the manifest anywhere on disk. We'll use a stable
+#    location under Program Files; the user-writable
+#    %LOCALAPPDATA% works too.
+$ManifestPath = "C:\Program Files\DM\com.app.dm.native.json"
+Copy-Item browser-extension\com.app.dm.native.chrome.json $ManifestPath
+notepad $ManifestPath
+# set "path" to "C:\\Program Files\\DM\\dm-native-host.exe"
+#    (double backslashes in JSON; Windows accepts both)
+# set "allowed_origins" to your actual Chrome extension ID
+
+# 2. Register the host for **each** browser you use.
+
+# Google Chrome
+reg add "HKCU\Software\Google\Chrome\NativeMessagingHosts\com.app.dm.native" `
+    /ve /d "$ManifestPath" /f
+
+# Microsoft Edge
+reg add "HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.app.dm.native" `
+    /ve /d "$ManifestPath" /f
+
+# Brave (REQUIRED — Brave does not fall back to Chrome's key)
+reg add "HKCU\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.app.dm.native" `
+    /ve /d "$ManifestPath" /f
+
+# Vivaldi (optional)
+reg add "HKCU\Software\Vivaldi\NativeMessagingHosts\com.app.dm.native" `
+    /ve /d "$ManifestPath" /f
+
+# 3. Restart the browser so it re-reads the registry.
+```
+
+**Removing the registration** when you uninstall DM:
+
+```powershell
+reg delete "HKCU\Software\Google\Chrome\NativeMessagingHosts\com.app.dm.native" /f
+reg delete "HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.app.dm.native" /f
+reg delete "HKCU\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.app.dm.native" /f
 ```
 
 ### Firefox
@@ -106,18 +167,22 @@ $EDITOR ~/.mozilla/native-messaging-hosts/com.app.dm.native.json
 4. **Copy the Extension ID** (a 32-character string like
    `abcdefghijklmnopqrstuvwxyzabcdef` under the extension title).
    You will need it in step 5.
-5. **Edit the host manifest** (`com.app.dm.native.json` — the one you
-   copied into `~/.config/google-chrome/NativeMessagingHosts/` in step 2)
-   and replace the string
-   `chrome-extension://REPLACE_WITH_YOUR_CHROME_EXTENSION_ID/`
+5. **Edit the host manifest** (`com.app.dm.native.json` — the file
+   you placed at the per-platform path in step 2) and replace the
+   string `chrome-extension://REPLACE_WITH_YOUR_CHROME_EXTENSION_ID/`
    in the `allowed_origins` array with
    `chrome-extension://<the ID you copied in step 4>/`.
+   - **Linux / macOS:** the file lives under
+     `~/.config/google-chrome/NativeMessagingHosts/` (or the
+     per-vendor directory for Chromium / Brave / Edge / Arc).
+   - **Windows:** the file lives anywhere on disk; the browser
+     locates it via the registry key you added in step 2.
    This is the most commonly-skipped step; if you skip it the popup
    will show `Native host not running` and the service worker
    console will log `Access to the specified native messaging host
    is blocked`. **Chrome refuses to start a host whose manifest
    does not list the calling extension's ID in `allowed_origins`.**
-6. Restart the browser (so Chrome re-reads the host manifest).
+6. Restart the browser (so it re-reads the host manifest / registry).
 
 ### Firefox
 
@@ -159,12 +224,12 @@ common messages you'll see and what they mean:
 | Popup error | What it means | Fix |
 | --- | --- | --- |
 | `No such native application com.app.dm.native` (Firefox) | Firefox couldn't find a valid host manifest for the extension | Confirm `~/.mozilla/native-messaging-hosts/com.app.dm.native.json` exists, is valid JSON, and the extension ID `dm-grabber@dm-project` is in its `allowed_extensions` array (use the bundled `com.app.dm.native.firefox.json` template). |
-| `Specified native messaging host not found.` (Chrome) | The host manifest is missing or its `path` is unreachable | Verify the manifest is in the right OS-specific directory and the binary at the `path` is absolute and executable. |
+| `Specified native messaging host not found.` (Chrome / Edge / Brave) | The browser can't locate the host manifest | **Linux / macOS:** the file is in the wrong per-vendor directory. **Windows:** the registry key under `HKCU\Software\<vendor>\NativeMessagingHosts\com.app.dm.native` is missing, points at a non-existent file, or you used Chrome's key for Brave (Brave does not fall back). |
 | `Access to the specified native messaging host is blocked.` (Chrome) | The Chrome extension ID is not in the host's `allowed_origins` | Copy the actual ID from `chrome://extensions` and edit the host manifest. Restart Chrome to re-read the manifest. |
-| `"path" is not absolute` (manifest rejected) | Relative path in the host manifest | Use an absolute path; on Windows escape backslashes (`"C:\\path\\to\\host.exe"`) |
+| `"path" is not absolute` (manifest rejected) | Relative path in the host manifest | Use an absolute path; on Windows the path can be relative to the manifest's directory but absolute is clearest (`"C:\\path\\to\\host.exe"`). |
 | Extension installed but downloads don't appear | Either the host isn't reachable or the extension is mis-configured | Click **Test host connection** in the popup and read the red error block — it tells you which file/path/ID is wrong. |
 | Firefox rejects the extension | Missing `browser_specific_settings` | `manifest.json` already carries the `gecko` block; if you see this, make sure you loaded the source `browser-extension/manifest.json`, not a copy that has been modified. |
-| The popup says "background not reachable" | The extension's background event page is not running yet | Give Firefox ~1 s after page load; the popup polls every 1.5 s. |
+| The popup flashes a red error for ~1 s on first open, then recovers | The MV3 service worker is in cold start | Expected behaviour: the popup retries `sendMessage` with backoff for ~680 ms before surfacing any error. If the error persists past 1 s, the service worker is genuinely unreachable (e.g. the extension was unloaded, or the manifest is broken). |
 
 ## Permissions the extension asks for
 
