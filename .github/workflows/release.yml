@@ -46,13 +46,18 @@ jobs:
           # Ubuntu 22.04 has every Tauri Linux dep in the default repos
           # (libwebkit2gtk-4.1-0, libappindicator3-1, librsvg2, etc.).
           # The `tauri-action` action's pre-build step installs the
-          # remaining toolchain bits (lld, GTK dev headers) and
-          # configures the workspace target/ for the Tauri CLI.
+          # remaining toolchain bits (lld, GTK dev headers, rpm-build)
+          # and configures the workspace target/ for the Tauri CLI.
           - platform: linux
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            # Tauri produces .deb + .AppImage on Linux out of the box
-            # when bundle.targets is "all" (see tauri.conf.json).
+            # Tauri 2 produces .deb + .AppImage + .rpm on Linux out of
+            # the box when bundle.targets is "all" (see tauri.conf.json).
+            # The .rpm is built by tauri-action's pre-build step on this
+            # Ubuntu runner; tauri-action installs rpm-build into the
+            # environment. All three artifacts are uploaded to the release
+            # by tauri-action itself (no `files:` needed for the desktop
+            # matrix; only the extension job lists files explicitly).
             args: ""
 
           # windows-2022 ships with MSVC + WiX (Tauri's MSI bundler
@@ -145,8 +150,9 @@ jobs:
 
             | Platform | Installer | Notes |
             | --- | --- | --- |
-            | Linux | `.deb` / `.AppImage` | `sudo dpkg -i DM_*_amd64.deb` |
-            | | | or `chmod +x DM_*_AppImage && ./DM_*_AppImage` |
+            | Linux | `.deb` | `sudo dpkg -i DM_*_amd64.deb` |
+            | | `.rpm` | `sudo dnf install -y ./DM-*_amd64.rpm` |
+            | | `.AppImage` | `chmod +x DM_*_AppImage && ./DM_*_AppImage` |
             | Windows | `.msi` / `.exe` | Run the installer; SmartScreen will
             | | | warn on first launch (unsigned) |
             | macOS | `.dmg` / `.app` | Drag to Applications. First

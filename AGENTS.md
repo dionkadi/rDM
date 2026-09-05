@@ -221,6 +221,14 @@ cargo run -p dm-native-host
 
 # Release binary (Cargo workspace unifies target dirs):
 ls target/release/dm-tauri     # ~23 MB stripped, dynamically linked to webkit2gtk-4.1
+
+# Linux bundle artifacts (when `bundle.targets = "all"` in
+# src-tauri/tauri.conf.json, tauri-action produces ALL THREE of these
+# from the Linux matrix job and uploads them to the same release):
+#   src-tauri/target/release/bundle/deb/DM_*_amd64.deb
+#   src-tauri/target/release/bundle/rpm/DM-*-1.x86_64.rpm
+#   src-tauri/target/release/bundle/appimage/DM_*_amd64.AppImage
+# The release.yml `releaseBody` lists them in the Install table.
 ```
 
 ### Fedora 40+ / similar Linux
