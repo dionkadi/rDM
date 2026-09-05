@@ -1,14 +1,35 @@
 // MV3 service worker for the DM Download Grabber extension.
-// Connects to the native-messaging host (`com.app.dm.native`) and forwards
-// detected media/download URLs to the running DM app.
 //
-// Connection model:
-//   * `connect()` is called on every send (the host terminates the connection
-//     after a short idle, so we reconnect on demand).
-//   * Failures (host not running, manifest missing, etc.) surface to the
-//     user via `chrome.action.setBadgeText` so a broken install is obvious.
+// Two transports, picked at module load:
+//   * **WebSocket** to `ws://127.0.0.1:9157/` — used by Chromium
+//     browsers (Chrome, Edge, Brave, Arc, Vivaldi). This is the
+//     "load unpacked and it just works" path: no host manifest,
+//     no native binary, no per-OS install. The Tauri app already
+//     binds that port for the legacy native host, so the
+//     extension piggybacks on the same socket.
+//   * **Native messaging** to `com.app.dm.native` — used by
+//     Firefox MV3. Firefox upgrades insecure `ws://` requests to
+//     `wss://` and silently fails, so a direct WebSocket to
+//     localhost is not viable there. The native-messaging host
+//     (`crates/native-host`) bridges stdio JSON to the same
+//     `127.0.0.1:9157` socket.
+//
+// Both transports share the same on-the-wire payload
+// (`{"url":"…","type":"…","referer":"…","userAgent":"…"}`)
+// and update the same `hostState` object that the popup polls.
+//
+// Connection model (per transport):
+//   * WebSocket: persistent, with exponential-backoff
+//     reconnect on close. Messages sent while disconnected are
+//     queued (capped at 64 entries to bound memory).
+//   * Native messaging: opened on demand; the host closes the
+//     port after a short idle, so we reconnect per send. This
+//     matches the original pre-WebSocket behaviour.
 
 const HOST_NAME = "com.app.dm.native";
+const WS_URL = "ws://127.0.0.1:9157/";
+const WS_RECONNECT_BACKOFF_MS = [200, 500, 1000, 2000, 5000];
+const WS_QUEUE_MAX = 64;
 const STORAGE_KEY_INSTALL_TIME = "dmInstallTime";
 
 // Connection state — visible to the popup via `chrome.runtime.sendMessage`.
@@ -17,6 +38,10 @@ const hostState = {
   lastError: null,
   lastSentAt: 0,
   lastSentCount: 0,
+  // `transportKind` is `"websocket"` or `"native"`. The popup
+  // surfaces this so the user can see which path is in use
+  // (and the install docs can link to the right section).
+  transportKind: null,
   // Live `chrome.downloads.onCreated` filter: epoch ms. Loaded from
   // `chrome.storage.local` on boot so the filter survives service-worker
   // restarts and extension reloads. Updated once, on the very first
@@ -52,130 +77,306 @@ function setBadge(state) {
   }
 }
 
-let port = null;
-
-function setNativeError(message) {
-  // One funnel for "the host is not reachable" so the popup, the
-  // badge, and the console stay in sync. We deliberately do NOT
-  // include the full stack — `chrome.runtime.lastError.message` is
-  // already user-readable (e.g. "No such native application
-  // com.app.dm.native" on Firefox, or "Specified native messaging
-  // host not found." on Chrome).
-  hostState.connected = false;
-  hostState.lastError = message;
-  setBadge("err");
-  console.warn("DM native host:", message);
+// One funnel for "the transport is not reachable" so the popup,
+// the badge, and the console stay in sync. We deliberately do
+// NOT include the full stack — `lastError` strings are
+// already user-readable.
+function setState(connected, message) {
+  hostState.connected = !!connected;
+  hostState.lastError = message || null;
+  setBadge(connected ? "ok" : "err");
+  if (!connected && message) {
+    console.warn("DM transport:", message);
+  }
 }
 
-function connect() {
-  if (port) return port;
-  // Snapshot of the previous state so we only log "connect failed"
-  // when we actually attempt a new connection.
-  let newPort = null;
-  try {
-    newPort = chrome.runtime.connectNative(HOST_NAME);
-  } catch (e) {
-    // `connectNative` is synchronous in Chrome but **may** throw in
-    // Firefox if the host lookup fails immediately (e.g. the host
-    // manifest is missing or unreadable). In that case we never get
-    // a `port` object, so we set the error and bail.
-    setNativeError(String(e && e.message ? e.message : e));
-    return null;
-  }
-  port = newPort;
-  // **CRITICAL (Firefox MV3):** `chrome.runtime.connectNative` is
-  // async — when the host lookup fails, Firefox reports the error
-  // via `chrome.runtime.lastError` *and* via `port.onDisconnect` on
-  // the next event-loop tick. If we don't read `lastError` in the
-  // same tick (before any other chrome.* call), it gets cleared and
-  // we lose the real error message. So we optimistically mark the
-  // connection as up, then check `lastError` immediately and roll
-  // back if it's set. This is the pattern recommended by the
-  // Chrome/Firefox MV3 docs.
-  if (chrome.runtime.lastError) {
-    setNativeError(chrome.runtime.lastError.message);
+// ─── WebSocket transport (Chromium browsers) ────────────────────
+//
+// Wraps the standard browser `WebSocket` with reconnect, queueing,
+// and the hostState integration. We don't pull in any libraries:
+// the WebSocket API is built in to MV3 service workers, and a
+// few hundred lines of state machine is enough.
+function makeWebSocketTransport() {
+  hostState.transportKind = "websocket";
+  let ws = null;
+  let queue = [];
+  let backoffIdx = 0;
+  let closing = false;
+  let onConnected = null; // test hook for `forceReconnect`
+
+  function connect() {
+    if (ws || closing) return;
     try {
-      port.disconnect();
+      ws = new WebSocket(WS_URL);
     } catch (e) {
-      // The port may already be closed; not interesting.
-      void e;
+      setState(false, "WebSocket ctor failed: " + (e && e.message ? e.message : e));
+      scheduleReconnect();
+      return;
     }
-    port = null;
-    return null;
+    ws.addEventListener("open", () => {
+      backoffIdx = 0;
+      setState(true, null);
+      // Drain anything queued while we were disconnected.
+      const pending = queue;
+      queue = [];
+      for (const payload of pending) {
+        try {
+          ws.send(JSON.stringify(payload));
+          hostState.lastSentAt = Date.now();
+          hostState.lastSentCount++;
+        } catch (e) {
+          // Re-queue if the socket died mid-drain.
+          queue.push(payload);
+          break;
+        }
+      }
+      if (typeof onConnected === "function") {
+        const cb = onConnected;
+        onConnected = null;
+        cb();
+      }
+    });
+    ws.addEventListener("message", () => {
+      // The Tauri side acks every payload with `{"ok":true}`.
+      // We don't need the ack for correctness (the next send
+      // would fail loudly if the socket were broken), but we
+      // keep the listener wired so Chrome's WebSocket impl
+      // doesn't fill an internal buffer.
+    });
+    ws.addEventListener("close", (ev) => {
+      ws = null;
+      setState(false, `disconnected (code ${ev.code})`);
+      if (!closing) scheduleReconnect();
+    });
+    ws.addEventListener("error", () => {
+      // The `error` event fires just before `close`. Chrome
+      // does not populate a useful message here, so we let
+      // `close` set the user-facing error string.
+    });
   }
-  hostState.connected = true;
-  hostState.lastError = null;
-  setBadge("ok");
-  port.onMessage.addListener(() => {
-    // The host may ack; nothing to act on.
-  });
-  port.onDisconnect.addListener(() => {
-    // This fires when:
-    //   (a) the host process exits (clean shutdown or crash); or
-    //   (b) Firefox rejects the connection asynchronously
-    //       (e.g. the host manifest is missing — Firefox will
-    //       throw "No such native application com.app.dm.native"
-    //       and then disconnect the port).
-    // In case (b) the same error is *also* in `lastError` on this
-    // tick, so we read it before any other runtime API call.
-    const err = chrome.runtime.lastError
-      ? chrome.runtime.lastError.message
-      : "host disconnected";
-    setNativeError(err);
-    port = null;
-  });
-  return port;
+
+  function scheduleReconnect() {
+    if (closing) return;
+    const wait = WS_RECONNECT_BACKOFF_MS[Math.min(backoffIdx, WS_RECONNECT_BACKOFF_MS.length - 1)];
+    backoffIdx++;
+    setTimeout(connect, wait);
+  }
+
+  return {
+    send(payload) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify(payload));
+          hostState.lastSentAt = Date.now();
+          hostState.lastSentCount++;
+          return true;
+        } catch (e) {
+          // Fall through to the queue path below.
+        }
+      }
+      // No live socket (or the send threw): queue and ensure a
+      // connection attempt is in flight. Cap the queue so a
+      // runaway tab can't OOM the SW — we drop oldest first,
+      // which is the right call (the user clicked the most
+      // recent link).
+      if (queue.length >= WS_QUEUE_MAX) queue.shift();
+      queue.push(payload);
+      if (!ws) connect();
+      return false;
+    },
+    disconnect() {
+      closing = true;
+      if (ws) {
+        try {
+          ws.close();
+        } catch (e) {
+          void e;
+        }
+        ws = null;
+      }
+      queue = [];
+    },
+    forceReconnect(onDone) {
+      onConnected = onDone || null;
+      if (ws) {
+        try {
+          ws.close();
+        } catch (e) {
+          void e;
+        }
+        ws = null;
+      }
+      closing = false;
+      // Reset backoff so the popup's "Test" button gives the
+      // server a fast first attempt.
+      backoffIdx = 0;
+      connect();
+    },
+  };
 }
 
-function send(payload) {
-  const p = connect();
-  if (!p) return false;
-  try {
-    p.postMessage(payload);
-    hostState.lastSentAt = Date.now();
-    hostState.lastSentCount++;
-    return true;
-  } catch (e) {
-    setNativeError(String(e && e.message ? e.message : e));
+// ─── Native-messaging transport (Firefox MV3) ──────────────────
+//
+// Kept as a faithful copy of the original Chrome / Firefox
+// connectNative path. Firefox MV3 cannot reliably open a
+// `ws://127.0.0.1` connection (Firefox upgrades insecure
+// ws:// requests to wss:// and fails), so Firefox users still
+// install the `dm-native-host` binary and register the host
+// manifest.
+function makeNativeTransport() {
+  hostState.transportKind = "native";
+  let port = null;
+
+  function connect() {
+    if (port) return port;
+    let newPort = null;
     try {
-      p.disconnect();
-    } catch (innerErr) {
-      // The port may already be closed; not interesting.
-      void innerErr;
+      newPort = chrome.runtime.connectNative(HOST_NAME);
+    } catch (e) {
+      setState(false, String(e && e.message ? e.message : e));
+      return null;
     }
-    port = null;
-    return false;
+    port = newPort;
+    // **CRITICAL (Firefox MV3):** `connectNative` is async —
+    // when the host lookup fails, Firefox reports the error
+    // via `chrome.runtime.lastError` *and* via
+    // `port.onDisconnect` on the next event-loop tick. If we
+    // don't read `lastError` in the same tick (before any
+    // other chrome.* call), it gets cleared and we lose the
+    // real error message. So we optimistically mark the
+    // connection as up, then check `lastError` immediately
+    // and roll back if it's set.
+    if (chrome.runtime.lastError) {
+      setState(false, chrome.runtime.lastError.message);
+      try {
+        port.disconnect();
+      } catch (e) {
+        void e;
+      }
+      port = null;
+      return null;
+    }
+    setState(true, null);
+    port.onMessage.addListener(() => {
+      // The host may ack; nothing to act on.
+    });
+    port.onDisconnect.addListener(() => {
+      const err = chrome.runtime.lastError
+        ? chrome.runtime.lastError.message
+        : "host disconnected";
+      setState(false, err);
+      port = null;
+    });
+    return port;
+  }
+
+  return {
+    send(payload) {
+      const p = connect();
+      if (!p) return false;
+      try {
+        p.postMessage(payload);
+        hostState.lastSentAt = Date.now();
+        hostState.lastSentCount++;
+        return true;
+      } catch (e) {
+        setState(false, String(e && e.message ? e.message : e));
+        try {
+          p.disconnect();
+        } catch (innerErr) {
+          void innerErr;
+        }
+        port = null;
+        return false;
+      }
+    },
+    disconnect() {
+      if (port) {
+        try {
+          port.disconnect();
+        } catch (e) {
+          void e;
+        }
+        port = null;
+      }
+    },
+    forceReconnect(onDone) {
+      if (port) {
+        try {
+          port.disconnect();
+        } catch (e) {
+          void e;
+        }
+        port = null;
+      }
+      setState(false, null);
+      connect();
+      // Drain a tick so Firefox's async disconnect can run.
+      setTimeout(() => {
+        if (typeof onDone === "function") onDone();
+      }, 50);
+    },
+  };
+}
+
+// Pick the transport at module load. We use WebSocket for
+// Chromium-based browsers and the native-messaging host for
+// Firefox. The detection is intentionally conservative: only
+// pick native if `browser.runtime.getBrowserInfo` exists,
+// which is Firefox-specific.
+const isFirefox =
+  typeof browser !== "undefined" &&
+  typeof browser.runtime !== "undefined" &&
+  typeof browser.runtime.getBrowserInfo === "function";
+const transport = isFirefox ? makeNativeTransport() : makeWebSocketTransport();
+
+// Thin wrappers around the transport. The rest of this file
+// uses `send()` and `connect()`; the underlying transport is
+// an implementation detail.
+function send(payload) {
+  return transport.send(payload);
+}
+function connect() {
+  if (typeof transport.connect === "function") {
+    transport.connect();
+  } else {
+    // WebSocket transport auto-connects on first send;
+    // for the boot sequence we just call forceReconnect to
+    // make sure the first connection attempt is in flight.
+    transport.forceReconnect();
   }
 }
 
 /**
- * Force a fresh `connectNative` attempt. Used by the popup's
- * "Test host" button. Disconnects any existing port, clears state,
- * and returns a `{ok, message}` summary that the popup can render.
+ * Force a fresh connection attempt. Used by the popup's
+ * "Test host" button. Resolves with a `{ok, lastError,
+ * transportKind}` summary that the popup can render.
  */
 async function probeHost() {
-  if (port) {
-    try {
-      port.disconnect();
-    } catch (e) {
-      // The port may already be closed; not interesting.
-      void e;
-    }
-    port = null;
-  }
-  hostState.connected = false;
-  hostState.lastError = null;
-  // Force a fresh `connectNative` attempt. We discard the
-  // returned port — `hostState.connected` and the onDisconnect
-  // listener track the actual state.
-  connect();
-  // Drain a tick so Firefox's async disconnect can run.
-  await new Promise((r) => setTimeout(r, 50));
-  return {
-    ok: hostState.connected,
-    lastError: hostState.lastError,
-    hostName: HOST_NAME,
-  };
+  return new Promise((resolve) => {
+    transport.forceReconnect(() => {
+      resolve({
+        ok: hostState.connected,
+        lastError: hostState.lastError,
+        transportKind: hostState.transportKind,
+        hostName: isFirefox ? HOST_NAME : null,
+        url: isFirefox ? null : WS_URL,
+      });
+    });
+    // Safety net: if neither transport calls us back within
+    // 1.5 s, return the current state anyway. WebSocket
+    // events fire async, and the "Test" button should never
+    // hang the popup.
+    setTimeout(() => {
+      resolve({
+        ok: hostState.connected,
+        lastError: hostState.lastError,
+        transportKind: hostState.transportKind,
+        hostName: isFirefox ? HOST_NAME : null,
+        url: isFirefox ? null : WS_URL,
+      });
+    }, 1500);
+  });
 }
 
 // Parse Chrome's `DownloadItem.startTime` (ISO 8601 string) → epoch ms.

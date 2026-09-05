@@ -1,247 +1,159 @@
 # DM Browser Extension — Install Guide
 
-The DM browser extension is an MV3 background (service worker on
-Chrome / Edge / Brave / Arc, event page on Firefox 109+) that captures
-media and download URLs from the pages you visit and forwards them to
-the DM app over a local TCP socket (`127.0.0.1:9157`).
+The DM browser extension is an MV3 extension that captures
+media and download URLs from the pages you visit and forwards
+them to the DM app over a local TCP socket (`127.0.0.1:9157`).
+**For most users, the install is three steps.** Firefox has a
+longer path because Firefox MV3 can't reliably open
+`ws://127.0.0.1` sockets (Firefox upgrades them to `wss://` and
+fails) — Firefox users run the small `dm-native-host` helper
+binary instead.
 
-The pieces:
+The pieces (for reference):
 
 ```
 browser-extension/
 ├── manifest.json                       # Chrome / Edge / Brave / Arc + Firefox 109+ (unified)
-├── background.js                       # MV3 background page
+├── background.js                       # MV3 background page (picks transport at load time)
 ├── content.js                          # Scans every page for <video>/<source>/<a>
 ├── popup.html / popup.js               # Toolbar popup with host status + "Test host connection"
 ├── icons/icon.svg                      # Shared icon (rasterize for production)
-├── com.app.dm.native.json              # Cross-browser host manifest template
-│                                       #   (use .chrome.json or .firefox.json instead for clean per-browser installs)
-├── com.app.dm.native.chrome.json       # Chrome-only template (uses `allowed_origins`)
-└── com.app.dm.native.firefox.json      # Firefox-only template (uses `allowed_extensions`,
-                                        #   no placeholder chrome-extension:// URL that some
-                                        #   Firefox versions mis-parse)
+├── com.app.dm.native.firefox.json      # Native-messaging host template (Firefox only)
+├── INSTALL.md                          # This file
+└── scripts/                            # Package scripts (.zip + .xpi); not shipped
 ```
 
-## 1. Build the native-messaging host
+## Chromium browsers — Chrome, Edge, Brave, Arc, Vivaldi, Opera
 
-```bash
-cargo build -p dm-native-host --release
-# → target/release/dm-native-host
-```
+The extension talks to DM directly over WebSocket on
+`ws://127.0.0.1:9157/`. **No native binary, no host manifest, no
+registry edits, no extension-ID copy-paste.** Tauri already binds
+that port for the legacy native host; the extension piggybacks on
+the same socket.
 
-## 2. Register the native-messaging host
+### Steps
 
-The host uses the standard Chrome / Firefox discovery paths.
-**Use the browser-specific template** (`com.app.dm.native.chrome.json` for
-Chrome-family browsers, `com.app.dm.native.firefox.json` for Firefox) — the
-shared `com.app.dm.native.json` template carries the `REPLACE_WITH_…`
-placeholder for Chrome and is convenient, but a clean per-browser file
-is harder to mis-edit.
+1. **Install the DM desktop app** (Tauri build for your platform —
+   `.msi` / `.exe` on Windows, `.dmg` / `.app` on macOS, `.deb` /
+   `.rpm` / `.AppImage` on Linux). Launch it once so the
+   `127.0.0.1:9157` listener is up.
+2. **Download the extension bundle** —
+   `dm-grabber-<version>.zip` from the latest GitHub release.
+   Unzip it anywhere (a permanent location is fine; the
+   extension stays loaded even if you move the folder).
+3. **Load it as an unpacked extension**:
+   - Chrome: `chrome://extensions`
+   - Edge: `edge://extensions`
+   - Brave: `brave://extensions`
+   - Arc: `arc://extensions`
+   - Vivaldi: `vivaldi://extensions`
+   - Opera: `opera://extensions`
+   Then: toggle **Developer mode** (top right) → **Load unpacked** →
+   pick the unzipped `browser-extension/` folder.
 
-### Linux (Chrome / Edge / Brave / Arc)
+That's it. The toolbar icon should show a green "✓ Native host
+connected" pill within a second. **There is no step 4.** No
+extension ID to copy, no manifest to register, no native binary
+to install.
 
-```bash
-# Use the Chrome-specific template (no `allowed_extensions` array, no
-# Firefox-only fields). The `path` is a placeholder; the
-# `allowed_origins` line MUST be replaced with your actual Chrome
-# extension ID (a 32-character string from `chrome://extensions`).
-cp browser-extension/com.app.dm.native.chrome.json \
-   ~/.config/google-chrome/NativeMessagingHosts/com.app.dm.native.json
-$EDITOR ~/.config/google-chrome/NativeMessagingHosts/com.app.dm.native.json
-# set: "path": "/absolute/path/to/target/release/dm-native-host"
-# set: "allowed_origins": ["chrome-extension://<YOUR 32-CHAR ID>/"]
+> **Tip:** the extension does not auto-update. To pick up a new
+> version, pull the new `dm-grabber-<version>.zip`, unzip it over
+> the old folder, and click **Reload** on the extension card in
+> `chrome://extensions`. Your settings and install-time filter
+> are stored in `chrome.storage.local` and survive the reload.
 
-# Repeat for Chromium / Brave if you use them:
-cp browser-extension/com.app.dm.native.chrome.json \
-   ~/.config/chromium/NativeMessagingHosts/com.app.dm.native.json
-cp browser-extension/com.app.dm.native.chrome.json \
-   ~/.config/BraveSoftware/Brave-Browser/NativeMessagingHosts/com.app.dm.native.json
-```
+## Firefox 109+
 
-### macOS
+Firefox MV3 cannot open a `ws://127.0.0.1` connection (Firefox
+upgrades insecure `ws://` requests to `wss://` and the connection
+fails silently). DM ships a tiny **`dm-native-host`** Rust binary
+that bridges stdio JSON to the same `127.0.0.1:9157` socket; the
+extension talks to it via Chrome's native-messaging protocol.
 
-```bash
-mkdir -p ~/Library/Application\ Support/Google/Chrome/NativeMessagingHosts
-cp browser-extension/com.app.dm.native.chrome.json \
-   ~/Library/Application\ Support/Google/Chrome/NativeMessagingHosts/com.app.dm.native.json
-$EDITOR ~/Library/Application\ Support/Google/Chrome/NativeMessagingHosts/com.app.dm.native.json
-```
+### Steps
 
-### Windows (PowerShell)
+1. **Install the DM desktop app**. Launch it once.
+2. **Build the native host** (or download a prebuilt one with
+   your release):
 
-Unlike Linux and macOS — where the browser looks for the host
-manifest in a per-vendor `NativeMessagingHosts/` directory —
-**Windows browsers read a per-vendor registry key** that points at
-the manifest file. The manifest file itself can live anywhere on
-disk; the registry is the only lookup mechanism. See the
-[Chrome docs](https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging#native-messaging-host-location)
-for the canonical explanation; the per-vendor keys are:
+   ```bash
+   cargo build -p dm-native-host --release
+   # → target/release/dm-native-host
+   ```
 
-| Browser | Registry key (under `HKCU\`) |
-| --- | --- |
-| Google Chrome | `Software\Google\Chrome\NativeMessagingHosts\com.app.dm.native` |
-| Microsoft Edge | `Software\Microsoft\Edge\NativeMessagingHosts\com.app.dm.native` |
-| Brave | `Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.app.dm.native` |
-| Arc (Chromium fork) | falls back to Chrome's key — no separate registration needed |
-| Vivaldi | `Software\Vivaldi\NativeMessagingHosts\com.app.dm.native` |
+3. **Place the host manifest** for Firefox (this is the
+   `com.app.dm.native.firefox.json` template, with the path
+   edited to your binary):
 
-**Why a separate Brave key is necessary.** Brave does **not** fall
-back to Chrome's registry key on Windows (the fallback chain is
-documented in the Microsoft Edge docs and applies to Chromium and
-Edge, but Brave ships its own vendor key). Copying the manifest
-into `%LOCALAPPDATA%\Google\Chrome\User Data\NativeMessagingHosts\`
-will *not* make Brave see it — you must add a Brave-specific
-registry entry. This is the most common cause of "Native host not
-running" on Windows + Brave specifically.
+   ```bash
+   mkdir -p ~/.mozilla/native-messaging-hosts
+   cp browser-extension/com.app.dm.native.firefox.json \
+      ~/.mozilla/native-messaging-hosts/com.app.dm.native.json
+   $EDITOR ~/.mozilla/native-messaging-hosts/com.app.dm.native.json
+   # set: "path": "/absolute/path/to/target/release/dm-native-host"
+   ```
 
-The `path` field inside the manifest can be absolute or relative
-to the directory that contains the manifest file (Windows-only
-behaviour). We recommend absolute for clarity.
+   The Firefox template is preconfigured with
+   `dm-grabber@dm-project` in `allowed_extensions` — no ID
+   substitution needed.
+4. **Load the extension**:
+   - Open `about:debugging#/runtime/this-firefox`
+   - Click **Load Temporary Add-on…** and select
+     `browser-extension/manifest.json`. The manifest carries a
+     `browser_specific_settings.gecko` block, so Firefox reads
+     it as a native add-on: the background runs as a
+     non-persistent event page (MV3 `background.scripts`), and
+     the extension ID is fixed to `dm-grabber@dm-project`.
+5. The toolbar icon should show "✓ Native host connected"
+   within a second.
 
-```powershell
-# 1. Place the manifest anywhere on disk. We'll use a stable
-#    location under Program Files; the user-writable
-#    %LOCALAPPDATA% works too.
-$ManifestPath = "C:\Program Files\DM\com.app.dm.native.json"
-Copy-Item browser-extension\com.app.dm.native.chrome.json $ManifestPath
-notepad $ManifestPath
-# set "path" to "C:\\Program Files\\DM\\dm-native-host.exe"
-#    (double backslashes in JSON; Windows accepts both)
-# set "allowed_origins" to your actual Chrome extension ID
+> **Note:** Firefox "Load Temporary Add-on" installs are erased
+> on browser restart. For a permanent install, package the
+> extension as `.xpi` (`./scripts/package.sh <version>`) and
+> install via `about:addons` → gear icon → "Install Add-on From
+> File…". For AMO-signed distribution, submit through the
+> Firefox Add-ons site.
 
-# 2. Register the host for **each** browser you use.
+## Verify the connection
 
-# Google Chrome
-reg add "HKCU\Software\Google\Chrome\NativeMessagingHosts\com.app.dm.native" `
-    /ve /d "$ManifestPath" /f
-
-# Microsoft Edge
-reg add "HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.app.dm.native" `
-    /ve /d "$ManifestPath" /f
-
-# Brave (REQUIRED — Brave does not fall back to Chrome's key)
-reg add "HKCU\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.app.dm.native" `
-    /ve /d "$ManifestPath" /f
-
-# Vivaldi (optional)
-reg add "HKCU\Software\Vivaldi\NativeMessagingHosts\com.app.dm.native" `
-    /ve /d "$ManifestPath" /f
-
-# 3. Restart the browser so it re-reads the registry.
-```
-
-**Removing the registration** when you uninstall DM:
-
-```powershell
-reg delete "HKCU\Software\Google\Chrome\NativeMessagingHosts\com.app.dm.native" /f
-reg delete "HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.app.dm.native" /f
-reg delete "HKCU\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.app.dm.native" /f
-```
-
-### Firefox
-
-**Important:** use `com.app.dm.native.firefox.json`, not the Chrome
-template. Firefox's host-manifest schema only knows about
-`allowed_extensions` (not `allowed_origins`); mixing both fields in
-the same manifest works in current Firefox but a placeholder
-`chrome-extension://REPLACE_WITH…` URL in `allowed_origins` is
-needless noise. The Firefox template is preconfigured with
-`dm-grabber@dm-project` in `allowed_extensions` — no ID
-substitution needed.
-
-```bash
-mkdir -p ~/.mozilla/native-messaging-hosts
-cp browser-extension/com.app.dm.native.firefox.json \
-   ~/.mozilla/native-messaging-hosts/com.app.dm.native.json
-$EDITOR ~/.mozilla/native-messaging-hosts/com.app.dm.native.json
-# set: "path": "/absolute/path/to/target/release/dm-native-host"
-```
-
-## 3. Install the extension itself
-
-### Chrome / Edge / Brave / Arc
-
-1. Open `chrome://extensions` (or `edge://extensions`, `brave://extensions`)
-2. Toggle **Developer mode** (top right)
-3. Click **Load unpacked** and pick `browser-extension/`
-4. **Copy the Extension ID** (a 32-character string like
-   `abcdefghijklmnopqrstuvwxyzabcdef` under the extension title).
-   You will need it in step 5.
-5. **Edit the host manifest** (`com.app.dm.native.json` — the file
-   you placed at the per-platform path in step 2) and replace the
-   string `chrome-extension://REPLACE_WITH_YOUR_CHROME_EXTENSION_ID/`
-   in the `allowed_origins` array with
-   `chrome-extension://<the ID you copied in step 4>/`.
-   - **Linux / macOS:** the file lives under
-     `~/.config/google-chrome/NativeMessagingHosts/` (or the
-     per-vendor directory for Chromium / Brave / Edge / Arc).
-   - **Windows:** the file lives anywhere on disk; the browser
-     locates it via the registry key you added in step 2.
-   This is the most commonly-skipped step; if you skip it the popup
-   will show `Native host not running` and the service worker
-   console will log `Access to the specified native messaging host
-   is blocked`. **Chrome refuses to start a host whose manifest
-   does not list the calling extension's ID in `allowed_origins`.**
-6. Restart the browser (so it re-reads the host manifest / registry).
-
-### Firefox
-
-1. Open `about:debugging#/runtime/this-firefox`
-2. Click **Load Temporary Add-on…** and select
-   `browser-extension/manifest.json`. The manifest carries a
-   `browser_specific_settings.gecko` block, so Firefox reads it as a
-   native add-on: the background runs as a non-persistent event page
-   (MV3 `background.scripts`), and the extension ID is fixed to
-   `dm-grabber@dm-project` — no ID substitution needed in the host
-   manifest.
-3. **Important**: load the source `browser-extension/manifest.json`,
-   not any copy that has been modified.
-4. After loading, click the DM Grabber toolbar icon. If the popup
-   shows "Native host not running", click the new **Test host
-   connection** button in the popup to force a fresh `connectNative`
-   and see the precise `chrome.runtime.lastError.message` from
-   Firefox (the error text is also shown in a red error block in the
-   popup, with a hint pointing at the most likely cause).
-
-## 4. Verify the connection
-
-1. Make sure the DM app is running (it binds `127.0.0.1:9157` on startup)
+1. Make sure the DM app is running (it binds `127.0.0.1:9157` on
+   startup).
 2. Click the DM Grabber toolbar icon — the popup should show
-   **"✓ Native host connected (port 9157)"**
-3. Open the DM app → **Settings → Extensions** — the status panel should
-   show the same: **Ready**, with "Last activity" updating whenever the
-   extension pushes a URL
-4. Visit any page with `<video>` (e.g. a Twitch clip) and the URL should
-   land in the DM queue within ~1 s
+   **"✓ Native host connected (port 9157)"**.
+3. Open the DM app → **Settings → Extensions** — the status
+   panel should show the same: **Ready**, with "Last activity"
+   updating whenever the extension pushes a URL.
+4. Visit any page with `<video>` (e.g. a Twitch clip) and the
+   URL should land in the DM queue within ~1 s.
 
 ## Troubleshooting
 
-The popup has a **Test host connection** button that forces a fresh
-`connectNative` and renders the actual `chrome.runtime.lastError.message`
-verbatim, plus a hint pointing at the most likely cause. The most
-common messages you'll see and what they mean:
+The popup has a **Test host connection** button that forces a
+fresh connection attempt and renders the actual
+`chrome.runtime.lastError.message` verbatim, plus a hint
+pointing at the most likely cause.
 
 | Popup error | What it means | Fix |
 | --- | --- | --- |
-| `No such native application com.app.dm.native` (Firefox) | Firefox couldn't find a valid host manifest for the extension | Confirm `~/.mozilla/native-messaging-hosts/com.app.dm.native.json` exists, is valid JSON, and the extension ID `dm-grabber@dm-project` is in its `allowed_extensions` array (use the bundled `com.app.dm.native.firefox.json` template). |
-| `Specified native messaging host not found.` (Chrome / Edge / Brave) | The browser can't locate the host manifest | **Linux / macOS:** the file is in the wrong per-vendor directory. **Windows:** the registry key under `HKCU\Software\<vendor>\NativeMessagingHosts\com.app.dm.native` is missing, points at a non-existent file, or you used Chrome's key for Brave (Brave does not fall back). |
-| `Access to the specified native messaging host is blocked.` (Chrome) | The Chrome extension ID is not in the host's `allowed_origins` | Copy the actual ID from `chrome://extensions` and edit the host manifest. Restart Chrome to re-read the manifest. |
-| `"path" is not absolute` (manifest rejected) | Relative path in the host manifest | Use an absolute path; on Windows the path can be relative to the manifest's directory but absolute is clearest (`"C:\\path\\to\\host.exe"`). |
+| `disconnected (code 1006)` | The WebSocket to `ws://127.0.0.1:9157/` was closed unexpectedly | Make sure the DM app is running. The extension auto-reconnects with backoff, so this should clear within 5 s. |
+| `WebSocket ctor failed` | The browser refused to open a WebSocket at all | Confirm `host_permissions` in `manifest.json` includes `ws://127.0.0.1:9157/*` and reload the extension. |
+| `No such native application com.app.dm.native` (Firefox) | Firefox couldn't find a valid host manifest for the extension | Confirm `~/.mozilla/native-messaging-hosts/com.app.dm.native.json` exists, is valid JSON, and lists `dm-grabber@dm-project` in `allowed_extensions`. |
+| `Specified native messaging host not found.` (Firefox) | The host manifest's `path` is unreachable | Verify the binary at the `path` is absolute and executable. |
+| The popup flashes a red error for ~1 s on first open, then recovers | MV3 service worker cold start | Expected behaviour: the popup retries `sendMessage` with backoff for ~680 ms before surfacing any error. If the error persists past 1 s, the service worker is genuinely unreachable. |
 | Extension installed but downloads don't appear | Either the host isn't reachable or the extension is mis-configured | Click **Test host connection** in the popup and read the red error block — it tells you which file/path/ID is wrong. |
 | Firefox rejects the extension | Missing `browser_specific_settings` | `manifest.json` already carries the `gecko` block; if you see this, make sure you loaded the source `browser-extension/manifest.json`, not a copy that has been modified. |
-| The popup flashes a red error for ~1 s on first open, then recovers | The MV3 service worker is in cold start | Expected behaviour: the popup retries `sendMessage` with backoff for ~680 ms before surfacing any error. If the error persists past 1 s, the service worker is genuinely unreachable (e.g. the extension was unloaded, or the manifest is broken). |
 
 ## Permissions the extension asks for
 
 | Permission | Why |
 | --- | --- |
-| `nativeMessaging` | Talk to the DM host binary |
 | `downloads` | Intercept real browser downloads ("Save link as") |
 | `tabs` | Look up the active tab when you click the popup |
 | `activeTab` | Run content scripts on the page you actually visit |
 | `scripting` | Reserved for future "inject grab button" features |
 | `storage` | Reserved for the future "always-grab these sites" list |
 | `<all_urls>` (host) | The content script can run on any page so it can scan whatever media is there |
+| `ws://127.0.0.1:9157/*` (host) | Open a WebSocket to the running DM app |
 
 All of these are minimal; no telemetry, no remote endpoints, no
 auto-update channel.
