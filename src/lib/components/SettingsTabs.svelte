@@ -8,6 +8,34 @@
 
   // Poll the native-messaging host status while the Settings panel is open.
   let probeTimer: ReturnType<typeof setInterval> | null = null;
+
+  // Static build / runtime info for the About panel. Loaded once
+  // on mount — the values are baked into the binary at compile
+  // time so there's no point re-fetching them. We initialise to
+  // empty strings and replace them on the first successful
+  // `api.appInfo()` call. The "loading" state is implicit (empty
+  // strings); once the user opens the About tab we re-render
+  // with the real values.
+  let appVersion = "";
+  let engineVersion = "";
+  let tauriVersion = "";
+  let appInfoError: string | null = null;
+  async function refreshAppInfo() {
+    try {
+      const info = await api.appInfo();
+      appVersion = info.appVersion;
+      engineVersion = info.engineVersion;
+      tauriVersion = info.tauriVersion;
+      appInfoError = null;
+    } catch (e) {
+      // Don't overwrite the version strings on a transient
+      // failure — if the very first call fails, the user will
+      // see "—" placeholders, which is honest about the state
+      // without hiding the real error.
+      appInfoError = String(e);
+    }
+  }
+
   async function refreshExtStatus() {
     if (typeof window === "undefined") return;
     try {
@@ -89,6 +117,7 @@
     if (typeof window !== "undefined") {
       window.addEventListener("dm:focus-proxy-url", focusProxyUrlFromPalette as EventListener);
     }
+    refreshAppInfo();
     refreshExtStatus();
     probeTimer = setInterval(refreshExtStatus, 3000);
   });
@@ -379,11 +408,21 @@
       {:else if activeTab === "extensions"}
         <section class="set-section">
           <h3>Browser extension</h3>
-          <p class="hint">The MV3 extension captures downloads from Chrome, Firefox and Edge and forwards them to DM through a native-messaging host on port 9157.</p>
+          <p class="hint">
+            The MV3 extension captures downloads from your browser and
+            forwards them to DM. Chromium-based browsers (Chrome, Edge,
+            Brave, Arc, Vivaldi, Opera) talk to DM directly over WebSocket
+            on <code>ws://127.0.0.1:9157/</code> — no host binary, no
+            manifest copy, no registry edits. Firefox still needs a small
+            <code>dm-native-host</code> shim because Firefox MV3 cannot
+            reliably open <code>ws://127.0.0.1</code> connections (Firefox
+            upgrades insecure <code>ws://</code> to <code>wss://</code> and
+            the connection fails silently).
+          </p>
 
           <div class="ext-status">
             <div class="ext-row">
-              <div class="ext-name">Native host</div>
+              <div class="ext-name">Listener</div>
               <div class="ext-state">
                 <span class="status-pill {$extensionStatus.kind}">
                   <span class="dot"></span>
@@ -408,25 +447,68 @@
           </div>
 
           <div class="set-group">
-            <h4>Install on Chrome / Edge / Brave</h4>
+            <h4>Install on Chrome / Edge / Brave / Arc / Vivaldi / Opera</h4>
+            <p class="hint">Three steps, no native binary, no manifest copy.</p>
             <ol class="steps">
-              <li>Build the native host: <code>cargo build -p dm-native-host --release</code></li>
-              <li>Edit <code>browser-extension/com.app.dm.native.json</code> and set <code>path</code> to the absolute path of <code>target/release/dm-native-host</code></li>
-              <li>Install it (Linux): <code>mkdir -p ~/.config/google-chrome/NativeMessagingHosts &amp;&amp; cp com.app.dm.native.json ~/.config/google-chrome/NativeMessagingHosts/</code></li>
-              <li>Open <code>chrome://extensions</code>, enable Developer mode, "Load unpacked" → pick <code>browser-extension/</code></li>
-              <li>Copy the extension ID and put it in <code>allowed_origins</code> of the manifest above</li>
+              <li>
+                Download <code>dm-grabber-&lt;version&gt;.zip</code> from the
+                latest GitHub release and unzip it anywhere.
+              </li>
+              <li>
+                Open <code>chrome://extensions</code> (or
+                <code>brave://extensions</code>, <code>edge://extensions</code>,
+                <code>arc://extensions</code>, <code>vivaldi://extensions</code>,
+                <code>opera://extensions</code>).
+              </li>
+              <li>
+                Toggle <b>Developer mode</b> (top right) → click
+                <b>Load unpacked</b> → pick the unzipped
+                <code>browser-extension/</code> folder.
+              </li>
             </ol>
+            <p class="hint">
+              The extension auto-reconnects to the running DM app. There
+              is no extension ID to copy and no native host to install.
+            </p>
           </div>
 
           <div class="set-group">
-            <h4>Install on Firefox</h4>
-            <p class="hint">Firefox needs a tiny shim. Run once:</p>
+            <h4>Install on Firefox 109+</h4>
+            <p class="hint">
+              Firefox needs the small <code>dm-native-host</code> shim
+              binary because it can't open <code>ws://127.0.0.1</code>
+              connections.
+            </p>
             <ol class="steps">
-              <li>Open <code>about:debugging#/runtime/this-firefox</code> → "Load Temporary Add-on…"</li>
-              <li>Select <code>browser-extension/manifest.json</code> (works as-is in Firefox 109+ thanks to broad MV3 support)</li>
-              <li>Set the path in <code>browser-extension/com.app.dm.native.json</code> to the <code>dm-native-host</code> binary</li>
-              <li>Copy the manifest to <code>~/.mozilla/native-messaging-hosts/</code></li>
+              <li>
+                Build the native host (or download it from the release):
+                <code>cargo build -p dm-native-host --release</code> →
+                <code>target/release/dm-native-host</code>.
+              </li>
+              <li>
+                Place the Firefox host manifest on disk:
+                <pre class="mono-block">mkdir -p ~/.mozilla/native-messaging-hosts
+cp browser-extension/com.app.dm.native.firefox.json \
+   ~/.mozilla/native-messaging-hosts/com.app.dm.native.json</pre>
+                and edit the <code>path</code> to point at the binary
+                from step 1.
+              </li>
+              <li>
+                Open <code>about:debugging#/runtime/this-firefox</code>
+                → <b>Load Temporary Add-on…</b> → select
+                <code>browser-extension/manifest.json</code>. The
+                manifest's <code>browser_specific_settings.gecko</code>
+                block fixes the extension ID to
+                <code>dm-grabber@dm-project</code>, so no ID copy-paste
+                is needed.
+              </li>
             </ol>
+            <p class="hint">
+              Temporary add-ons are erased on browser restart. For a
+              permanent install, package the extension as
+              <code>.xpi</code> (<code>./scripts/package.sh &lt;version&gt;</code>
+              in the repo) and install via <code>about:addons</code>.
+            </p>
           </div>
         </section>
 
@@ -461,11 +543,28 @@
           <h3>DM Download Manager</h3>
           <p class="hint">A modern, graceful, cross-platform download manager — Tauri 2 + Svelte.</p>
           <div class="about-grid">
-            <div><span class="k">Version</span><span class="v">0.1.0</span></div>
-            <div><span class="k">Engine</span><span class="v">dm-engine 0.1.0</span></div>
-            <div><span class="k">Backend</span><span class="v">Tauri 2 + Rust</span></div>
-            <div><span class="k">Frontend</span><span class="v">Svelte 5 + Vite</span></div>
+            <div>
+              <span class="k">Version</span>
+              <span class="v">{appVersion || "—"}</span>
+            </div>
+            <div>
+              <span class="k">Engine</span>
+              <span class="v">dm-engine {engineVersion || "—"}</span>
+            </div>
+            <div>
+              <span class="k">Tauri runtime</span>
+              <span class="v">{tauriVersion || "—"}</span>
+            </div>
+            <div>
+              <span class="k">Frontend</span>
+              <span class="v">Svelte 4 + Vite</span>
+            </div>
           </div>
+          {#if appInfoError}
+            <p class="hint danger">
+              Could not load build info: {appInfoError}
+            </p>
+          {/if}
         </section>
       {/if}
     </div>
@@ -850,6 +949,17 @@
     padding: 1px 5px;
     border-radius: 4px;
     color: var(--accent);
+  }
+  .mono-block {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    background: rgba(0, 0, 0, 0.25);
+    color: var(--text);
+    padding: 10px 12px;
+    border-radius: 6px;
+    margin: 6px 0 4px;
+    overflow-x: auto;
+    white-space: pre;
   }
   .status-pill {
     display: inline-block;

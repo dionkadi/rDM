@@ -14,6 +14,40 @@ pub fn ping() -> String {
     format!("pong @ {}", chrono::Utc::now().to_rfc3339())
 }
 
+/// Static build / runtime info for the Settings → About panel.
+///
+/// Previously the frontend hard-coded "0.1.0" in two places, which
+/// went stale as soon as the first version bump landed. The
+/// `app_info` Tauri command is the single source of truth: the
+/// values come from `env!("CARGO_PKG_VERSION")` at compile time
+/// (so they're baked into the binary the user actually runs, not
+/// read from a config file the user could edit).
+///
+/// All three fields are returned as `String` so the frontend can
+/// render them without any conversion. `engine_version` is read
+/// from `dm_engine::VERSION` (which mirrors
+/// `crates/engine/Cargo.toml`) so the engine and the wrapper
+/// app are guaranteed to report the same version, and a single
+/// `scripts/release.sh` bump keeps them in sync.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppInfo {
+    pub app_version: String,
+    pub engine_version: String,
+    /// Tauri runtime version. Useful for diagnosing
+    /// version-specific Tauri bugs in user reports.
+    pub tauri_version: String,
+}
+
+#[tauri::command]
+pub fn app_info() -> AppInfo {
+    AppInfo {
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        engine_version: dm_engine::VERSION.to_string(),
+        tauri_version: tauri::VERSION.to_string(),
+    }
+}
+
 /// Enqueue a new download. Returns the created `Download` (status `Queued`).
 ///
 /// Optional `headers` and `auth` arguments attach per-download

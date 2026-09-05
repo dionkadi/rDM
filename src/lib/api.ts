@@ -15,6 +15,22 @@ export function ping(): Promise<string> {
  return invoke("ping");
 }
 
+/**
+ * Static build / runtime info for the Settings → About panel.
+ * Returns the running Tauri app's version, the engine crate's
+ * version, and the Tauri runtime version. All three are
+ * `String`s (no parsing needed on the frontend).
+ */
+export interface AppInfo {
+ appVersion: string;
+ engineVersion: string;
+ tauriVersion: string;
+}
+
+export function appInfo(): Promise<AppInfo> {
+ return invoke<AppInfo>("app_info");
+}
+
 export function addDownload(opts: {
  url: string;
  category?: string | null;
