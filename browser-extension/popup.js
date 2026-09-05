@@ -12,6 +12,7 @@
 // without opening the browser console.
 const status = document.getElementById("status");
 const errDetail = document.getElementById("err-detail");
+const openBtn = document.getElementById("open");
 
 /** Clear the children of `el` without using `innerHTML = ""`. */
 function clearChildren(el) {
@@ -108,6 +109,9 @@ function setStatus(state) {
   if (!state) {
     clearChildren(status);
     appendText(status, "Checking…");
+    // While the first probe is in flight we don't know if the host
+    // is up; leave the "Open DM app" button alone (whatever its
+    // previous state was).
     return;
   }
   if (state.connected) {
@@ -123,6 +127,19 @@ function setStatus(state) {
       status,
       `Sent ${sent} ${sent === 1 ? "request" : "requests"} (last: ${ago}).`,
     );
+    // The "Open DM app" button can't actually launch a Tauri app
+    // from a browser (no `chrome.app` API in MV3; the Tauri
+    // `tauri://` scheme is unknown to Chrome). When the host is up
+    // we keep the button enabled as a no-op so the user can click
+    // it without seeing a modal that blocks the rest of the popup
+    // (the previous `alert()` was unclosable in MV3 popup context).
+    if (openBtn) {
+      openBtn.disabled = true;
+      openBtn.title =
+        "DM is already running (the native host is reachable). " +
+        "Use the DM window directly — this browser extension can't " +
+        "launch the Tauri app.";
+    }
     return;
   }
   // Not connected. Show the headline + a detail block with the
@@ -155,6 +172,18 @@ function setStatus(state) {
     appendText(hintEl, " below to retry and see the actual error.");
     errDetail.appendChild(hintEl);
     errDetail.classList.add("shown");
+  }
+  // When the host is down, give the user a way to re-check from
+  // here: the "Open DM app" button no longer fires a modal alert;
+  // it's repurposed as a one-click re-probe so the user can confirm
+  // whether launching the DM app on their desktop has fixed the
+  // problem. The button label and title explain what it does.
+  if (openBtn) {
+    openBtn.disabled = false;
+    openBtn.textContent = "Re-check host";
+    openBtn.title =
+      "The DM app doesn't seem to be running. Launch it on your " +
+      "desktop, then click here to re-check the connection.";
   }
 }
 
@@ -298,20 +327,19 @@ document.getElementById("grab").addEventListener("click", async () => {
 });
 
 document.getElementById("open").addEventListener("click", () => {
-  // Open the DM app (the native host won't be reachable if the app
-  // isn't running, so this is the most useful "wake it up" action
-  // from the extension's perspective). Tauri/WebView2 URLs are not
-  // something Chrome can launch directly, so we surface the host
-  // status instead and tell the user to launch the app.
-  chrome.runtime.sendMessage({ type: "get-status" }, (res) => {
-    if (chrome.runtime.lastError || !res || !res.state) {
-      alert(
-        "DM is not running.\n\n" +
-          "Launch the DM app, then click this button again to verify " +
-          "the native host is reachable.",
-      );
-    }
-  });
+  // The previous version of this handler called `alert(...)` when
+  // the host was down. `alert()` in an MV3 popup is a synchronous,
+  // unclosable native dialog that takes focus away from the popup
+  // and (in some Chromium versions) cannot be dismissed without
+  // killing the popup. That's the worst possible UX for a status
+  // indicator.
+  //
+  // Instead we re-issue the status probe. The next `setInterval`
+  // tick (1.5 s) will pick up the result and re-render the status
+  // pill. If the user has just launched the DM app on their
+  // desktop, this is exactly what they want — a single click to
+  // confirm the host is now reachable.
+  refresh();
 });
 
 document.getElementById("test").addEventListener("click", async () => {

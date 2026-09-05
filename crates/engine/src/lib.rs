@@ -3,6 +3,15 @@
 //! UI-agnostic and fully testable without Tauri. The Tauri backend (`src-tauri`)
 //! depends on this crate and bridges it to the web frontend via commands/events.
 
+/// Engine version. Mirrors the `[package] version` in
+/// `crates/engine/Cargo.toml` and is updated by `scripts/release.sh`
+/// in lockstep with the rest of the workspace.
+///
+/// Exposed to the frontend via the Tauri `app_info` command so the
+/// Settings → About panel can show the running engine's version
+/// instead of a hard-coded string.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod chunk;
 pub mod config;
 pub mod cookies;

@@ -165,6 +165,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::ping,
+            commands::app_info,
             commands::add_download,
             commands::list_downloads,
             commands::get_download,

@@ -1,12 +1,27 @@
-# Package the browser extension as both a Chrome/Edge/Brave .zip and a
+# Package the browser extension as a Chrome/Edge/Brave .zip and a
 # Firefox .xpi. Windows / PowerShell equivalent of scripts/package.sh —
-# the two should stay in sync on the include/exclude list. CI uses the
-# bash variant on Ubuntu; this one is for local packaging on Windows.
+# the two should stay in sync on the include/exclude list and the
+# Chrome-vs-Firefox manifest rewrite. CI uses the bash variant on
+# Ubuntu; this one is for local packaging on Windows.
+#
+# The payload is identical, but the manifest.json at the root is
+# rewritten to match the target's MV3 background-page model:
+#   * Chrome / Edge / Brave / Arc — `background.service_worker`
+#     is the ONLY valid MV3 key. The previous source manifest used
+#     `background.scripts`, which Chrome's MV3 parser strictly
+#     rejects with `'background.scripts' requires manifest version
+#     of 2 or lower` — the extension silently failed to install.
+#   * Firefox 109+ — reads `background.scripts` as a non-persistent
+#     event page. `background.service_worker` (added in Firefox
+#     121) is also accepted, but the
+#     `browser_specific_settings.gecko` block forces event-page
+#     mode regardless, so we keep the scripts-array form for
+#     maximum compatibility.
 #
 # Usage: .\scripts\package.ps1 -Version 0.1.0
 # Output (relative to browser-extension\):
-#   dist\dm-grabber-<version>.zip
-#   dist\dm-grabber-<version>.xpi
+#   dist\dm-grabber-<version>.zip     (Chrome-shaped manifest)
+#   dist\dm-grabber-<version>.xpi     (Firefox-shaped manifest)
 
 [CmdletBinding()]
 param(
@@ -48,24 +63,50 @@ try {
         Copy-Item -Path $_.FullName -Destination $Tmp -Recurse -Force
     }
 
+    $SrcManifest = Join-Path $ExtDir "manifest.json"
     $ManifestPath = Join-Path $Tmp "manifest.json"
     if (-not (Test-Path $ManifestPath)) {
         throw "manifest.json missing from staged payload"
     }
 
-    $Manifest = Get-Content $ManifestPath -Raw | ConvertFrom-Json
-    if ($Manifest.version -ne $Version) {
-        throw "manifest.json declares version `"$($Manifest.version)`" but you asked to package `"$Version)`". Bump manifest.json first."
+    # Validate the *source* manifest as the Firefox template. This
+    # is what devs sideload on Firefox 109+ without running the
+    # package script, so the source has to be a valid Firefox
+    # manifest on its own.
+    $SrcContent = Get-Content $SrcManifest -Raw | ConvertFrom-Json
+    if ($SrcContent.version -ne $Version) {
+        throw "manifest.json declares version `"$($SrcContent.version)`" but you asked to package `"$Version)`". Bump manifest.json first."
     }
-    if ($Manifest.manifest_version -ne 3) {
+    if ($SrcContent.manifest_version -ne 3) {
         throw "manifest_version must be 3"
     }
-    if (-not $Manifest.background.scripts) {
-        throw "background.scripts must be an array (Firefox 109+ event-page compat)"
+    if (-not $SrcContent.background.scripts) {
+        throw "source manifest.background.scripts must be an array (Firefox template)"
+    }
+    if ($SrcContent.background.service_worker) {
+        throw "source manifest.background.service_worker breaks Firefox 109+ event-page model; restore scripts for the Firefox template"
+    }
+    if (-not $SrcContent.browser_specific_settings.gecko.id) {
+        throw "source manifest missing browser_specific_settings.gecko.id (Firefox template)"
     }
 
-    # Pack the .zip from inside the staging dir so the archive paths
-    # are relative, which is what Chrome's "Load unpacked" expects.
+    # Generate the Chrome-shaped manifest in place of the staged one.
+    # Chrome MV3 strictly rejects `background.scripts`. We rewrite
+    # to `background.service_worker: "background.js"` and drop the
+    # `browser_specific_settings.gecko` block (Chrome ignores it
+    # but logs a warning; better to omit entirely).
+    $Chrome = [ordered]@{}
+    foreach ($prop in $SrcContent.PSObject.Properties) {
+        if ($prop.Name -eq 'background') {
+            $Chrome[$prop.Name] = [ordered]@{ service_worker = "background.js" }
+        } elseif ($prop.Name -ne 'browser_specific_settings') {
+            $Chrome[$prop.Name] = $prop.Value
+        }
+    }
+    $ChromeJson = $Chrome | ConvertTo-Json -Depth 10
+    Set-Content -Path $ManifestPath -Value $ChromeJson -Encoding UTF8
+
+    # Pack the .zip (Chrome / Edge / Brave / Arc).
     Push-Location $Tmp
     try {
         & zip -r -X "$OutBase.zip" . | Out-Null
@@ -73,12 +114,58 @@ try {
         Pop-Location
     }
 
-    # .xpi is a renamed .zip.
-    Copy-Item "$OutBase.zip" "$OutBase.xpi" -Force
+    # Re-stage the *source* manifest (Firefox-shaped) for the .xpi.
+    # A .xpi is just a renamed .zip. Firefox is stricter than Chrome
+    # about which files are allowed (no top-level __MACOSX/, no
+    # .DS_Store, no symlinks). The exclude list above handles the
+    # first two; `zip -r` skips symlinks by default.
+    Copy-Item -Path $SrcManifest -Destination $ManifestPath -Force
+    Push-Location $Tmp
+    try {
+        & zip -r -X "$OutBase.xpi" . | Out-Null
+    } finally {
+        Pop-Location
+    }
+
+    # Self-verify: open the .zip and confirm the Chrome-shaped
+    # manifest has `service_worker` (and no `scripts`); open the
+    # .xpi and confirm the Firefox-shaped manifest has `scripts`
+    # and `gecko.id`. This catches the v0.4.1 regression where
+    # Chrome silently failed to install.
+    if (Get-Command unzip -ErrorAction SilentlyContinue) {
+        $ZipManifest = & unzip -p "$OutBase.zip" manifest.json 2>$null
+        $XpiManifest = & unzip -p "$OutBase.xpi" manifest.json 2>$null
+        if (-not $ZipManifest) { throw ".zip is missing manifest.json" }
+        if (-not $XpiManifest) { throw ".xpi is missing manifest.json" }
+
+        $ZipObj = $ZipManifest | ConvertFrom-Json
+        $XpiObj = $XpiManifest | ConvertFrom-Json
+
+        if (-not $ZipObj.background.service_worker) {
+            throw ".zip manifest.background.service_worker is missing (Chrome requires it under MV3)"
+        }
+        if ($ZipObj.background.scripts) {
+            throw ".zip manifest must NOT have background.scripts (Chrome MV3 rejects it)"
+        }
+        if ($ZipObj.browser_specific_settings.gecko) {
+            throw ".zip manifest must NOT have browser_specific_settings.gecko (Chrome logs a warning)"
+        }
+        if (-not $XpiObj.background.scripts) {
+            throw ".xpi manifest.background.scripts is missing (Firefox 109+ requires this)"
+        }
+        if ($XpiObj.background.service_worker) {
+            throw ".xpi manifest must NOT have background.service_worker (Firefox 109+ event-page model expects scripts)"
+        }
+        if (-not $XpiObj.browser_specific_settings.gecko.id) {
+            throw ".xpi manifest missing browser_specific_settings.gecko.id"
+        }
+    } else {
+        Write-Warning "'unzip' not installed; skipping manifest self-verify"
+    }
 
     Write-Host "✔ packaged:"
-    Write-Host "    $OutBase.zip"
-    Write-Host "    $OutBase.xpi"
+    Write-Host "    $OutBase.zip   (Chrome-shaped: background.service_worker)"
+    Write-Host "    $OutBase.xpi   (Firefox-shaped: background.scripts + gecko.id)"
 } finally {
     Remove-Item -Recurse -Force $Tmp
 }
