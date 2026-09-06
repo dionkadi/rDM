@@ -215,9 +215,12 @@ jobs:
           ./scripts/package.sh "$VERSION"
 
       - name: Verify packages
+        working-directory: browser-extension/dist
         env:
           STRIPPED: ${{ steps.strip-version.outputs.stripped }}
-        run: ./browser-extension/scripts/verify-package.sh "${STRIPPED}"
+        run: |
+          "${GITHUB_WORKSPACE}/browser-extension/scripts/verify-package.sh" \
+            "${STRIPPED}"
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
