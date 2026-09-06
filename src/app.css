@@ -121,6 +121,10 @@
   --color-info-dim: rgba(45, 95, 218, 0.1);
   --color-info-strong: rgba(45, 95, 218, 0.28);
 
+  --color-accent: var(--color-primary);
+  --color-accent-dim: var(--color-primary-dim);
+  --color-accent-strong: var(--color-primary-strong);
+
   --color-category-video: #b56a00;
   --color-category-audio: #1d8a8a;
   --color-category-archive: #0f8a63;

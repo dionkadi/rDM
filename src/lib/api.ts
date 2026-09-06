@@ -253,3 +253,10 @@ export function importBrowserCookies(
   pathOverride: pathOverride ?? null,
  });
 }
+
+/**
+ * Show a desktop notification (used when a download completes).
+ */
+export function notify_on_complete(title: string, body: string): Promise<void> {
+ return invoke("notify_on_complete", { title, body });
+}

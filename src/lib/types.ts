@@ -114,14 +114,17 @@ export interface CapturedUrl {
 }
 
 // Discriminated union emitted on the "download-event" channel.
+// Note: Rust uses #[serde(tag = "kind", rename_all = "camelCase")] which
+// serializes enum variants with their fields FLATTENED at the top level.
+// The TypeScript types must match this flat structure (no nested "download" wrapper).
 export type FrontendEvent =
- | { kind: "added"; download: Download }
- | { kind: "progress"; download: Download }
- | { kind: "statusChanged"; download: Download }
- | { kind: "completed"; download: Download }
- | { kind: "error"; download: Download }
- | { kind: "removed"; download: { id: string } }
- | { kind: "captured"; download: CapturedUrl };
+ | ({ kind: "added" } & Download)
+ | ({ kind: "progress" } & Download)
+ | ({ kind: "statusChanged" } & Download)
+ | ({ kind: "completed" } & Download)
+ | ({ kind: "error" } & Download)
+ | { kind: "removed"; id: string }
+ | ({ kind: "captured" } & CapturedUrl); // Flat structure, no "download" wrapper
 
 /** Human-readable label for a proxy mode. */
 export const PROXY_MODE_LABEL: Record<ProxyMode, string> = {

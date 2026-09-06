@@ -1,4 +1,5 @@
 // Downloads store — reactive state for the download list
+// Downloads store — reactive state for the download list
 import { writable, derived, get } from "svelte/store";
 import type { CapturedUrl, Download, FrontendEvent } from "../types";
 import * as api from "../api";
@@ -258,11 +259,22 @@ export async function startEventListener(): Promise<void> {
         // confirmation prompt. The dialog calls `addDownload()`
         // when the user clicks "Download", which is what actually
         // queues the task in the engine.
-        enqueueCapture(e.download);
+        // Rust serializes Captured flat (no "download" wrapper), so
+        // construct CapturedUrl directly from the event payload.
+        const captured: CapturedUrl = {
+          source: e.source,
+          url: e.url,
+          suggestedFilename: e.suggestedFilename,
+          defaultSaveDir: e.defaultSaveDir,
+          referer: e.referer,
+          userAgent: e.userAgent,
+          nonce: e.nonce,
+        };
+        enqueueCapture(captured);
         return;
       }
       if (e.kind === "removed") {
-        const removedId = e.download.id;
+        const removedId = e.id;
         downloads.update((list) => list.filter((d) => d.id !== removedId));
         // Lazy-import to avoid a circular dependency: `ui.ts` is
         // also imported by the download store, so reaching back
@@ -272,7 +284,15 @@ export async function startEventListener(): Promise<void> {
         );
         return;
       }
-      const d = e.download;
+      // For Added, Progress, StatusChanged, Completed, Error: download fields are flat
+      // SAFETY: Rust serializes these variants flat (no "download" wrapper) due to
+      // #[serde(tag = "kind", rename_all = "camelCase")]. The TypeScript type
+      // matches this flat structure, so the cast is safe when kind is one of these.
+      const d: Download = e as unknown as Download;
+      // Notify on completion
+      if (d.status === "completed") {
+        api.notify_on_complete("Download Complete", `${d.filename} finished downloading`).catch(() => {});
+      }
       downloads.update((list) => {
         const i = list.findIndex((x) => x.id === d.id);
         if (i >= 0) {
