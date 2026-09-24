@@ -69,7 +69,7 @@
   import { settings, loadSettings } from "./lib/stores/settings";
   import { initKeyboardShortcuts, registerShortcuts } from "./lib/hooks/useKeyboardShortcuts";
   import { fmtBytes, fmtRate, filenameFromUrl, isUrl, truncate } from "./lib/utils/formatters";
-  import type { Download } from "./lib/types";
+  import type { Download, ToolInfo } from "./lib/types";
 
   // ── Form state ────────────────────────────────────────────────
   let url = "";
@@ -432,10 +432,76 @@
       else if (type === "remove") await bulkRemove(ids);
       else if (type === "trash") await bulkTrash(ids);
       else if (type === "set-limit") await bulkSetLimit(ids, limit ?? null);
+      else if (type === "merge") {
+        await mergeSelectedPair(ids);
+        return; // `mergeSelectedPair` reports its own outcome
+      }
       showToast({ kind: "info", title: `${ids.length} ${verbFor(type)}` });
       if (type === "remove" || type === "trash") clearSelection();
     } catch (err) {
       showToast({ kind: "error", title: "Bulk action failed", message: String(err) });
+    }
+  }
+
+  // ── Merging a DASH video + audio pair ───────────────────────────
+  //
+  // A site on MPEG-DASH (bilibili and friends) serves video as two
+  // independent streams, so the two rows you get from a capture are the
+  // two halves of one file. Merging them is what makes it playable.
+  //
+  // The backend validates the *result* (the merged file must contain
+  // both a video and an audio stream) and leaves the sources on disk, so
+  // a wrong pairing costs a clear error message, never data.
+  //
+  // ffmpeg is not bundled with the app. We probe once at startup so the
+  // Merge button can be disabled with a reason instead of failing after
+  // the click; if the probe hasn't answered yet the button stays
+  // enabled and the command reports the problem precisely.
+  let ffmpegState: ToolInfo | null = null;
+
+  async function mergeSelectedPair(ids: string[]) {
+    if (ids.length !== 2) return;
+    // Remuxing a large file is I/O-bound and not instant, so say
+    // something before the await rather than leaving the UI silent.
+    showToast({
+      kind: "info",
+      title: "Merging…",
+      message: "Copying the two streams into one file (no re-encode).",
+      duration: 2500,
+    });
+    try {
+      const res = await api.mergeDownloads(ids[0], ids[1]);
+      const name = res.outputPath.split("/").pop() ?? res.outputPath;
+      const size = fmtBytes(res.bytes);
+      // Only claim the stream counts when ffprobe actually verified
+      // them; otherwise say what we know and no more.
+      const streams =
+        res.videoStreams != null && res.audioStreams != null
+          ? `, ${res.videoStreams} video + ${res.audioStreams} audio stream`
+          : ", unverified (ffprobe not installed)";
+      showToast({
+        kind: "success",
+        title: "Merged into one file",
+        message: `${name} (${size}${streams})`,
+        duration: 8000,
+      });
+      // Say it out loud too: a merge takes long enough that the user has
+      // usually moved on, and the toast may well have expired.
+      api.notify("Video + audio merged", `${name} is ready`).catch(() => {});
+      // The backend retargeted the first row at the merged file; refresh
+      // so the list shows the new filename even if the StatusChanged
+      // event is missed.
+      await refreshDownloads();
+    } catch (err) {
+      const msg = String(err);
+      showToast({
+        kind: "error",
+        title: "Merge failed",
+        message: /ffmpeg is not installed/i.test(msg)
+          ? msg + " — install ffmpeg (e.g. `sudo apt install ffmpeg`) and retry."
+          : msg,
+        duration: 10000,
+      });
     }
   }
 
@@ -695,6 +761,14 @@
       startSpeedMonitor();
       await startEventListener();
       doPing();
+      // Which external tools are available. Probed once and lazily
+      // tolerated: a failure here only costs the Merge button its
+      // "disabled with a reason" state, and the merge command still
+      // reports a missing ffmpeg precisely.
+      api
+        .probeFfmpeg()
+        .then((t) => (ffmpegState = t))
+        .catch(() => (ffmpegState = null));
     })();
 
     // Global keyboard shortcuts
@@ -955,6 +1029,7 @@
     {:else}
       <BulkActionBar
         visibleIds={visible.map((d) => d.id)}
+        ffmpegState={ffmpegState}
         on:action={onBulkAction}
       />
       {#each visible as d, i (d.id)}

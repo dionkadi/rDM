@@ -59,7 +59,8 @@ jobs:
             librsvg2-dev \
             build-essential \
             libxdo-dev \
-            libssl-dev
+            libssl-dev \
+            ffmpeg
 
       - name: cargo check (workspace)
         run: cargo check --workspace --all-targets
@@ -69,6 +70,12 @@ jobs:
         # protocol / chunk / scheduler code without needing a
         # network. Integration tests under tests/ are slower; we
         # run them on a schedule or before releases, not on every PR.
+        #
+        # This includes the media tests, which shell out to a real
+        # ffmpeg (installed above) to prove that a video+audio pair
+        # really remuxes into a file with both streams, and that two
+        # videos are *refused* rather than silently "merged". They skip
+        # themselves with a printed note when ffmpeg is absent.
         run: cargo test -p dm-engine --lib
 
       - name: Ghost-row regression (remove while downloading)

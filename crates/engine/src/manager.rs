@@ -442,9 +442,43 @@ impl DownloadManager {
         self.emit(DownloadEvent::Removed(id.to_string()));
     }
 
+    /// Point an existing download row at a different file on disk.
+    ///
+    /// Used after a successful media merge (see [`crate::media`]): the
+    /// download's *output* is no longer the single stream that was
+    /// fetched, it is the merged file, and the row has to follow it —
+    /// otherwise "Show in folder" and "Open" act on a part the user may
+    /// well have deleted, and the merged file would exist on disk with
+    /// nothing in the UI pointing at it.
+    ///
+    /// Deliberately narrow. It changes `save_path` + `filename` only,
+    /// leaves the URL alone (the origin is still worth seeing) and keeps
+    /// the status, because a merge only ever happens between completed
+    /// downloads. Emits `StatusChanged` so the list re-renders.
+    ///
+    /// Returns `false` when there is no such download.
+    pub fn set_output_file(&self, id: &str, path: &std::path::Path) -> bool {
+        let snapshot = {
+            let tasks = self.inner.tasks.lock().unwrap();
+            let Some(entry) = tasks.get(id) else {
+                return false;
+            };
+            let mut d = entry.state.download.lock().unwrap();
+            d.save_path = path.to_path_buf();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                d.filename = name.to_string();
+            }
+            let _ = self.inner.storage.save_download(&d);
+            d.clone()
+        };
+        // Emit with no locks held: the sink is caller code and must never
+        // be able to deadlock against a download lock.
+        self.emit(DownloadEvent::StatusChanged(snapshot));
+        true
+    }
+
     /// Set or clear a per-download speed limit (bytes/sec).
-    pub fn set_speed_limit(&self, id: &str, limit: Option<u64>) {
-        if let Some(e) = self.inner.tasks.lock().unwrap().get(id) {
+    pub fn set_speed_limit(&self, id: &str, limit: Option<u64>) {        if let Some(e) = self.inner.tasks.lock().unwrap().get(id) {
             let mut d = e.state.download.lock().unwrap();
             d.speed_limit = limit;
             let _ = self.inner.storage.save_download(&d);
@@ -1087,5 +1121,47 @@ mod tests {
         // row.
         assert!(mgr.get("ghost").is_none());
         assert_eq!(mgr.inner.storage.load_active().unwrap().len(), 0);
+    }
+
+    /// A successful media merge changes what a download *produced*, so
+    /// its row has to follow the new file — otherwise the merged file
+    /// exists on disk with nothing in the UI pointing at it, and
+    /// "Show in folder" opens a part the user may have deleted.
+    ///
+    /// `#[tokio::test]` is required, not stylistic: `add()` spawns the
+    /// download task through the manager's spawner.
+    #[tokio::test]
+    async fn set_output_file_retargets_the_row_and_persists_it() {
+        let storage = Storage::open_memory().unwrap();
+        let mgr = DownloadManager::new(storage);
+        mgr.add(new_download("part", "https://cdn.test/x-30280.m4s"));
+
+        assert!(
+            !mgr.set_output_file("nope", std::path::Path::new("/tmp/x.mp4")),
+            "an unknown id must report failure rather than panic"
+        );
+
+        let merged = std::path::Path::new("/tmp/x-30280.mp4");
+        assert!(mgr.set_output_file("part", merged));
+
+        let d = mgr.get("part").expect("row still exists");
+        assert_eq!(d.filename, "x-30280.mp4");
+        assert_eq!(d.save_path, std::path::PathBuf::from(merged));
+        assert_eq!(
+            d.url, "https://cdn.test/x-30280.m4s",
+            "the origin URL stays visible — only the output moved"
+        );
+
+        // Persisted, not just in memory: a restart must not resurrect
+        // the old path.
+        let row = mgr
+            .inner
+            .storage
+            .load_active()
+            .unwrap()
+            .into_iter()
+            .find(|d| d.id == "part")
+            .expect("row persisted");
+        assert_eq!(row.filename, "x-30280.mp4");
     }
 }

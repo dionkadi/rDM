@@ -21,6 +21,30 @@ erased with nothing to replace it. Full audit:
 
 ### Added
 
+- **Merging a DASH video + audio pair into one playable file.** Sites on
+  MPEG-DASH (bilibili and friends) serve video as **two independent
+  streams**, so no single URL was ever the whole video: you got a picture
+  with no sound, or sound with no picture, and no amount of grabbing could
+  fix that. Select two finished downloads → **Merge** → one file, via
+  `ffmpeg -c copy` (no re-encode, so fast and lossless; `.mp4`, falling
+  back to `.mkv` when the codecs are not MP4-compatible).
+  `crates/engine/src/media.rs` owns the grouping heuristic and the remux;
+  `probe_ffmpeg` / `merge_downloads` expose it to the UI.
+  The design leans on verifying the *result* rather than the guess — URL
+  shape cannot tell a video half from an audio half (bilibili names both
+  `…-30280.m4s` / `…-30232.m4s`) — so both inputs are mapped optionally
+  (`-map 0:v? -map 0:a? -map 1:v? -map 1:a?`), which makes their order
+  irrelevant, and the merged file is then required to contain at least one
+  video **and** one audio stream. A wrong pairing fails with a message and
+  removes its own half-written output, instead of leaving a picture-less
+  "success". The two sources stay on disk, and the first row is retargeted
+  at the merged file so the result is visible in the list rather than
+  orphaned on disk.
+  ffmpeg is not bundled — `probe_ffmpeg` lets the UI disable the button
+  *with a reason* instead of failing after the click. Still open (see
+  TODO.md): manifest parsing / segment download for `m3u8` / `mpd`, and
+  automatic pairing at capture time so this becomes one click instead of
+  "select the two rows".
 - **`browser-extension/test/`** — a dependency-free regression suite
   (48 tests) on `node:test`, with a fake `chrome.*`, a controllable
   clock, a minimal DOM and a fake `WebSocket`. `background.js`,

@@ -369,6 +369,114 @@ pub fn notify_on_complete(app: tauri::AppHandle, title: String, body: String) {
     notify(app, title, body);
 }
 
+// ── Media merging (DASH/HLS "video + audio" pairs) ──────────────────
+//
+// Sites that serve video over MPEG-DASH (bilibili and friends) split it
+// into two independent streams, so "one URL = the video" is simply not
+// true for them: you get a picture with no sound, or sound with no
+// picture. `dm_engine::media` owns the grouping heuristic and the
+// ffmpeg remux; these two commands expose it.
+//
+// Merging needs ffmpeg on PATH. It is *not* bundled — a download manager
+// has no business shipping a media toolkit — so `probe_ffmpeg` exists to
+// let the UI say "install ffmpeg" before the user tries, and
+// `merge_downloads` returns a precise error if it is missing anyway.
+
+/// Is ffmpeg available, and which build?
+#[tauri::command]
+pub async fn probe_ffmpeg() -> dm_engine::media::ToolInfo {
+    dm_engine::media::ffmpeg().await
+}
+
+/// Result of a successful merge.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeResult {
+    /// Absolute path of the merged file.
+    pub output_path: String,
+    /// Size of the merged file in bytes.
+    pub bytes: u64,
+    /// Container we ended up with (`mp4`, or `mkv` when the codecs are
+    /// not MP4-compatible).
+    pub container: String,
+    /// Stream counts in the merged file. `None` when ffprobe is not
+    /// installed and the result could not be verified (ffmpeg's exit
+    /// status still had to be success).
+    pub video_streams: Option<usize>,
+    pub audio_streams: Option<usize>,
+}
+
+/// Merge two *completed* downloads into one playable file.
+///
+/// Either id may be the video half: ffmpeg maps streams by type rather
+/// than by input order, and URL shape genuinely cannot tell them apart
+/// for `.m4s` (bilibili names both halves the same way). Asking the
+/// caller to know which is which would push a guess onto the UI.
+///
+/// The merged file is verified to contain at least one video **and** one
+/// audio stream. A wrong pairing therefore fails with a clear message
+/// instead of leaving the user with a silent "success" and a
+/// picture-less file.
+///
+/// The two source files are left in place — this writes a new file and
+/// never deletes — and the first download's row is retargeted at the
+/// merged file so the result is visible and actionable in the list
+/// rather than orphaned on disk.
+#[tauri::command]
+pub async fn merge_downloads(
+    state: State<'_, DownloadManager>,
+    first_id: String,
+    second_id: String,
+) -> Result<MergeResult, String> {
+    if first_id == second_id {
+        return Err("pick two different downloads to merge".into());
+    }
+
+    let first = state
+        .get(&first_id)
+        .ok_or_else(|| format!("download not found: {first_id}"))?;
+    let second = state
+        .get(&second_id)
+        .ok_or_else(|| format!("download not found: {second_id}"))?;
+
+    for d in [&first, &second] {
+        if d.status != DownloadStatus::Completed {
+            return Err(format!(
+                "\"{}\" is not finished yet ({:?}) — both parts must be complete before merging",
+                d.filename, d.status
+            ));
+        }
+        if !d.save_path.exists() {
+            return Err(format!(
+                "the file for \"{}\" is missing: {}",
+                d.filename,
+                d.save_path.display()
+            ));
+        }
+    }
+
+    let outcome = dm_engine::media::remux(&first.save_path, &second.save_path)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // The download's output is now the merged file, so point the row at
+    // it. Done after the merge succeeded and no earlier: a failed merge
+    // must leave the row describing the file that is actually on disk.
+    state.set_output_file(&first_id, std::path::Path::new(&outcome.output_path));
+
+    let (video_streams, audio_streams) = match outcome.streams {
+        Some((v, a)) => (Some(v), Some(a)),
+        None => (None, None),
+    };
+    Ok(MergeResult {
+        output_path: outcome.output_path,
+        bytes: outcome.bytes,
+        container: outcome.container,
+        video_streams,
+        audio_streams,
+    })
+}
+
 /// Snapshot of the native-messaging host listener, used by the Settings →
 /// Extensions tab to render a live status pill.
 #[derive(serde::Serialize)]

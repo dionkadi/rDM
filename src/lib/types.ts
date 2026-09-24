@@ -169,3 +169,33 @@ export interface CookieImportResult {
  header: string;
  cookies: BrowserCookie[];
 }
+
+/** An external tool DM shells out to (currently only ffmpeg). */
+export interface ToolInfo {
+ name: string;
+ /** Absolute path when found on `PATH`, else `null`. */
+ path: string | null;
+ /** First line of `<tool> -version`, else `null`. */
+ version: string | null;
+}
+
+/**
+ * Result of merging two DASH streams into one file.
+ *
+ * Merging is how a site that serves video as two independent streams
+ * (video + audio) becomes a single playable file. See
+ * `crates/engine/src/media.rs`.
+ */
+export interface MergeResult {
+ outputPath: string;
+ bytes: number;
+ /** `mp4`, or `mkv` when the codecs are not MP4-compatible. */
+ container: string;
+ /**
+ * Stream counts in the merged file. `null` when ffprobe is not
+ * installed, in which case the merge succeeded per ffmpeg's exit
+ * status but the result could not be verified.
+ */
+ videoStreams: number | null;
+ audioStreams: number | null;
+}

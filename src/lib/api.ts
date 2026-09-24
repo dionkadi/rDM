@@ -7,8 +7,10 @@ import type {
  BrowserKind,
  CookieImportResult,
  Download,
+ MergeResult,
  ProxyMode,
  Settings,
+ ToolInfo,
 } from "./types";
 
 export function ping(): Promise<string> {
@@ -273,4 +275,30 @@ export function notify(title: string, body: string): Promise<void> {
  */
 export function notify_on_complete(title: string, body: string): Promise<void> {
   return invoke("notify_on_complete", { title, body });
+}
+
+/**
+ * Is ffmpeg available? Merging a DASH video + audio pair needs it, and
+ * it is deliberately not bundled with the app.
+ */
+export function probeFfmpeg(): Promise<ToolInfo> {
+  return invoke("probe_ffmpeg");
+}
+
+/**
+ * Merge two completed downloads into one playable file.
+ *
+ * Either id may be the video half — ffmpeg maps streams by type, and URL
+ * shape cannot reliably tell the halves apart for `.m4s`. The merged
+ * file is verified to contain both a video and an audio stream, so a
+ * wrong pairing fails with a message instead of producing a
+ * picture-less file. The two sources are left on disk; the first
+ * download's row is retargeted at the merged file so it shows up in the
+ * list.
+ */
+export function mergeDownloads(
+  firstId: string,
+  secondId: string,
+): Promise<MergeResult> {
+  return invoke("merge_downloads", { firstId, secondId });
 }

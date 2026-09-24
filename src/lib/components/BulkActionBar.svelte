@@ -9,6 +9,7 @@
   } from "../stores/ui";
   import { downloads } from "../stores/downloads";
   import { fmtBytes } from "../utils/formatters";
+  import type { ToolInfo } from "../types";
 
   /** Optional list of *visible* ids — the bar uses this to render
    *  the "in selection / visible total" line. Falls back to the
@@ -22,6 +23,31 @@
   $: count = $selectedIds.size;
   // Aggregate stats for the selected rows (used in the summary line)
   $: stats = computeStats($downloads, $selectedIds, visibleIds);
+
+  /**
+   * Merging is only meaningful for exactly two *finished* rows — the
+   * shape you get from a site that serves video as two independent DASH
+   * streams (video + audio). Anything else and the button would invite
+   * the user to create a broken file.
+   *
+   * ffmpeg is not bundled, so `ffmpegState` (probed once by the parent)
+   * lets us disable the button with a reason instead of failing after
+   * the click. `null` = not probed yet, which is treated as "allow"
+   * so a slow probe never blocks an otherwise valid action; the
+   * command itself reports a missing ffmpeg clearly.
+   */
+  export let ffmpegState: ToolInfo | null = null;
+
+  $: selectedRows = $downloads.filter((d) => $selectedIds.has(d.id));
+  $: allFinished =
+    selectedRows.length === 2 &&
+    selectedRows.every((d) => d.status === "completed");
+  $: mergeDisabled = !allFinished || ffmpegState?.path === null;
+  $: mergeTitle = !allFinished
+    ? "Select exactly two finished downloads to merge (a DASH video + audio pair)"
+    : ffmpegState?.path === null
+      ? "Merging needs ffmpeg, which was not found on PATH — install it and restart DM"
+      : "Merge these two into one playable file (ffmpeg stream copy, no re-encode)";
 
   function computeStats(
     list: typeof $downloads,
@@ -124,6 +150,16 @@
           </button>
         {/if}
       </div>
+
+      <button
+        class="action"
+        on:click={() => fire("merge")}
+        disabled={mergeDisabled}
+        title={mergeTitle}
+      >
+        <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4v6a3 3 0 0 0 3 3h4M7 20v-6a3 3 0 0 1 3-3h4"/><path d="M14 7h4v4"/></svg>
+        Merge
+      </button>
 
       <button class="action" on:click={() => fire("trash")} title="Move selected to Trash (recoverable)">
         <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6M10 11v6M14 11v6"/></svg>
@@ -232,6 +268,18 @@
   .action:hover {
     background: rgba(255, 255, 255, 0.06);
     border-color: var(--border-strong);
+  }
+  /* Merge is only enabled for exactly two finished rows. A disabled
+   * button that looks enabled is worse than no button — the user clicks
+   * it and nothing happens — so make the state unmistakable, and drop
+   * the hover feedback that would otherwise promise an interaction. */
+  .action:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+  .action:disabled:hover {
+    background: var(--surface);
+    border-color: var(--border);
   }
   .action.primary {
     color: var(--accent);

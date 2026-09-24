@@ -491,10 +491,21 @@ async fn cancel_persists_partial_progress() {
         .find(|d| d.id == "cancel")
         .expect("cancel row should still exist (status = canceled)");
     assert_eq!(row.status, DownloadStatus::Canceled);
-    assert_eq!(
-        row.downloaded, partial,
-        "cancel must persist the partial progress we observed in-memory \
-         (in-memory: {partial}, on disk: {})",
+    // `>=`, not `==`. The guarantee is "no progress is lost", and the
+    // value on disk is written from the *current* in-memory count when
+    // the task finalizes — which is why the row can legitimately hold
+    // more than the snapshot taken a moment earlier. Over loopback the
+    // transfer runs at GB/s, so between `wait_for_min_bytes` returning
+    // and `cancel()` landing, several megabytes routinely go by; an
+    // equality assertion against the earlier snapshot fails on exactly
+    // the fast machines where nothing is wrong. (Observed here: the
+    // snapshot said 1.1 MiB while the row held 16 MiB — i.e. the
+    // download had advanced, not lost anything.)
+    assert!(
+        row.downloaded >= partial,
+        "cancel must not discard progress: observed {partial} in-memory, \
+         but only {} on disk — a value below the snapshot means work was \
+         rolled back, which is the bug this test guards",
         row.downloaded
     );
 }

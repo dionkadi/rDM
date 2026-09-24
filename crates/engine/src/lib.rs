@@ -18,6 +18,7 @@ pub mod cookies;
 pub mod control;
 pub mod limiter;
 pub mod manager;
+pub mod media;
 pub mod model;
 pub mod protocol;
 pub mod scheduler;
@@ -30,7 +31,8 @@ pub use cookies::{read_browser_cookies, BrowserCookie, BrowserKind, CookieError,
 pub use control::DownloadControl;
 pub use limiter::{CombinedLimiter, TokenBucket};
 pub use manager::{DownloadEvent, DownloadManager, EventSink, RunContext};
-pub use model::{Category, ChecksumSpec, ChunkState, Download, DownloadId, DownloadStatus, Settings};
+pub use media::{plan as plan_media, MediaPlan, MergeError, MergeOutcome, PartKind};
+pub use model::{Category, ChecksumSpec, ChunkState, Download, DownloadId, DownloadStatus, MediaKind, Settings};
 pub use scheduler::DownloadScheduler;
 pub use storage::{Storage, StorageError};
 pub use task::{layout_for_resume, run_download, sha256_of, TaskState};

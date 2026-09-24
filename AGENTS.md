@@ -310,6 +310,30 @@ ls target/release/dm-tauri     # ~23 MB stripped, dynamically linked to webkit2g
 - **`.pi/` is gitignored** — it's Plannotator/agent harness scratch. Don't commit from it.
 - **`.taurignore` (project root) keeps the Tauri CLI's walker from EMFILE-panicking**: the Tauri CLI uses the `ignore` crate (`ignore::WalkBuilder`) to walk the project tree for `tauri dev` file watching and for source-file discovery during `tauri build`. The walker does **not** apply `max_open(1)` back-pressure, so on a project whose `target/` and `node_modules/` together hold tens of thousands of files (this repo's `target/release` alone is 20k+ files), it can exhaust the per-process FD limit and panic with `Too many open files (os error 24)` at `crates/tauri-cli/src/interface/rust.rs` (the `Result::unwrap()` on the walker iterator). The Tauri CLI is a precompiled native Node addon (`node_modules/@tauri-apps/cli-linux-x64-gnu/cli.linux-x64-gnu.node`) so we cannot patch the walker. The supported fix is a project-root `.taurignore` (gitignore-compatible syntax) that excludes `target/`, `**/target/`, `node_modules/`, `dist/` (Tauri reads `dist/` via the `frontendDist` config, not by walking), `coredump/`, `images/`, `notes/`, `.pi/`, and editor metadata. The CLI looks for `.taurignore` in every directory it walks and applies the patterns in addition to its built-in defaults.
 
+## Media merging (`crates/engine/src/media.rs`)
+
+Sites that serve video over **MPEG-DASH** (bilibili and friends) split it into **two independent streams** — video and audio — so "one URL = the video" is simply false for them: downloading one half gives you a picture with no sound, or sound with no picture. `media.rs` is the answer, in two halves:
+
+* `plan(&[urls])` — decide what a capture amounts to: a manifest, a single file, or a `Pair`. Pure and heuristic.
+* `remux(first, second)` — `ffmpeg -c copy` the two into one file (no re-encode: fast and lossless).
+
+**The heuristic is allowed to be approximate because the result is verified.** URL shape genuinely cannot tell a video half from an audio half — bilibili names both `…-1-30280.m4s` / `…-1-30232.m4s`, differing only by a site-specific codec id — so instead of pretending otherwise:
+
+1. `-map 0:v? -map 0:a? -map 1:v? -map 1:a?` takes whatever each input actually contains, which makes the **order of the two inputs irrelevant**. Callers never have to know which file is which; `merge_downloads` accepts either order.
+2. `probe_stream_counts` (ffprobe) checks the output really has ≥1 video **and** ≥1 audio stream.
+3. Only a verified success returns `Ok`. A wrong pairing (e.g. two video-only streams) fails with `Unusable { missing: "audio" }` and **removes its own half-written output** — the one test that guarantees this is `refuses_to_merge_two_videos_instead_of_writing_a_silent_failure`, and it is the reason this feature can ship without asking the user what a DASH representation is.
+
+Other things that will bite you if you change them:
+
+* **`.ts` (HLS segments) are never paired.** They are consecutive pieces of *one* stream, so "merging" two of them concatenates video onto video. A manifest (`m3u8`/`mpd`) is reported as a manifest rather than offered as a video, because DM cannot expand one yet — see TODO.md.
+* **The output name avoids the inputs.** A `.mp4` video part merged to `.mp4` would target the very file it is reading, so on collision the name becomes `<stem>.merged.<ext>` — skipping the container instead would silently downgrade an mp4 merge to mkv.
+* **`.mp4` first, `.mkv` on failure.** MKV accepts codecs that MP4 does not, so the fallback turns an avoidable failure into a working file.
+* **`kill_on_drop(true)`** is what makes the 15-minute timeout safe: on timeout the future holding the child is dropped, and that flag turns it into a kill.
+* **ffmpeg is not bundled** (a download manager has no business shipping a media toolkit) and is looked up on `PATH` (`probe_ffmpeg` feeds the UI so the Merge button can be disabled *with a reason* instead of failing after the click). `ffprobe` is used when present but is not required — without it the merge still succeeds, and the UI says "unverified" rather than claiming stream counts it never checked.
+* **A successful merge retargets the row** (`DownloadManager::set_output_file`): the download's output is now the merged file, so the row has to follow it, otherwise the merged file exists on disk with nothing in the UI pointing at it and "Show in folder" opens a part the user may have deleted. The two source files are deliberately left alone — the merge command never deletes.
+
+Tests live in `media.rs` themselves and shell out to a **real ffmpeg** (synthesising clips with `lavfi`, so no fixtures): one test proves a pair merges into a file with both streams, the other proves a bad pairing is refused and leaves nothing behind. They skip with a printed note when ffmpeg is missing; CI installs ffmpeg so there they are a real gate.
+
 ## When you're stuck
 
 - Engine behaviour unclear → read `crates/engine/src/manager.rs::run_download` and `task.rs` together; they tell the same story from different angles.
