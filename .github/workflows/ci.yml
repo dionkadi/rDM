@@ -71,6 +71,15 @@ jobs:
         # run them on a schedule or before releases, not on every PR.
         run: cargo test -p dm-engine --lib
 
+      - name: Ghost-row regression (remove while downloading)
+        # `--lib` above deliberately skips tests/, and that is exactly
+        # why the "canceled ghost" survived: the existing lib test
+        # removes a download that was never started, so there is no
+        # in-flight worker to reproduce it. This one test needs a real
+        # worker being cut off mid-transfer, and it is quick (loopback
+        # server, one 64 MiB transfer abandoned after 1 MiB).
+        run: cargo test -p dm-engine --test integration remove_while_downloading
+
   # ───────────────────────────────────────────────────────────────────
   # 2. Frontend: svelte-check + a production bundle to catch
   #    runtime-svelte-only issues (a11y warnings, unused props, etc.)
@@ -94,6 +103,14 @@ jobs:
         # svelte-check exits non-zero on warnings only when --fail-on-warnings
         # is set; the project treats warnings as errors by convention.
         run: npm run check
+
+      - name: CSS custom-property guard
+        # Neither svelte-check nor the build looks inside `var(--x)`.
+        # An undefined custom property silently invalidates the whole
+        # declaration, which is how the capture dialog's "Download"
+        # button became white text on a near-white background with no
+        # error anywhere.
+        run: node scripts/check-css-vars.mjs
 
       - name: Production build
         run: npm run build

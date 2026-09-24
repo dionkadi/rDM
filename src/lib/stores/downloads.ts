@@ -85,6 +85,10 @@ export async function refreshDownloads(): Promise<void> {
   isLoading.set(true);
   try {
     const list = await api.listDownloads();
+    // The server list is authoritative: if an id we were blocking for
+    // `removedIds` came back, stop blocking it, otherwise a late event
+    // for it would be swallowed forever.
+    for (const d of list) removedIds.delete(d.id);
     downloads.set(list);
     error.set("");
   } catch (e) {
@@ -248,6 +252,25 @@ export async function setDownloadPriority(
 // ── Event handling (Tauri live updates) ────────────────────────────
 let unlistenFn: (() => void) | null = null;
 
+/**
+ * Ids the user has removed during this session.
+ *
+ * Defence in depth for the "canceled ghost" bug. `remove` drops the
+ * task and emits `Removed`, but an in-flight chunk worker only notices
+ * the cancel flag when it next polls — and its finalize path used to
+ * persist `status = Canceled` and emit `StatusChanged` *after* the
+ * `Removed`. The generic branch below inserts unknown ids, so that late
+ * event recreated the row as a ghost which only a full list refresh
+ * cleared (hence "it disappeared when I clicked Resume").
+ *
+ * The engine no longer emits or persists for a removed task (see
+ * `DownloadControl::remove` and the finalize guard in `task.rs`); this
+ * set means the UI stays correct even if some other path ever does.
+ * `refreshDownloads` un-blocks any id the server still knows about, so
+ * an id can't stay blocked after a legitimate re-add.
+ */
+const removedIds = new Set<string>();
+
 export async function startEventListener(): Promise<void> {
   try {
     const { listen } = await import("@tauri-apps/api/event");
@@ -271,10 +294,25 @@ export async function startEventListener(): Promise<void> {
           nonce: e.nonce,
         };
         enqueueCapture(captured);
+        // Tell the user the way they'll notice from wherever they are.
+        // They just clicked a link in their browser, so this window is
+        // almost always behind it and the CaptureDialog modal is
+        // invisible to them — that is why "it doesn't notify" was the
+        // complaint. When the window *is* focused the dialog plus the
+        // in-app toast are feedback enough, so we skip the duplicate.
+        if (typeof document !== "undefined" && !document.hasFocus()) {
+          api
+            .notify(
+              "New download captured",
+              captured.suggestedFilename || captured.url,
+            )
+            .catch(() => {});
+        }
         return;
       }
       if (e.kind === "removed") {
         const removedId = e.id;
+        removedIds.add(removedId);
         downloads.update((list) => list.filter((d) => d.id !== removedId));
         // Lazy-import to avoid a circular dependency: `ui.ts` is
         // also imported by the download store, so reaching back
@@ -289,9 +327,17 @@ export async function startEventListener(): Promise<void> {
       // #[serde(tag = "kind", rename_all = "camelCase")]. The TypeScript type
       // matches this flat structure, so the cast is safe when kind is one of these.
       const d: Download = e as unknown as Download;
+      // A late event for a row the user already removed must not
+      // resurrect it. See `removedIds` above.
+      if (removedIds.has(d.id)) return;
       // Notify on completion
       if (d.status === "completed") {
-        api.notify_on_complete("Download Complete", `${d.filename} finished downloading`).catch(() => {});
+        api
+          .notify_on_complete(
+            "Download Complete",
+            `${d.filename} finished downloading`,
+          )
+          .catch(() => {});
       }
       downloads.update((list) => {
         const i = list.findIndex((x) => x.id === d.id);

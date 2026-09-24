@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import {
   createClock,
   createChromeMock,
+  createPerformanceFake,
   loadExtension,
   FakeDocument,
   FakeElement,
@@ -31,8 +32,18 @@ function bootContent(options = {}) {
     document: doc,
     location: options.location || { href: PAGE, protocol: "https:" },
     navigator: { userAgent: "Mozilla/5.0 (Test) DMTest/1.0" },
+    performance: options.performance,
   });
   return { clock, ctl, doc };
+}
+
+/** Ask the content script for its media list, synchronously. */
+function grab(ctl) {
+  let res = null;
+  ctl.tabsSendMessage(1, { type: "collect" }, (r) => {
+    res = r;
+  });
+  return res;
 }
 
 /** Push a background state update into the content script. */
@@ -252,4 +263,140 @@ test("the removed auto-scrape path stays removed", () => {
     before,
     "content.js must not emit anything in response",
   );
+});
+
+// ─── "Grab page media" ──────────────────────────────────────────
+//
+// Reported: grabbing on a bilibili watch page returned `iframe.html`
+// and `player.html` instead of video. Two causes: the iframe branch
+// added every iframe URL unfiltered (and `.html` is not media), and an
+// MSE player never puts the real stream in the DOM at all.
+
+/** Build a `<video>` the way an MSE player presents one. */
+function mseVideo() {
+  const video = new FakeElement("video");
+  video.setAttribute("src", "blob:https://www.bilibili.com/8f3a-2b1c");
+  video.currentSrc = "blob:https://www.bilibili.com/8f3a-2b1c";
+  return video;
+}
+
+function iframe(src) {
+  const el = new FakeElement("iframe");
+  el.setAttribute("src", src);
+  return el;
+}
+
+test("grab: a bilibili-style page yields the real streams, not the player's HTML", () => {
+  const videoUrl =
+    "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/12/34/56/123456-1-30280.m4s?deadline=1&uipk=5";
+  const audioUrl =
+    "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/12/34/56/123456-1-30232.m4s?deadline=1&uipk=5";
+  const { ctl } = bootContent({
+    anchors: {
+      "video, audio, source, picture source, track": [mseVideo()],
+      "iframe[src]": [
+        iframe("https://player.bilibili.com/player.html?aid=123"),
+        iframe("https://www.bilibili.com/blackboard/iframe.html"),
+      ],
+    },
+    // What the player fetched into the blob.
+    performance: createPerformanceFake([
+      "https://s1.hdslb.com/bfs/static/main.css",
+      "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/12/34/56/123456-1-30280.m4s?range=0-8388607",
+      videoUrl,
+      audioUrl,
+    ]),
+  });
+
+  const res = grab(ctl);
+  assert.ok(res, "collect must answer");
+  assert.ok(
+    res.urls.some((u) => u.includes("30280.m4s")),
+    `expected the video stream, got ${JSON.stringify(res.urls)}`,
+  );
+  assert.ok(
+    res.urls.some((u) => u.includes("30232.m4s")),
+    "and the audio stream (DASH keeps them separate)",
+  );
+  for (const u of res.urls) {
+    assert.ok(!/\.html(\?|$)/.test(u), `HTML must never be offered: ${u}`);
+    assert.ok(!/^blob:/.test(u), `blob: is not downloadable: ${u}`);
+  }
+});
+
+test("grab: the same stream requested several times is offered once", () => {
+  // Range requests repeat the base URL; the query differs, so
+  // exact-string dedupe is not enough on its own for every CDN — but
+  // the identical URL must not be listed twice.
+  const url = "https://cdn.example.test/movie.mp4?token=abc";
+  const { ctl } = bootContent({
+    performance: createPerformanceFake([url, url, url]),
+  });
+  const res = grab(ctl);
+  assert.equal(res.urls.filter((u) => u === url).length, 1);
+});
+
+test("grab: media elements are preferred over the network copy", () => {
+  const progressive = "https://cdn.example.test/clip.mp4";
+  const video = new FakeElement("video");
+  video.setAttribute("src", progressive);
+  video.currentSrc = progressive;
+  const { ctl } = bootContent({
+    anchors: { "video, audio, source, picture source, track": [video] },
+    performance: createPerformanceFake([progressive]),
+  });
+  assert.deepEqual(plain(grab(ctl).urls), [progressive]);
+});
+
+test("grab: an iframe is only offered when its URL itself looks like media", () => {
+  const { ctl } = bootContent({
+    anchors: {
+      "iframe[src]": [
+        iframe("https://player.example.test/embed/player.html"),
+        iframe("https://cdn.example.test/embedded.mp4"),
+      ],
+    },
+  });
+  const res = grab(ctl);
+  assert.deepEqual(plain(res.urls).sort(), ["https://cdn.example.test/embedded.mp4"]);
+});
+
+test("grab: results are ranked best-first and capped", () => {
+  // 12 network entries, deliberately shuffled by kind.
+  const entries = [];
+  for (let i = 0; i < 4; i++) entries.push(`https://cdn.example.test/seg${i}.m4s`);
+  for (let i = 0; i < 2; i++) entries.push(`https://cdn.example.test/stream${i}.m3u8`);
+  for (let i = 0; i < 6; i++) entries.push(`https://cdn.example.test/file${i}.mp4`);
+  const { ctl } = bootContent({ performance: createPerformanceFake(entries) });
+
+  const res = grab(ctl);
+  assert.ok(res.urls.length <= 8, `cap must hold, got ${res.urls.length}`);
+  assert.match(
+    res.urls[0],
+    /\.mp4(\?|$)/,
+    `a downloadable file should rank first, got ${res.urls[0]}`,
+  );
+  assert.ok(
+    res.urls.every((u) => !u.includes("hdslb")),
+    "irrelevant resources must not leak in",
+  );
+});
+
+test("grab: the note says when there is nothing usable", () => {
+  const { ctl } = bootContent({
+    anchors: {
+      "iframe[src]": [iframe("https://player.example.test/player.html")],
+    },
+  });
+  const res = grab(ctl);
+  assert.deepEqual(plain(res.urls), []);
+  assert.match(res.note, /cross-origin iframe|No media found/);
+});
+
+test("grab: the note reports where the URLs came from", () => {
+  const { ctl } = bootContent({
+    performance: createPerformanceFake(["https://cdn.example.test/a.mp4"]),
+  });
+  assert.match(grab(ctl).note, /1 media URL\(s\)/);
+  assert.match(grab(ctl).note, /network activity/);
 });

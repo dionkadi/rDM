@@ -183,6 +183,7 @@ fn main() {
             commands::get_settings,
             commands::update_settings,
             commands::save_dir_for,
+            commands::notify,
             commands::notify_on_complete,
             commands::probe_native_host,
             commands::open_folder,

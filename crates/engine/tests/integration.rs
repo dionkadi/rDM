@@ -7,12 +7,13 @@
 //!
 //! Run with: `cargo test -p dm-engine --test integration`
 
-use dm_engine::manager::DownloadManager;
+use dm_engine::manager::{DownloadEvent, DownloadManager};
 use dm_engine::model::{Download, DownloadStatus, Settings};
 use dm_engine::storage::Storage;
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 // 256 KiB of a deterministic, easily-verifiable pattern. The legacy
@@ -495,5 +496,105 @@ async fn cancel_persists_partial_progress() {
         "cancel must persist the partial progress we observed in-memory \
          (in-memory: {partial}, on disk: {})",
         row.downloaded
+    );
+}
+
+/// Every `DownloadEvent` carries the id it is about; `Removed` carries
+/// only the id.
+fn event_id(e: &DownloadEvent) -> Option<&str> {
+    match e {
+        DownloadEvent::Added(d)
+        | DownloadEvent::Progress(d)
+        | DownloadEvent::StatusChanged(d)
+        | DownloadEvent::Completed(d)
+        | DownloadEvent::Error(d) => Some(&d.id),
+        DownloadEvent::Removed(id) => Some(id),
+    }
+}
+
+/// Regression test for the "canceled ghost" bug: remove a *running*
+/// download and it refuses to go away.
+///
+/// Sequence before the fix:
+///   1. `remove()` drops the task, deletes the SQLite row, emits `Removed`.
+///   2. The in-flight chunk worker only notices the cancel flag when it
+///      next polls, then runs `run_download`'s finalize path, which
+///      `save_download`s the row — an UPSERT, so the deleted row is
+///      re-created (and comes back on the next launch) — and emits
+///      `StatusChanged(Canceled)`.
+///   3. The frontend had already dropped the row from `Removed`, so the
+///      `StatusChanged` re-inserts it. The ghost then survived until
+///      something triggered a full list refresh, which is why clicking
+///      Resume appeared to dismiss it.
+///
+/// `DownloadControl::remove()` + the finalize/flush guards make step 2
+/// a no-op. The existing lib test `remove_does_not_emit_canceled_status_change`
+/// never started the download, so there was no worker to reproduce it —
+/// this test is the one that actually removes a task mid-transfer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remove_while_downloading_leaves_no_ghost_row() {
+    // `size = 1` gives the 64 MiB payload, so the transfer is reliably
+    // still in flight when we remove it.
+    let port = spawn_server(0, 1);
+    let tmp_dir = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp_dir.path().join("dm.sqlite");
+    let out_path = tmp_dir.path().join("ghost.bin");
+
+    let storage = Storage::open(&db_path).expect("file storage");
+    let mgr = DownloadManager::with_settings(storage, Settings::default());
+
+    let events: Arc<Mutex<Vec<DownloadEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let events = events.clone();
+        mgr.set_event_sink(Arc::new(move |e| events.lock().unwrap().push(e)));
+    }
+
+    let mut d = Download::new(format!("http://127.0.0.1:{port}/ghost.bin"));
+    d.id = "ghost".into();
+    d.save_path = out_path.clone();
+    mgr.add(d);
+
+    wait_for_min_bytes(&mgr, "ghost", 1024 * 1024).await;
+    mgr.remove("ghost");
+
+    // Let the worker notice the flag and reach its finalize path — the
+    // step that used to resurrect the row.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert!(
+        mgr.get("ghost").is_none(),
+        "the in-memory entry must stay gone after remove()"
+    );
+
+    let recorded = events.lock().unwrap().clone();
+    let removed_at = recorded
+        .iter()
+        .rposition(|e| matches!(e, DownloadEvent::Removed(id) if id == "ghost"))
+        .expect("remove() must emit Removed");
+    let after_removed: Vec<&DownloadEvent> = recorded
+        .iter()
+        .skip(removed_at + 1)
+        .filter(|e| event_id(e) == Some("ghost"))
+        .collect();
+    assert!(
+        after_removed.is_empty(),
+        "nothing may be emitted for a removed download after its Removed \
+         event; got {after_removed:?}"
+    );
+
+    drop(mgr);
+
+    // The half that survives a restart: the row must not be back in
+    // SQLite.
+    let storage2 = Storage::open(&db_path).expect("reopen storage");
+    let resurrected: Vec<Download> = storage2
+        .load_active()
+        .expect("load_active")
+        .into_iter()
+        .filter(|d| d.id == "ghost")
+        .collect();
+    assert!(
+        resurrected.is_empty(),
+        "the worker's finalize path must not re-insert a removed row, found {resurrected:?}"
     );
 }

@@ -344,15 +344,29 @@ pub struct CookieImportResult {
     pub cookies: Vec<BrowserCookieDto>,
 }
 
-/// Show a desktop notification (used when a download completes).
+/// Show a desktop notification.
+///
+/// Two callers, both of which exist because the window is usually *behind*
+/// something else at that moment:
+///   * a download finishing — nothing else tells the user;
+///   * a browser capture arriving — the `CaptureDialog` is a modal
+///     inside a window the user is probably not looking at, so without
+///     this a forwarded URL is effectively silent.
 #[tauri::command]
-pub fn notify_on_complete(app: tauri::AppHandle, title: String, body: String) {
+pub fn notify(app: tauri::AppHandle, title: String, body: String) {
     let _ = app
         .notification()
         .builder()
         .title(title)
         .body(body)
         .show();
+}
+
+/// Back-compat alias for `notify` (the frontend used to only ever
+/// notify on completion, hence the name).
+#[tauri::command]
+pub fn notify_on_complete(app: tauri::AppHandle, title: String, body: String) {
+    notify(app, title, body);
 }
 
 /// Snapshot of the native-messaging host listener, used by the Settings →

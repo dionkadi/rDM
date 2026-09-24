@@ -219,6 +219,24 @@
     if (!$settings) loadSettings();
   });
 
+  // In-app confirmation that a capture arrived. Keyed on the capture
+  // nonce so it fires exactly once per capture instead of on every
+  // re-evaluation of `current` (which would re-toast when the queue
+  // shifts). The *desktop* notification is sent from the store's event
+  // listener instead, because that is the only place that knows whether
+  // the window has focus — and a toast in an unfocused window is not a
+  // notification.
+  let toastedNonce: string | null = null;
+  $: if (current && current.nonce !== toastedNonce) {
+    toastedNonce = current.nonce;
+    showToast({
+      kind: "info",
+      title: "New download ready",
+      message: current.suggestedFilename || current.url,
+      duration: 5000,
+    });
+  }
+
   function onKeydown(e: KeyboardEvent) {
     if (e.key === "Escape") {
       e.preventDefault();

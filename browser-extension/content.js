@@ -46,6 +46,40 @@
 const MEDIA_RE =
   /\.(m3u8|mp4|webm|mkv|mov|flv|avi|ts|m4v|ogg|mp3|m4a|wav|flac|zip|7z|rar|pdf|iso|exe)(\?|#|$)/i;
 
+// Extensions that mean "this network request was media". Wider than
+// MEDIA_RE because it has to cover DASH: `.m4s` segments and `.mpd`
+// manifests are what MSE players (bilibili, and anything similar) fetch,
+// and they are never links the user clicked — so `MEDIA_RE` would never
+// see them.
+//
+// `.ts` is deliberately absent even though MPEG-TS exists: every
+// TypeScript dev server serves `.ts` files, and tagging those as video
+// would be worse than missing an occasional transport stream.
+const RESOURCE_MEDIA_RE =
+  /\.(m3u8|mpd|mp4|m4s|m4v|m4a|webm|mkv|mov|flv|avi|mp3|wav|flac|aac|ogg|opus)(\?|#|$)/i;
+
+// Best-first ordering for what we hand back. Rank 0 (a real video file
+// you can download as-is) beats a manifest, which beats a segment.
+const MEDIA_EXT_RANK = [
+  /\.(mp4|m4v|webm|mkv|mov|flv|avi)(\?|#|$)/i,
+  /\.(m4a|mp3|flac|wav|aac|ogg|opus)(\?|#|$)/i,
+  /\.(m3u8|mpd)(\?|#|$)/i,
+  /\.(m4s|ts)(\?|#|$)/i,
+];
+
+// The grab feeds DM's capture dialog, which asks the user to confirm
+// one URL at a time. A page like bilibili can expose dozens of segment
+// requests, so cap the list and keep the best ones. `captureQueue` in
+// the app is capped at 10, so stay under it.
+const MAX_GRAB_URLS = 8;
+
+function mediaRank(url) {
+  for (let i = 0; i < MEDIA_EXT_RANK.length; i++) {
+    if (MEDIA_EXT_RANK[i].test(url)) return i;
+  }
+  return MEDIA_EXT_RANK.length;
+}
+
 // ─── Mirrored background state ──────────────────────────────────
 //
 // `hostAlive`       — the DM host is reachable right now. Starts
@@ -196,40 +230,134 @@ function onClickCapture(e) {
   }
 }
 
+/**
+ * Find the media on this page.
+ *
+ * Used only by the popup's "Grab page media" button.
+ *
+ * Sources, most trustworthy first. A URL found by several heuristics
+ * keeps its earliest (best) slot:
+ *
+ *   1. `<video>` / `<audio>` / `<source>` — `currentSrc` first, which is
+ *      the URL the element actually resolved and loaded (`src` may be
+ *      relative, or one of several `<source>` candidates).
+ *   2. HLS/DASH hints and `<a>` links that look downloadable.
+ *   3. Open Graph / Twitter card video.
+ *   4. Same-page `<iframe>` srcs, **only if the URL itself looks like
+ *      media**. An iframe pointing at `player.html` is an HTML document;
+ *      handing that to a download manager is how "grab" used to return
+ *      `iframe.html` / `player.html` instead of video. Media fetched
+ *      *inside* a cross-origin iframe is still invisible from here —
+ *      the honest answer for those pages is source 5 or nothing.
+ *   5. Network activity — `performance.getEntriesByType("resource")`.
+ *      This is the one that matters for MSE players: bilibili &co. load
+ *      the stream with `fetch`/XHR into a `<video src="blob:…">`, so the
+ *      DOM only ever shows `blob:` (which is not downloadable) while the
+ *      real `.m4s` / `.mp4` / `.m3u8` URLs are sitting in the resource
+ *      timing buffer. Newest first, because the currently-playing stream
+ *      is the one the user wants.
+ */
 function collectMedia() {
-  const urls = new Set();
-  // Same-origin media.
+  const ordered = [];
+  const seen = new Set();
+  const sources = { player: 0, link: 0, meta: 0, iframe: 0, network: 0 };
+
+  const add = (raw, source) => {
+    if (!raw || typeof raw !== "string") return;
+    const url = raw.trim();
+    // `blob:` (MSE), `data:`, `javascript:` and relative URLs are all
+    // unusable as a download target.
+    if (!/^https?:/i.test(url)) return;
+    if (seen.has(url)) return;
+    seen.add(url);
+    ordered.push(url);
+    sources[source]++;
+  };
+
+  // 1. Media elements.
   document
     .querySelectorAll("video, audio, source, picture source, track")
     .forEach((el) => {
-      const s = el.getAttribute("src");
-      if (s && /^https?:/i.test(s)) urls.add(s);
+      add(el.currentSrc, "player");
+      add(el.getAttribute("src"), "player");
     });
-  // Iframe sources (e.g., embedded players like bilibili's player.html)
-  document.querySelectorAll("iframe[src]").forEach((el) => {
-    const s = el.getAttribute("src");
-    if (s && /^https?:/i.test(s)) urls.add(s);
-  });
-  // Anchor tags that look like downloadable media.
-  document.querySelectorAll("a[href]").forEach((el) => {
-    if (MEDIA_RE.test(el.href)) urls.add(el.href);
-  });
-  // Common HLS / DASH manifest references that don't end in a media
-  // extension.
+
+  // 2. Manifests referenced in any form, then downloadable-looking links.
   document
-    .querySelectorAll('a[href*=".m3u8"], a[href*="manifest"]')
-    .forEach((el) => {
-      if (el.href) urls.add(el.href);
-    });
-  // Open Graph and Twitter card video tags.
+    .querySelectorAll('a[href*=".m3u8"], a[href*=".mpd"], a[href*="manifest"]')
+    .forEach((el) => add(el.href, "link"));
+  document.querySelectorAll("a[href]").forEach((el) => {
+    if (MEDIA_RE.test(el.href)) add(el.href, "link");
+  });
+
+  // 3. Open Graph / Twitter card video.
   document
     .querySelectorAll(
-      'meta[property="og:video"], meta[name="twitter:player:stream"]',
+      'meta[property="og:video"], meta[property="og:video:url"], meta[name="twitter:player:stream"]',
     )
-    .forEach((el) => {
-      const c = el.getAttribute("content");
-      if (c && /^https?:/i.test(c)) urls.add(c);
-    });
+    .forEach((el) => add(el.getAttribute("content"), "meta"));
+
+  // 4. Iframes, filtered — see the doc comment.
+  document.querySelectorAll("iframe[src]").forEach((el) => {
+    const src = el.getAttribute("src");
+    if (src && RESOURCE_MEDIA_RE.test(src)) add(src, "iframe");
+  });
+
+  // 5. Network activity. `performance` is always present in a page
+  //    context, but guard anyway: a grab that throws would look like
+  //    "found nothing".
+  try {
+    const entries =
+      typeof performance !== "undefined" &&
+      typeof performance.getEntriesByType === "function"
+        ? performance.getEntriesByType("resource")
+        : [];
+    // Reverse: the most recent requests are the most likely to be what
+    // the user is watching right now.
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const name = entries[i] && entries[i].name;
+      if (name && RESOURCE_MEDIA_RE.test(name)) add(name, "network");
+    }
+  } catch (_e) {
+    // Nothing to add; the other sources still count.
+  }
+
+  // Rank, then cap. Discovery order is preserved within a rank, so the
+  // first `<video>` beats a later one and the newest network entry beats
+  // an older one.
+  const urls = ordered
+    .map((url, index) => ({ url, index, rank: mediaRank(url) }))
+    .sort((a, b) => a.rank - b.rank || a.index - b.index)
+    .slice(0, MAX_GRAB_URLS)
+    .map((x) => x.url);
+
+  // Say where the URLs came from. Without this, a grab that finds
+  // nothing (or finds segments instead of a single file) is
+  // indistinguishable from a broken button.
+  const total = Object.values(sources).reduce((a, b) => a + b, 0);
+  let note;
+  if (urls.length === 0) {
+    note =
+      total === 0
+        ? "No media found in this page's DOM or network activity. Media " +
+          "loaded inside a cross-origin iframe or fetched by a service " +
+          "worker can't be seen from here."
+        : "Found media, but none of it is a URL a download manager can use.";
+  } else {
+    const parts = [];
+    if (sources.network) parts.push(`${sources.network} from network activity`);
+    if (sources.player) parts.push(`${sources.player} from media elements`);
+    if (sources.link) parts.push(`${sources.link} from links`);
+    if (sources.meta) parts.push(`${sources.meta} from page metadata`);
+    if (sources.iframe) parts.push(`${sources.iframe} from iframes`);
+    note =
+      `${urls.length} media URL(s)` +
+      (parts.length ? ` — ${parts.join(", ")}` : "") +
+      (ordered.length > urls.length
+        ? ` (${ordered.length - urls.length} more not shown)`
+        : "");
+  }
+
   return {
     type: "media",
     pageUrl: location.href,
@@ -238,7 +366,8 @@ function collectMedia() {
     // pre-filled too.
     referer: location.href,
     userAgent: navigator.userAgent,
-    urls: Array.from(urls),
+    urls,
+    note,
   };
 }
 

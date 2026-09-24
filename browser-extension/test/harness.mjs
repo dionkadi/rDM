@@ -511,6 +511,10 @@ export class FakeElement {
     this.title = "";
     this.checked = false;
     this.href = null;
+    // Resolved URL of a media element (see HTMLMediaElement.currentSrc).
+    // Distinct from the `src` attribute: for a `<video>` with a `<source>`
+    // list, or one whose relative src was resolved against the document.
+    this.currentSrc = null;
   }
   get firstChild() {
     return this.children[0] ?? null;
@@ -655,6 +659,20 @@ export function makeClick(href, over = {}) {
   return { anchor, event };
 }
 
+/**
+ * Minimal `performance` stand-in for the content script's network scan
+ * (`getEntriesByType("resource")`), which is how MSE players'
+ * real stream URLs are discovered.
+ */
+export function createPerformanceFake(resourceUrls = []) {
+  return {
+    getEntriesByType(type) {
+      if (type !== "resource") return [];
+      return resourceUrls.map((name) => ({ name, entryType: "resource" }));
+    },
+  };
+}
+
 // ─── Loader ─────────────────────────────────────────────────────
 
 /**
@@ -688,6 +706,7 @@ export function loadExtension(scripts, env) {
   if (env.location !== undefined) sandbox.location = env.location;
   if (env.document !== undefined) sandbox.document = env.document;
   if (env.navigator !== undefined) sandbox.navigator = env.navigator;
+  if (env.performance !== undefined) sandbox.performance = env.performance;
   if (env.browser !== undefined) sandbox.browser = env.browser;
 
   vm.createContext(sandbox);

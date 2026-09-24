@@ -41,6 +41,13 @@ erased with nothing to replace it. Full audit:
   a plain terminal program on port 9158, so the extension's Chromium
   transport can be tested without building or launching the Tauri app.
   Excluded from the workspace; never shipped.
+- **`scripts/check-css-vars.mjs`** — fails the build when a `var(--x)`
+  has no definition and no fallback. CSS custom properties fail
+  *silently* (the whole declaration is dropped at computed-value time),
+  and neither `svelte-check` nor the Vite build looks inside `var()` —
+  which is how the invisible Download button shipped. It strips comments
+  first, so a commented-out definition doesn't count as one. Wired into
+  CI, and used to find the 91 dead declarations above.
 - **`browser-extension/scripts/dev-unpacked.sh`** — builds
   `dist/chrome-unpacked/`, a Chrome-loadable *directory* for "Load
   unpacked" built from your working tree. Editing the repo's `.js` files
@@ -153,6 +160,56 @@ erased with nothing to replace it. Full audit:
   perfectly good socket was open, and schedule yet another connect,
   leaking a connection per click. Each socket's handlers are now bound
   to their own socket.
+
+### Fixed (app)
+
+- **The capture dialog's "Download" button was invisible.** It is
+  `color:#fff` on `background: var(--color-accent)`, and the
+  `--color-accent*` aliases lived under `[data-theme="light"]` only —
+  so dark mode was already falling back to `.btn`'s elevated
+  background, and an unrelated edit that deleted those three lines
+  broke light mode too: white text on a near-white surface, with no
+  error anywhere. The aliases now live in the theme-agnostic `:root`
+  with the rest of the back-compat map (custom properties are
+  substituted at use time, so one definition resolves in both themes).
+  Completing that map uncovered **13 more names nothing defined**
+  (`--surface`, `--border`, `--text-faint`, `--success`, `--danger`,
+  `--warning`, `--info`, …): **91 declarations across the app were
+  silently dead**, costing borders, hover backgrounds and status
+  colours on every screen. All aliased now, and enforced by CI.
+- **A removed download could reappear as a "canceled ghost"** and only
+  disappeared when some later action refreshed the list. Removing a
+  *running* download deleted its SQLite row and emitted `Removed`, and
+  then the in-flight chunk worker — which only notices the cancel flag
+  when it next polls — ran its finalize path, which `save_download`s the
+  row (an UPSERT, so the row really came back, including after a
+  restart) and emitted `StatusChanged(Canceled)`, which the frontend
+  re-inserted because it had already dropped the row. `DownloadControl`
+  now carries a `removed` flag distinct from `cancel`; the aggregator's
+  progress flushes and the finalize path both skip persisting and
+  emitting once it is set, and the frontend additionally ignores events
+  for ids it has removed. The pre-existing test for this never started
+  the download, which is why it passed while the bug lived — the new
+  `remove_while_downloading_leaves_no_ghost_row` integration test removes
+  a task mid-transfer and is now a CI gate.
+- **Nothing told the user a URL had been captured.** The `CaptureDialog`
+  is a modal inside a window the user is almost certainly not looking at
+  (they just clicked a link in their *browser*), so a capture was
+  silent. A capture now raises a desktop notification as well as the
+  in-app toast — the notification is suppressed while the window has
+  focus, so it doesn't duplicate what is already on screen.
+- **"Grab page media" returned the player's HTML instead of video.**
+  Two causes. The `<iframe>` branch added *every* iframe URL with no
+  filter, so `player.html` / `iframe.html` came back as "media"; it now
+  only offers iframes whose URL itself looks like media. And an MSE
+  player never puts the stream in the DOM — bilibili loads it into
+  `<video src="blob:…">` via `fetch` — so the grab now also scans
+  `performance.getEntriesByType("resource")`, which is where the real
+  `.m4s` / `.mp4` / `.m3u8` URLs live. Results are ranked (a
+  downloadable file beats a manifest beats a segment), capped at 8 (the
+  app's capture queue holds 10), deduped, and come with a note saying
+  where they came from — or why nothing usable was found (media inside
+  a cross-origin iframe is not visible from the page).
 
 ### Changed
 

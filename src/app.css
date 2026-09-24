@@ -121,10 +121,6 @@
   --color-info-dim: rgba(45, 95, 218, 0.1);
   --color-info-strong: rgba(45, 95, 218, 0.28);
 
-  --color-accent: var(--color-primary);
-  --color-accent-dim: var(--color-primary-dim);
-  --color-accent-strong: var(--color-primary-strong);
-
   --color-category-video: #b56a00;
   --color-category-audio: #1d8a8a;
   --color-category-archive: #0f8a63;
@@ -225,6 +221,48 @@
   --hair-2: var(--color-border-2);
   --accent: var(--color-primary);
   --accent-2: var(--color-primary-hover);
+  /* ── Incomplete aliases: the invisible-button bug ──────────────
+   *
+   * Components are written against a short-name scheme (`--surface`,
+   * `--border`, `--text-muted`, `--success`, …) that this block was
+   * supposed to map onto the canonical `--color-*` tokens — but the
+   * map only ever covered some of them. Every unaliased name is a
+   * *silent* failure: an undefined custom property makes the whole
+   * declaration invalid at computed-value time, so
+   *
+   *     border: 1px solid var(--border);    → dropped, no border
+   *     color: var(--text-faint);           → dropped, inherits
+   *
+   * and nothing warns. The loudest instance was `.btn.primary`, which
+   * is `color:#fff` on `background: var(--color-accent)`; when the
+   * `--color-accent*` aliases below went missing the button fell back
+   * to the near-white elevated surface and became white-on-white.
+   *
+   * These aliases must live in this theme-agnostic block and must
+   * point at the theme-aware `--color-*` tokens: custom properties are
+   * substituted at *use* time, so a single alias resolves correctly in
+   * both themes. Defining one inside `[data-theme="light"]` (as
+   * `--color-accent` used to be) breaks it in dark mode.
+   *
+   * `scripts/check-css-vars.mjs` now fails the build on any var() with
+   * no definition and no fallback, so this list can't silently rot. */
+  --surface: var(--color-surface);
+  --surface-hover: var(--color-surface-hover);
+  --surface-active: var(--color-surface-active);
+  --border: var(--color-border);
+  --border-strong: var(--color-border-strong);
+  --border-focus: var(--color-border-focus);
+  --text-muted: var(--color-muted);
+  --text-faint: var(--color-faint);
+  --color-text-muted: var(--color-muted);
+  --color-text-faint: var(--color-faint);
+  --success: var(--color-success);
+  --danger: var(--color-danger);
+  --warning: var(--color-warning);
+  --info: var(--color-info);
+  --color-accent: var(--color-primary);
+  --color-accent-dim: var(--color-primary-dim);
+  --color-accent-strong: var(--color-primary-strong);
   --amber: var(--color-warning);
   --rose: var(--color-danger);
   --blue: var(--color-info);
@@ -585,6 +623,9 @@ select {
 .btn-primary:hover {
   box-shadow: 0 16px 34px -14px rgba(122, 240, 200, 0.95);
   transform: translateY(-1px);
+}
+.btn-primary:active {
+  transform: translateY(0);
 }
 .btn-ghost {
   background: var(--surface-hover);

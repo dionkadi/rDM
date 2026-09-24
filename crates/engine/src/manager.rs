@@ -426,10 +426,15 @@ impl DownloadManager {
         let entry = self.inner.tasks.lock().unwrap().remove(id);
         if let Some(e) = entry {
             // Stop the chunk workers without touching the on-disk
-            // row. The `DownloadControl::cancel()` flag is what
-            // `chunk.rs` polls; flipping it is enough to make the
-            // in-flight `run_download()` future unwind.
-            e.state.control.cancel();
+            // row. `DownloadControl::remove()` flips the cancel flag
+            // (which `chunk.rs` polls) *and* the `removed` flag, which
+            // is what tells the worker's finalize path to skip
+            // persisting and emitting: `Storage::save_download` is an
+            // UPSERT, so without that flag the worker would re-insert
+            // the row we are deleting two lines below — and then
+            // publish a `StatusChanged` that resurrects it in the UI as
+            // a "canceled ghost" until the next full refresh.
+            e.state.control.remove();
         }
         if let Err(e) = self.inner.storage.delete_download(id) {
             log::warn!("failed to delete download {id} from storage: {e}");

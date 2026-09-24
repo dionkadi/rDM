@@ -500,16 +500,20 @@ if (grabBtn) {
           `Grab failed: ${(res && res.error) || "no response from the background"}.`,
         );
       } else if (!res.urls) {
-        setNote("warn", "No media found on this page.");
+        setNote("warn", res.note || "No media found on this page.");
       } else if (!res.delivered) {
         setNote(
           "err",
           `Found ${res.urls} media URL(s) but nothing was sent — ${
             res.error || "DM is unreachable"
-          }.`,
+          }.` + (res.note ? ` ${res.note}` : ""),
         );
       } else {
-        setNote("ok", `Sent ${res.urls} media URL(s) to DM.`);
+        setNote(
+          "ok",
+          `Sent ${res.urls} media URL(s) to DM.` +
+            (res.note ? ` ${res.note}` : ""),
+        );
       }
       // Re-read the real state and render it together with the note.
       await refresh();

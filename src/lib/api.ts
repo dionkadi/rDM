@@ -255,8 +255,22 @@ export function importBrowserCookies(
 }
 
 /**
- * Show a desktop notification (used when a download completes).
+ * Show a desktop notification.
+ *
+ * Used for download completion and for a browser capture arriving. A
+ * capture notification exists because the `CaptureDialog` is a modal
+ * inside a window the user is almost certainly not looking at — they
+ * just clicked a link in their browser — so without it the capture is
+ * silent until they happen to switch back.
+ */
+export function notify(title: string, body: string): Promise<void> {
+  return invoke("notify", { title, body });
+}
+
+/**
+ * Show a desktop notification on download completion.
+ * Kept for the existing call site; identical to `notify`.
  */
 export function notify_on_complete(title: string, body: string): Promise<void> {
- return invoke("notify_on_complete", { title, body });
+  return invoke("notify_on_complete", { title, body });
 }

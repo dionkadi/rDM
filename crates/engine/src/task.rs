@@ -391,6 +391,15 @@ pub async fn run_download(ctx: Arc<RunContext>, state: Arc<TaskState>) {
                     ch.downloaded += written;
                 }
             }
+            // The user removed this download while it was running. Keep
+            // draining the channel (so the chunk workers never block on
+            // a full one) but stop touching storage and stop emitting.
+            // `save_download` is an UPSERT, so a flush after `remove()`
+            // would re-insert the very row that was just deleted, and
+            // the row would also come back on the next launch.
+            if agg_state.control.is_removed() {
+                continue;
+            }
             unflushed_bytes = unflushed_bytes.saturating_add(written);
             let now = Instant::now();
             // UI throttle (150 ms) — same as before, do not change.
@@ -419,7 +428,10 @@ pub async fn run_download(ctx: Arc<RunContext>, state: Arc<TaskState>) {
         // Final flush on graceful stream-end so the very last bytes are
         // durable even if the run_download() code path doesn't immediately
         // transition the status (it does, but defence in depth).
-        {
+        //
+        // Skipped when the download was removed mid-flight: see the
+        // `is_removed` check in the loop above.
+        if !agg_state.control.is_removed() {
             let d = agg_state.download.lock().unwrap();
             if let Err(e) = agg_ctx.storage.save_download(&d) {
                 log::warn!("final progress flush failed id={agg_id} err={e}");
@@ -447,6 +459,19 @@ pub async fn run_download(ctx: Arc<RunContext>, state: Arc<TaskState>) {
 
     // ---- 5. Finalize ----
     {
+        // If the user removed this download while we were running, the
+        // row is already gone and there is no status left to publish.
+        // Everything below either writes to storage (`save_download` is
+        // an UPSERT, so it would re-create the deleted row and the ghost
+        // would survive a restart) or emits an event (which the frontend
+        // would re-insert as a "canceled ghost" row). Neither is wanted:
+        // `DownloadManager::remove` has already emitted the only event
+        // this download gets, `Removed`, and the cancel flag below is
+        // what makes the workers unwind — not a reason to report anything.
+        if state.control.is_removed() {
+            ctx.scheduler.release_download_state(&id);
+            return;
+        }
         let mut d = state.download.lock().unwrap();
         if cancelled {
             d.status = DownloadStatus::Canceled;

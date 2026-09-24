@@ -854,6 +854,10 @@ function handleGrab(tabId, sendResponse) {
         urls: urls.length,
         delivered,
         error: delivered ? null : state.lastError || "DM host not reachable",
+        // The content script explains where the URLs came from (or why
+        // it found none) — without it a grab that legitimately finds
+        // nothing is indistinguishable from a broken button.
+        note: (res && res.note) || null,
       });
     });
   } catch (e) {

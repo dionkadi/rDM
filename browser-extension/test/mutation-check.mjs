@@ -138,6 +138,30 @@ const MUTATIONS = [
     test: "test/manifest.test.mjs",
     pattern: "the tooling runs when invoked through a symlinked path",
   },
+  {
+    name: "grab  offer the player's HTML again",
+    file: "content.js",
+    find: '    if (src && RESOURCE_MEDIA_RE.test(src)) add(src, "iframe");',
+    replace: '    if (src) add(src, "iframe");',
+    test: "test/content.test.mjs",
+    pattern: "grab: a bilibili-style page yields the real streams",
+  },
+  {
+    name: "grab  stop scanning network activity",
+    file: "content.js",
+    find: '      if (name && RESOURCE_MEDIA_RE.test(name)) add(name, "network");',
+    replace: '      if (false) add(name, "network");',
+    test: "test/content.test.mjs",
+    pattern: "grab: a bilibili-style page yields the real streams",
+  },
+  {
+    name: "grab  drop the ranking / cap",
+    file: "content.js",
+    find: "    .slice(0, MAX_GRAB_URLS)",
+    replace: "    .slice(0, 999)",
+    test: "test/content.test.mjs",
+    pattern: "grab: results are ranked best-first and capped",
+  },
 ];
 
 const results = [];
