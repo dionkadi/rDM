@@ -21,7 +21,7 @@
 
 import net from "node:net";
 import crypto from "node:crypto";
-import { fileURLToPath } from "node:url";
+import { isMainModule } from "./lib/is-main.mjs";
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -332,9 +332,7 @@ function report(port, verdict) {
   }
 }
 
-const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
-
-if (isMain) {
+if (isMainModule(import.meta.url)) {
   const args = process.argv.slice(2);
   if (args.includes("--self-test")) {
     const ok = await selfTest();

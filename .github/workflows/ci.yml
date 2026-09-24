@@ -156,7 +156,7 @@ jobs:
 
       - name: Syntax-check all JS files
         run: |
-          for f in background.js content.js popup.js; do
+          for f in background.js content.js popup.js scripts/*.mjs scripts/lib/*.mjs test/*.mjs; do
             echo "checking $f"
             node --check "$f"
           done

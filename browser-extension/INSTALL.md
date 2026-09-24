@@ -31,15 +31,26 @@ browser-extension/
 > **Manifest shapes.** The `manifest.json` in the repo is the
 > **Firefox** template (`background.scripts` + `browser_specific_settings.gecko`;
 > `background.service_worker` is rejected by Firefox 109-127). The
-> Chromium `.zip` is not built from it directly — `scripts/package.sh`
-> emits a Chrome-shaped copy with `background.service_worker`, no gecko
-> block, and no `nativeMessaging` permission.
+> Chromium build is not the repo folder — `scripts/package.sh` /
+> `scripts/dev-unpacked.sh` emit a Chrome-shaped copy with
+> `background.service_worker`, no gecko block, and no `nativeMessaging`
+> permission.
 >
-> This matters if you load the extension by hand: pointing Chrome at the
-> repo's `browser-extension/` folder gives you a manifest with no
-> background context at all (Chrome ignores `background.scripts` in MV3),
-> so nothing works and the popup reports "background not reachable".
-> **Always install Chromium builds from the released `.zip`.**
+> This matters because loading the repo folder in Chrome **does not fail
+> loudly**: Chrome ignores `background.scripts` under MV3, so the
+> extension installs with **no background service worker at all** —
+> content scripts inject, the popup opens, and every message answers
+> `Could not establish connection. Receiving end does not exist.`, which
+> looks exactly like "the DM app isn't running". It is not:
+> `node scripts/check-host.mjs` will tell you the app is fine.
+>
+> **Never point "Load unpacked" at the repo folder.** Use the released
+> `.zip`, or the dev build:
+>
+> ```bash
+> cd browser-extension
+> ./scripts/dev-unpacked.sh     # builds dist/chrome-unpacked/ and prints the path
+> ```
 
 ## Chromium browsers — Chrome, Edge, Brave, Arc, Vivaldi, Opera
 
@@ -79,6 +90,25 @@ to install.
 > the old folder, and click **Reload** on the extension card in
 > `chrome://extensions`. Your settings and install-time filter
 > are stored in `chrome.storage.local` and survive the reload.
+
+### Working on the extension itself
+
+Editing `background.js` / `content.js` / `popup.js` in the repo does
+**not** affect an extension you loaded from the `.zip`. Build a loadable
+directory from your working tree instead:
+
+```bash
+cd browser-extension
+./scripts/dev-unpacked.sh
+# ✔ Chrome-unpacked build ready (v0.4.2)
+#   3. "Load unpacked" -> paste: <repo>/browser-extension/dist/chrome-unpacked
+```
+
+Run it again after each edit, then **Reload** on the extension card.
+(`dist/` is gitignored; the script reuses the packaging path, so the dev
+directory is byte-identical to what a user installs and inherits the
+manifest-shape checks — including a hard failure if the staged manifest
+would leave Chrome with no service worker.)
 
 ## Firefox 109+
 
@@ -219,7 +249,7 @@ pointing at the most likely cause.
 | Popup error | What it means | Fix |
 | --- | --- | --- |
 | `disconnected (code 1006)` | Nothing completed a WebSocket handshake on `127.0.0.1:9157` | Run `node browser-extension/scripts/check-host.mjs` — it distinguishes the four causes above. While it's disconnected, media links are left to the browser. |
-| `Could not establish connection. Receiving end does not exist.` | The extension has **no background service worker**, so the popup can't even ask it for status. Almost always: you loaded the repo's `browser-extension/` folder in Chrome | Install the released `dm-grabber-<version>.zip` (see the top of this file), then Reload on `chrome://extensions`. |
+| `Could not establish connection. Receiving end does not exist.` | The extension has **no background service worker**, so the popup can't even ask it for status. Almost always: you loaded the repo's `browser-extension/` folder in Chrome | Load a Chromium build: the released `dm-grabber-<version>.zip`, or `./scripts/dev-unpacked.sh` for a working-tree build. Then Reload on `chrome://extensions`. Note the DM app may be perfectly fine — confirm with `node scripts/check-host.mjs`. |
 | `WebSocket ctor failed` | The browser refused to open a WebSocket at all | Reload the extension. This is *not* caused by `host_permissions` — extension pages aren't gated by host permissions for WebSockets. Check for a restrictive `content_security_policy`. |
 | `connectNative is not a function` (Firefox) | The extension was built without the `nativeMessaging` permission | Install the released `.xpi`, or add `"nativeMessaging"` to `permissions` in the Firefox `manifest.json` and reload. |
 | `No such native application com.app.dm.native` (Firefox) | Firefox couldn't find a valid host manifest for the extension | Confirm `~/.mozilla/native-messaging-hosts/com.app.dm.native.json` exists, is valid JSON, and lists `dm-grabber@dm-project` in `allowed_extensions`. |

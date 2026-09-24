@@ -41,6 +41,21 @@ erased with nothing to replace it. Full audit:
   a plain terminal program on port 9158, so the extension's Chromium
   transport can be tested without building or launching the Tauri app.
   Excluded from the workspace; never shipped.
+- **`browser-extension/scripts/dev-unpacked.sh`** — builds
+  `dist/chrome-unpacked/`, a Chrome-loadable *directory* for "Load
+  unpacked" built from your working tree. Editing the repo's `.js` files
+  does nothing to a `.zip` install, and pointing "Load unpacked" at the
+  repo folder gives Chrome an extension with **no background service
+  worker** (Chrome ignores `background.scripts` under MV3), which
+  presents as `Could not establish connection. Receiving end does not
+  exist.` — indistinguishable from "DM isn't running" unless you have the
+  probe. The script reuses the packaging path, so the dev directory is
+  byte-identical to what users install, and it fails hard if the staged
+  manifest would leave Chrome without a background.
+- **`browser-extension/scripts/make-chrome-manifest.mjs`** — the
+  Firefox→Chromium manifest transform, extracted from `package.sh` so
+  packaging and the dev build share one implementation (and one set of
+  guards) instead of drifting.
 - **Two behaviour switches in the popup** (`dmSettings` in
   `chrome.storage.local`, both default on so nothing changes for an
   existing user): *Take over media link clicks* and *Take over all
@@ -117,6 +132,19 @@ erased with nothing to replace it. Full audit:
   background from a blocked socket from an unreachable host, and the
   host case points at `check-host.mjs` instead of leaving the user to
   guess between "the app is closed" and "the app is too old".
+- **The build tooling could silently do nothing.** Node resolves the
+  entry module to its *real* path for `import.meta.url` but leaves
+  `process.argv[1]` exactly as given, so the usual
+  `import.meta.url === process.argv[1]` main-module check never fires
+  when a script is reached through a symlink — and `pwd`, which
+  `package.sh` uses to compute its own directory, returns the logical
+  path. On a symlinked checkout the manifest transform therefore ran
+  nothing, exited 0, and `zip` shipped the **untransformed Firefox
+  manifest** into the Chromium `.zip`: an extension that installs fine
+  and then does nothing, with `set -e` perfectly happy. Tooling scripts
+  now use `isMainModule()` from `scripts/lib/is-main.mjs`, which compares
+  realpaths, and `test/manifest.test.mjs` invokes both tooling scripts
+  through a symlink so a regression can't pass silently again.
 - **A superseded WebSocket can no longer knock out the live one.** The
   `close` handler nulled the shared `ws` reference unconditionally, so
   the "Test host connection" button — which closes the current socket

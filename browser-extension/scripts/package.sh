@@ -138,36 +138,12 @@ node -e '
 ' "$SRC_MANIFEST" || exit 5
 
 # ── Generate the Chrome-shaped manifest ─────────────────────────────
-# Chrome MV3 strictly rejects `background.scripts` (the error
-# message in the user's chrome://extensions page is literally
-# "'background.scripts' requires manifest version of 2 or lower").
-# We rewrite the staged `manifest.json` for the .zip pass:
-#   * `background.scripts`   -> `background.service_worker: "background.js"`
-#   * `browser_specific_settings.gecko` is removed (Chrome ignores
-#     it but logs a warning; better to omit it entirely).
-#   * `nativeMessaging` is removed — it is only needed by the
-#     Firefox native-messaging transport, and the Chromium path talks
-#     to DM over WebSocket. Keeping it would add a permission warning
-#     to the Chrome install prompt for nothing.
-# The Firefox .xpi uses the source manifest as-is.
+# `make-chrome-manifest.mjs` owns the transform (and its guards) so the
+# .zip and the Load-unpacked dev directory can't drift apart. See that
+# file for why loading the repo's Firefox-shaped manifest in Chrome
+# produces an extension with no background context at all.
 CHROME_MANIFEST="$TMP/manifest.json" # already in the staged tree
-node -e '
-  const fs = require("fs");
-  const f = process.argv[1];
-  const m = JSON.parse(fs.readFileSync(f, "utf8"));
-  // Refuse to overwrite if the source is already Chrome-shaped
-  // (that means the dev flipped it manually and we would silently
-  // emit a Firefox-shaped .xpi with no service-worker).
-  if (m.background?.service_worker) {
-    throw new Error("source manifest is already Chrome-shaped; restore `background.scripts` for the Firefox template");
-  }
-  // Construct the Chrome variant.
-  const out = { ...m };
-  out.background = { service_worker: "background.js" };
-  delete out.browser_specific_settings;
-  out.permissions = (out.permissions || []).filter((p) => p !== "nativeMessaging");
-  fs.writeFileSync(f, JSON.stringify(out, null, 2) + "\n");
-' "$CHROME_MANIFEST" || exit 6
+node "$SCRIPT_DIR/make-chrome-manifest.mjs" "$CHROME_MANIFEST" "$CHROME_MANIFEST" || exit 6
 
 # ── Pack the .zip (Chrome / Edge / Brave / Arc) ─────────────────────
 # The staged `manifest.json` is now Chrome-shaped (service_worker,

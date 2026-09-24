@@ -414,8 +414,8 @@ normal browser behaviour instead of silently eating a download.
 
 ### Verification
 
-* **51 tests + 11 mutations, all green.** `cd browser-extension && node --test test/*.test.mjs && node test/mutation-check.mjs`
-* **`browser-extension/test/` is 51 tests** and `test/mutation-check.mjs` re-introduces each fixed defect (cancel-without-delivery, intercept-without-liveness, drop the fallback, drop `nativeMessaging`, defer the listener, delete a completed file, ignore the opt-out, fake popup success, re-add `stopImmediatePropagation`, let a stale socket clobber the live one, blame the host for a missing background) and **requires the suite to fail on each**. All 11 are caught, which is what makes the suite evidence rather than decoration.
+* **54 tests + 14 mutations, all green.** `cd browser-extension && node --test test/*.test.mjs && node test/mutation-check.mjs`
+* **`browser-extension/test/` is 54 tests** and `test/mutation-check.mjs` re-introduces each fixed defect (cancel-without-delivery, intercept-without-liveness, drop the fallback, drop `nativeMessaging`, defer the listener, delete a completed file, ignore the opt-out, fake popup success, re-add `stopImmediatePropagation`, let a stale socket clobber the live one, blame the host for a missing background, ship a manifest with no service worker, leak `nativeMessaging` into the zip, silently no-op the tooling's main check) and **requires the suite to fail on each**. All 14 are caught, which is what makes the suite evidence rather than decoration.
 * The tests are not mocks-of-the-code: `background.js`, `content.js` and `popup.js` are loaded unmodified through `node:vm` into a *shared* context, so a content-script click really does travel through `chrome.runtime.sendMessage` into the background and back.
 * **No browser was launched.** These are behavioural tests against a faithful fake of the extension APIs; they do not replace a manual pass on real Chrome + Firefox, which is still worth doing for the items in §6.
 * Packaging verified end to end: `./scripts/package.sh 0.4.2` then `scripts/verify-package.sh 0.4.2` — no development files, Chrome-shaped `.zip` (`background.service_worker`, no gecko block, no `nativeMessaging`), Firefox-shaped `.xpi` (`background.scripts`, gecko ID, `nativeMessaging`).
@@ -502,5 +502,44 @@ Still not verified here: whether a *real* Chrome service worker can open
 network access policy). If the probe says `ok` and the popup says
 `WebSocket ctor failed`, that is the remaining candidate — and the popup
 now says so.
+
+### Resolution
+
+Reported back: the probe said **`OK — 127.0.0.1:9157 is a working
+WebSocket server`**, and the popup said **`Could not establish
+connection. Receiving end does not exist.`**
+
+That combination is conclusive, and it is the case the popup's new
+wording exists to name: the app is fine and **the Chrome install has no
+background service worker at all**. The repo's `manifest.json` is the
+Firefox template, Chrome ignores `background.scripts` under MV3, so the
+extension loads — content scripts inject, the popup opens — and nothing
+else runs. It is not a loud failure, which is precisely why it read as
+"DM isn't running" for a whole debugging session while `ss` showed the
+port bound and a handshake succeeding.
+
+So the `ws://`-from-a-service-worker hypothesis is **not** implicated,
+and the correct fix is to install a Chromium build:
+`scripts/dev-unpacked.sh` (working tree) or the released `.zip`.
+
+### A second, self-inflicted instance of the same class
+
+While adding that dev build, the refactor of `package.sh` to call the
+extracted transform introduced a *silent no-op*: the
+`import.meta.url === process.argv[1]` main-module check never fires when
+a script is reached through a symlink, and `pwd` — which `package.sh`
+uses for its own directory — returns the logical path on this symlinked
+checkout. The transform therefore ran nothing, exited 0, and `zip`
+shipped the **untransformed Firefox manifest** into the Chromium `.zip`:
+an artifact that installs and then does nothing, with `set -e` reporting
+success.
+
+Caught by re-running `verify-package.sh` after the change, which is the
+whole reason that script exists. Both tooling scripts now use
+`scripts/lib/is-main.mjs` (realpath comparison), `test/manifest.test.mjs`
+invokes them **through a symlink** so it can't regress silently, and
+three mutations cover it: a manifest shipped without a service worker,
+leaked `nativeMessaging`, and the no-op'd main check.
+
 
 

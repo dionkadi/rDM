@@ -114,6 +114,30 @@ const MUTATIONS = [
     test: "test/integration.test.mjs",
     pattern: "a missing background is not blamed on the DM host",
   },
+  {
+    name: "ship  let a manifest without a service worker reach Chrome",
+    file: "scripts/make-chrome-manifest.mjs",
+    find: '  out.background = { service_worker: "background.js" };',
+    replace: '  out.background = { scripts: ["background.js"] };',
+    test: "test/manifest.test.mjs",
+    pattern: "the Chrome transform produces a loadable Chromium manifest",
+  },
+  {
+    name: "ship  leak the Firefox-only nativeMessaging permission into the zip",
+    file: "scripts/make-chrome-manifest.mjs",
+    find: '  out.permissions = (out.permissions || []).filter((p) => p !== "nativeMessaging");',
+    replace: '  out.permissions = (out.permissions || []).slice();',
+    test: "test/manifest.test.mjs",
+    pattern: "the Chrome transform produces a loadable Chromium manifest",
+  },
+  {
+    name: "tool  silently no-op the main check under a symlinked path",
+    file: "scripts/lib/is-main.mjs",
+    find: "    return fs.realpathSync(entry) === fs.realpathSync(fileURLToPath(metaUrl));",
+    replace: "    return entry === fileURLToPath(metaUrl);",
+    test: "test/manifest.test.mjs",
+    pattern: "the tooling runs when invoked through a symlinked path",
+  },
 ];
 
 const results = [];
