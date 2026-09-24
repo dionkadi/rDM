@@ -71,33 +71,39 @@ DM/
 │   └── native-host/           # Standalone bin: dm-native-host (Chrome native-messaging shim)
 │       └── src/main.rs        # read/write 4-byte-LE-prefixed frames, extract_media_urls, forward_url
 ├── browser-extension/         # MV3 (manifest_version: 3) extension
-│   ├── manifest.json          # Chrome / Edge / Brave / Arc + Firefox 109+ (unified)
-│   │                          #   Chrome treats this as a service worker; Firefox reads
-│   │                          #   `browser_specific_settings.gecko` and runs the
-│   │                          #   `background.scripts` array as a non-persistent event page.
-│   ├── background.js          # MV3 background page → chrome.runtime.connectNative(...)
-│   │                          #   No ESM imports — works in both service-worker (Chrome)
-│   │                          #   and event-page (Firefox) contexts. `chrome.runtime.lastError`
-│   │                          #   is captured in the same tick as `connectNative` (Firefox
-│   │                          #   clears it on the next runtime API call).
+│   ├── manifest.json          # The **Firefox 109+ template** — NOT a unified
+│   │                          #   manifest. `scripts/package.sh` derives the
+│   │                          #   Chromium `.zip` manifest from it. Loading this
+│   │                          #   file directly in Chrome yields no background
+│   │                          #   context at all (see "Manifest shapes" below).
+│   ├── background.js          # MV3 background page. Picks the transport at load:
+│   │                          #   WebSocket ws://127.0.0.1:9157/ for Chromium,
+│   │                          #   chrome.runtime.connectNative for Firefox.
+│   │                          #   No ESM imports — works in both service-worker
+│   │                          #   (Chrome) and event-page (Firefox) contexts.
+│   │                          #   `chrome.runtime.lastError` is captured in the
+│   │                          #   same tick as `connectNative` (Firefox clears it
+│   │                          #   on the next runtime API call).
 │   ├── content.js             # Two responsibilities, both opt-in:
 │   │                          #   (1) capture-phase click interceptor on `<a>` elements
 │   │                          #       matching MEDIA_RE (or with a `download` attribute)
 │   │                          #       — synchronously preventDefault + forward the URL to
-│   │                          #       the background, so Firefox never creates a download
-│   │                          #       row in the first place (no "canceled" entry);
+│   │                          #       the background, so no "canceled" download row is
+│   │                          #       created in the first place. Gated on DM being
+│   │                          #       reachable, on `e.isTrusted`, and on the user's
+│   │                          #       toggle; does NOT stopPropagation, so the page's
+│   │                          #       own handlers keep working;
 │   │                          #   (2) explicit `collect` message handler for the popup's
 │   │                          #       "Grab page media" button. Modifier keys, middle/right
 │   │                          #       click, and non-http(s) URLs bypass the interceptor.
-│   ├── popup.html / popup.js  # "Grab page media" + "Open DM" + "Test host connection" buttons
-│   │                          #   (themed; shows host status + a red error block with the
-│   │                          #   actual `chrome.runtime.lastError.message` and a hint).
-│   ├── com.app.dm.native.json           # Cross-browser host-manifest template (uses both
-│   │                                    #   `allowed_origins` and `allowed_extensions`).
-│   ├── com.app.dm.native.chrome.json    # Chrome-only template (`allowed_origins` only,
-│   │                                    #   no `REPLACE_WITH_…` placeholder leak).
-│   ├── com.app.dm.native.firefox.json   # Firefox-only template (`allowed_extensions` only,
-│   │                                    #   no `chrome-extension://…` URL at all).
+│   ├── popup.html / popup.js  # Host status, the two behaviour switches, "Grab page
+│   │                          #   media" and "Test host connection" buttons (themed;
+│   │                          #   surfaces the actual `chrome.runtime.lastError.message`
+│   │                          #   and a hint, and reports grab results truthfully).
+│   ├── test/                  # Dependency-free regression suite (node:test + a fake
+│   │                          #   chrome.* / DOM / clock). Not shipped. See "Testing"
+│   ├── com.app.dm.native.firefox.json   # Firefox-only host template. `path` is a
+│   │                                    #   placeholder the user must edit.
 │   └── INSTALL.md             # Build + register the native host, per-browser notes
 ├── .pkgconfig-shim/           # *.pc shims for libappindicator3 / ayatana-appindicator3
 ├── build-with-shim.sh         # Wraps `npm run tauri build`; prepends .pkgconfig-shim to PKG_CONFIG_PATH
@@ -157,15 +163,47 @@ A pure-stdio binary (`dm-native-host`) reads Chrome native-messaging frames (4-b
 
 `src-tauri/src/native_host.rs` additionally tracks `NativeHostStatus { bound: AtomicBool, last_event_unix: AtomicU64 }`. The `probe_native_host` Tauri command returns a snapshot; the Settings → Extensions tab polls it every 3s.
 
-The browser extension MV3 background connects via `chrome.runtime.connectNative("com.app.dm.native")` and relays URLs from three sources, in priority order: (1) the content script's **capture-phase click interceptor**, which prevents Firefox/Chrome from creating a download row in the first place; (2) the `chrome.downloads.onCreated` safety net for downloads that bypass the content script (e.g. right-click "Save link as", `<a download>` in cross-origin iframes, programmatic `window.location = url`); (3) the popup's manual "Grab" button. **A single `manifest.json` serves both Chrome/Edge/Brave/Arc and Firefox 109+**: Chrome reads `background.scripts` as a service worker (Chrome 121+); Firefox 109+ reads the same array as a non-persistent event page and uses the `browser_specific_settings.gecko.id = dm-grabber@dm-project` block to fix the extension ID. Firefox's `about:debugging` → "Load Temporary Add-on…" requires `background.scripts` and rejects `background.service_worker` (a transitional state in Firefox 109–127), so the array form is mandatory; `background.service_worker` was removed entirely.
+The browser extension MV3 background relays URLs from three sources, in priority order: (1) the content script's **capture-phase click interceptor**, which prevents the browser from creating a download row in the first place; (2) the `chrome.downloads.onCreated` safety net for downloads that bypass the content script (e.g. right-click "Save link as", `<a download>` in cross-origin iframes, programmatic `window.location = url`); (3) the popup's manual "Grab" button. Unlike the pre-0.4.2 code, **every one of those paths is gated on the URL actually reaching DM** — see "Nothing is taken from the browser unless DM received it" below.
 
-**Chrome extension ID must match `allowed_origins` in the host manifest.** Every Chrome extension installed via "Load unpacked" gets a unique random ID. The native-messaging host manifest at `~/.config/google-chrome/NativeMessagingHosts/com.app.dm.native.json` ships with the literal placeholder `chrome-extension://REPLACE_WITH_YOUR_CHROME_EXTENSION_ID/` — the user **must** copy the actual ID from `chrome://extensions` and replace that string in `allowed_origins` (and re-launch Chrome to pick up the manifest change). If they skip this, Chrome refuses to start the host with `Access to the specified native messaging host is blocked`, the badge turns red, the popup shows `Native host not running`, and downloads silently never arrive. INSTALL.md calls this out explicitly but it is the most common install failure. Firefox is fine — the host manifest's `allowed_extensions` already contains the fixed `dm-grabber@dm-project` Gecko ID.
+**Transport selection.** Chromium browsers use a WebSocket to the app's `127.0.0.1:9157` listener; Firefox uses `chrome.runtime.connectNative("com.app.dm.native")` because Firefox upgrades insecure `ws://` to `wss://` and silently fails. Both carry the same payload `{"url"|"urls", "type", "referer", "userAgent"}`.
+
+**Manifest shapes — the source manifest is the Firefox template.** `browser-extension/manifest.json` declares `background.scripts` (an array) and a `browser_specific_settings.gecko` block, because Firefox 109–127 rejects `background.service_worker`. `scripts/package.sh` / `package.ps1` derive the Chromium variant at package time: `background.service_worker: "background.js"`, no gecko block, and `nativeMessaging` stripped.
+
+Do **not** assume Chrome reads `background.scripts` as a service worker — it does not. Before Chrome 121 a Manifest V3 extension declaring `background.scripts` is **refused at load**; from Chrome 121 the key is **ignored**, and since the source manifest declares no `background.service_worker`, loading the repo directory unpacked in Chrome produces **no background context at all** (the popup reports "background not reachable" and nothing works). Chromium builds must come from the released `.zip`. `scripts/verify-package.sh` asserts both manifest shapes.
+
+**The Firefox path needs the `nativeMessaging` permission.** Without it, `chrome.runtime.connectNative` is not a function, the native transport can never connect, and — because the content script used to intercept unconditionally — the only visible symptom was "media links stop working". `manifest.json` declares it; the Chromium `.zip` must not (the WebSocket path doesn't need it, and an unnecessary permission enlarges the install prompt). `test/manifest.test.mjs` derives the required permission set from the source and fails if the manifest disagrees in either direction.
+
+**No Chrome extension ID to copy any more.** Chromium talks to DM over WebSocket, so there is no `allowed_origins` host manifest to register and no `REPLACE_WITH_YOUR_CHROME_EXTENSION_ID` placeholder to substitute. Only the Firefox host manifest exists (`com.app.dm.native.firefox.json`, `allowed_extensions: ["dm-grabber@dm-project"]`), and its `path` ships as a placeholder the user must point at the built `dm-native-host` binary. (The `com.app.dm.native.json` / `com.app.dm.native.chrome.json` templates were deleted in 0.4.2 — if you find a doc or README pointing at them, the doc is stale.)
 
 **The native host is a dumb pipe; don't filter URLs by file extension.** The Rust `dm-native-host` binary used to accept only `MEDIA_EXTS` (`.mp4`, `.webm`, `.mkv`, ...) and HLS/DASH manifests, silently dropping everything else — including `.zip`, `.pdf`, `.iso`, `.exe` that the content script finds on a download page. The user would see "I clicked save-as, nothing happened" with no diagnostic. The host now uses a permissive `looks_like_downloadable_url` (must be `http(s)://`, must not be `javascript:` / `data:` / `about:`, must have a non-trivial path) and forwards **every** http(s) URL the extension captures. The Tauri engine's `add_download` is the right place to reject unsupported schemes / 4xx / 5xx — the user gets a real error message there, not a silent drop.
 
 **Content script is opt-in only — no auto-scrape on every page.** The previous version of `content.js` ran `collectMedia()` once on `document_idle` AND kept a `MutationObserver` that re-scanned every 2 s. Every page the user visited (and every DOM change on that page) auto-sent media URLs to DM. The result: opening YouTube, Twitch, a news site with embedded video, or any re-rendering single-page app flooded DM with queued downloads the user never asked for. The current version responds to the `collect` message only — the popup's **Grab page media** button is the *only* trigger. The auto-scrape path is intentionally removed; if a future version wants to add it back, gate it on a user-controlled "auto-grab" preference stored in `chrome.storage.sync`.
 
-**`chrome.downloads.onCreated` is filtered by install time.** Chrome re-fires `onCreated` for downloads that were already in the user's history at the moment the extension was installed (a documented re-fire to help extensions catch up after a crash). For a download manager, that turns "I just installed DM Grabber" into "DM is now clogged with 200 old downloads I never asked for". The service worker records the install time in `chrome.storage.local` (key `dmInstallTime`) on the very first `onInstalled({reason: "install"})` event and only on that event — updates do **not** reset the timestamp, so the filter continues to ignore pre-update downloads. The filter drops any `DownloadItem` whose `startTime` is missing, unparseable, or before `installTimeMs`. **`onCreated` is registered only after `loadInstallTime()` resolves** (the boot sequence is `loadInstallTime().then(registerDownloadsListener).then(connect)`), so there is no race where a download fires before the filter is armed. `chrome.storage.local` survives service-worker restarts and extension reloads; clearing it manually falls back to `Date.now()` at boot.
+**`chrome.downloads.onCreated` is filtered by install time — and the listener must be registered synchronously.** Chrome re-fires `onCreated` for downloads that were already in the user's history at the moment the extension was installed (a documented re-fire to help extensions catch up after a crash). For a download manager, that turns "I just installed DM Grabber" into "DM is now clogged with 200 old downloads I never asked for". The service worker records the install time in `chrome.storage.local` (key `dmInstallTime`) on the very first `onInstalled({reason: "install"})` event and only on that event — updates do **not** reset the timestamp, so the filter continues to ignore pre-update downloads. The filter drops any `DownloadItem` whose `startTime` is missing, unparseable, or before `installTimeMs`.
+
+Two things about that filter are easy to get wrong:
+
+* **The listener is registered at the top level, synchronously.** MV3 requires it: a listener added after an `await` misses the event that woke the worker, and the browser may then stop waking it for that event type at all. The old code deferred registration until `loadInstallTime()` resolved, which is why the safety net was unreliable after a service-worker restart.
+* **`state.installTimeMs` uses `0` to mean "not read yet", and nothing is forwarded while it is 0.** A service worker is routinely woken *by* the download event in question, so `Date.now()` taken at boot is always slightly *later* than that download's `startTime` — using the boot time as a stand-in silently drops legitimate downloads. The handler instead `await`s `loadInstallTime()` and then judges, so a download that woke a cold worker is still forwarded. Don't "simplify" this back to a boot-time default.
+
+**Nothing is taken from the browser unless DM received it.** This is the invariant the whole interception design exists to enforce, and it is what `browser-extension/test/` pins down:
+
+* `onCreated` forwards **first** and only calls `takeOverChromeDownload()` when `send()` returned `true`. Cancelling unconditionally (the 0.4.2 behaviour) destroyed downloads the user had already started whenever DM was down.
+* A click the background can't deliver is handed back with `chrome.downloads.download()`; the resulting `onCreated` is suppressed through an `ignoredUrls` map so the fallback can't ping-pong. Fallback filenames go through `safeFilename()` first — `downloads.download` throws on an invalid name, and throwing there would lose the download we were trying to rescue.
+* The content script caches host liveness (pushed by `broadcastState()` on every transition) and refuses to intercept when DM is unreachable or when the extension runtime was invalidated by a reload. It fails **open**: if in doubt, the browser does the download.
+* When the browser's copy *is* cancelled, the file is removed with `downloads.removeFile()` **only if the item is not `complete`** — a finished file is real data. Note `downloads.erase()` alone never deletes bytes, so without `removeFile` the truncated partial lingers as an orphan.
+
+The popup exposes two `chrome.storage.local` switches (`dmSettings`), both defaulting to on so existing behaviour is unchanged: `interceptOnClick` (media-link clicks) and `takeoverBrowserDownloads` (everything the browser starts on its own). A download manager that silently hijacks every download in a browser profile with no way to opt out is a bug, not a feature.
+
+**Testing.** `browser-extension/test/` runs on `node:test` with **no dependencies** (CI's extension job never runs `npm install`). `test/harness.mjs` builds a fake `chrome.*`, a controllable clock, a minimal DOM and a fake `WebSocket`, then loads the real `background.js` / `content.js` / `popup.js` through `node:vm` into a *shared* context so messages genuinely travel between them. Run it with:
+
+```bash
+cd browser-extension
+node --test test/*.test.mjs          # the regression suite (48 tests)
+node test/mutation-check.mjs         # re-introduces each fixed bug; every one must be caught
+```
+
+`mutation-check.mjs` deliberately rewrites the sources (and restores them in a `finally`), so it is not named `*.test.mjs` and isn't picked up by the normal run. **If you fix a bug here, add a test and a mutation for it** — a regression test that can't fail is decoration.
 
 **The `media` message type is a hard boundary, not a soft one.** The previous content-script auto-scrape path used to send `{type: "media", urls: [...]}` on every page load / DOM mutation, which flooded DM. The content script no longer auto-sends, and the background's `onMessage` handler now **drops `type === "media"` on the floor** — even if a stale cached content script (or a third-party script) tries to send it, the background refuses. Only `type === "grab"` (the popup button's explicit ask) is accepted. This is a deliberate, documented boundary so the next refactor can't accidentally re-enable passive capture by leaving a "harmless" `media` branch in the handler.
 
@@ -271,4 +309,6 @@ ls target/release/dm-tauri     # ~23 MB stripped, dynamically linked to webkit2g
 - Tray/indicator build failures on Linux → check `.pkgconfig-shim/` and confirm you're running `./build-with-shim.sh`.
 - Dropdown menu "following the wrong row" / "two-position jump" → likely a stale `transform` on the row/actions container or a missed `DropdownMenu` reset; see the `DropdownMenu positioning` section above.
 - Tests failing on connection caps → scheduler tests use `tokio::time::timeout(100ms, ...)` to assert blocked acquires; do not increase the timeout without understanding the test intent.
-- Browser extension: native host not connecting → confirm the bundled `com.app.dm.native.json` path points to the release binary, and that the `127.0.0.1:9157` TCP listener in the app is up (Settings → Extensions tab shows the live `bound` + `last_event_unix` from `NativeHostStatus`).
+- Browser extension: native host not connecting → first check the popup: it prints the real `chrome.runtime.lastError.message`, and `connectNative is not a function` means the `nativeMessaging` permission is missing from the Firefox manifest. Otherwise confirm the Firefox host manifest's `path` points at the release binary (the shipped template is a placeholder) and that the `127.0.0.1:9157` TCP listener in the app is up (Settings → Extensions tab shows the live `bound` + `last_event_unix` from `NativeHostStatus`).
+- Browser extension: media links suddenly do nothing in Firefox → the `nativeMessaging` permission was dropped from the manifest (it was, in 0.4.2, for a whole release). The transport can't connect *and* the link was already `preventDefault()`ed. `node --test browser-extension/test/*.test.mjs` catches this in one second.
+- Browser extension: a download vanished and `chrome://downloads` has no trace → that is the "cancelled a browser download DM never received" bug. `handleCreatedDownload` must not call `takeOverChromeDownload()` unless `send()` returned true; the mutation `P0-3` in `test/mutation-check.mjs` reproduces it.

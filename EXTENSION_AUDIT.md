@@ -1,0 +1,428 @@
+# Browser Extension Audit — `browser-extension/`
+
+**Scope:** `manifest.json`, `background.js`, `content.js`, `popup.js`, the packaged
+artifacts in `dist/`, and the app-side counterpart (`src-tauri/src/native_host.rs`,
+`src-tauri/src/ws.rs`, `crates/native-host/src/main.rs`).
+**Method:** static read of every file + manifest validation + `node --check` +
+artifact inspection + cross-check against MDN/Chrome docs. No live browser run.
+**Trigger for the audit:** *"if the host dies, it should not intercept downloads
+from the browser."*
+
+> **Status: fixed.** Every item below has been addressed, and each fix has a
+> test that fails if the fix is removed — see §7 for the change list, the
+> verification, and the two things deliberately left alone.
+
+---
+
+## 1. Verdict
+
+The extension has **two independent interception paths, and neither one is gated
+on the host being alive.** Interception is unconditional; only *delivery* is
+conditional. So when the DM app is not running (or, on Firefox, when it never can
+be reached), the browser's own download is suppressed and nothing replaces it.
+
+The exact failure the audit was asked about is **real and reproducible by design**,
+in three separate places:
+
+| Path | Host up | Host down |
+| --- | --- | --- |
+| Left-click a `.zip` / `.pdf` / `.mp4` link | URL → DM ✅ | **link does nothing, silently** ❌ |
+| Ctrl/Cmd-click, middle-click, right-click "Save link as" | URL → DM, Chrome copy cancelled | **Chrome download cancelled mid-flight, DM never gets it** ❌❌ |
+| Firefox, any of the above | n/a | **nothing ever works** (see P0-1) ❌❌❌ |
+
+The second row is the worst: it is silent, it destroys a download the user has
+already started, and it fires on gestures the code's own comments promise are
+left alone.
+
+---
+
+## 2. Architecture as built
+
+```
+                       ┌───────────── content.js ─────────────┐
+ user left-clicks  ──▶ │ capture-phase click listener on      │
+ an <a> that matches   │ documentElement (http/https only)    │
+ MEDIA_RE or has       │  → preventDefault() + stopImmediate… │
+ `download`            │  → sendMessage("download-click")     │
+                       └──────────────┬───────────────────────┘
+                                      │
+ non-intercepted gestures             │
+ (Ctrl/Cmd, middle, right-click,      │
+  programmatic navigations)           ▼
+        │                  ┌─────── background.js ────────┐
+        └──── chrome ──▶   │ onMessage → send(payload)     │
+             .downloads   │                              │
+             .onCreated ──▶│ onCreated → send()           │
+                          │   + takeOverChromeDownload()  │
+                          └──────────┬───────────────────┘
+                                     │
+                    ┌────────────────┴─────────────────┐
+                    ▼                                  ▼
+        WebSocket ws://127.0.0.1:9157/      native messaging
+        (Chromium, 64-entry in-mem queue)   com.app.dm.native (Firefox)
+                    │                                  │
+                    ▼                                  ▼
+        Tauri: src-tauri/src/ws.rs          crates/native-host (stdio JSON)
+                    └──────────┬───────────────────────┘
+                               ▼
+              native_host.rs → Captured event → CaptureDialog
+```
+
+Transport choice is made once at SW load (`background.js:327-331`): Firefox →
+native messaging, everyone else → WebSocket. `send()` returns `true`/`false`,
+but **every call site discards it** (`background.js:430`, `:525`, `:543`).
+
+---
+
+## 3. Findings
+
+### P0-1 — Firefox can never connect: `nativeMessaging` permission is missing, but interception still happens
+
+* `manifest.json:24-30` declares `downloads, tabs, activeTab, scripting, storage`.
+  There is **no `nativeMessaging`**.
+* `CHANGELOG.md:127` shows this was deliberate: *"`browser-extension/manifest.json`
+  — drop `nativeMessaging` from `permissions`"* — a side effect of adding the
+  WebSocket transport. But `makeNativeTransport()` was explicitly **kept** for
+  Firefox, and it calls `chrome.runtime.connectNative` (`background.js:234`).
+* MDN is explicit: *"The extension must request the `nativeMessaging` permission
+  … in the `manifest.json`"*, and documents the failure mode verbatim under
+  Troubleshooting: `TypeError: browser.runtime.connectNative is not a function` →
+  *"Check that the extension has the `nativeMessaging` permission."*
+
+**Effect:** on the Firefox path, `connect()` throws inside the `try`
+(`background.js:233-238`), `setState(false, …)` runs, and `send()` returns `false`
+**forever**. The badge goes red, but `content.js:76` has already called
+`preventDefault()` on every media link. Firefox users get an extension whose only
+observable behaviour is "media links stop working". This is worse than not having
+the extension installed.
+
+**Fix:** add `"nativeMessaging"` to `permissions` in the Firefox template. The
+Chrome-shaped zip is generated by `package.sh` (`:139-168`) and can keep dropping
+it.
+
+---
+
+### P0-2 — Click interception has no host-liveness gate, and there is no fallback
+
+* `shouldIntercept()` (`content.js:53-63`) inspects only the event and the anchor.
+  It never asks whether a transport is reachable.
+* `onClickCapture()` (`content.js:65-113`) then unconditionally runs
+  `preventDefault()` + `stopPropagation()` + `stopImmediatePropagation()`
+  (`content.js:76-78`) **before** the async `sendMessage` (`content.js:84-104`).
+* The comment at `content.js:79-83` states this reasoning: *"the click has already
+  been suppressed and the browser will not start a download regardless of when
+  (or whether) the message arrives."* That is precisely the problem.
+* `background.js:528-541` → `send()` → the WebSocket transport's `send()`
+  (`background.js:166-186`) queues the payload when the socket isn't `OPEN` and
+  **returns `false`**. Nobody reads it.
+
+**Effect when DM is not running:** no download, no error, no badge change, no
+console line. The user clicks and nothing happens. The URL sits in the in-memory
+64-entry queue and is **replayed whenever DM next starts** — a burst of stale
+`CaptureDialog` modals for clicks the user has long forgotten. There is no TTL and
+the queue dies with the service worker, so the 64 entries are neither durable nor
+bounded in time.
+
+**Fix:** see §5.
+
+---
+
+### P0-3 — `chrome.downloads.onCreated` cancels the browser's download even when the forward failed
+
+* `background.js:419-444`: the handler calls `send({…})` (`:430`) and discards the
+  result, then unconditionally calls `takeOverChromeDownload(item)` (`:441-443`).
+* `takeOverChromeDownload()` (`background.js:464-495`) calls
+  `chrome.downloads.cancel(id)` and then `chrome.downloads.erase(...)`.
+
+This path is reached by **every download the content script did not intercept**:
+Ctrl/Cmd-click, middle-click, right-click → **"Save link as"** (where the user
+explicitly chose a destination path), programmatic `window.location = url`,
+downloads started by other extensions, "save image/PDF as", etc.
+
+**Effect when DM is down:** Chrome's download is cancelled mid-transfer, the entry
+is erased from `chrome://downloads`, the URL only reaches the extension's volatile
+queue — and the user's download is simply gone. No message anywhere.
+
+**Secondary bug — it contradicts its own documentation.** `content.js:11-16`
+promises: *"Modifier keys (Ctrl, Cmd, Shift, Alt, Meta), middle-click, and
+right-click are NOT intercepted — those should keep the browser's normal 'open in
+new tab' / 'save as' behaviour."* The `onCreated` listener overrides exactly that
+promise. The code that describes the extension's behaviour and the code that
+implements it disagree.
+
+**Fix:** `if (!send(...)) return;` before the takeover — two lines, removes the
+data-loss case entirely. See §5 for a stricter policy.
+
+---
+
+### P1-4 — `chrome.downloads.onCreated` is registered after an `await` (MV3 contract violation)
+
+```js
+loadInstallTime().then(registerDownloadsListener).then(connect);   // background.js:633
+chrome.runtime.onStartup.addListener(async () => {
+  await loadInstallTime(); registerDownloadsListener(); connect(); // :619-623
+});
+```
+
+MV3 requires event listeners to be registered **synchronously at the top level** of
+the service worker. A listener added after an `await` (here, after
+`chrome.storage.local.get`) misses the event that woke the worker — and because the
+worker's first event produces no matching synchronous listener, Chrome may stop
+waking it for that event type altogether.
+
+**Effect:** the "safety net" path is reliable only while the SW happens to be warm;
+after the ~30 s idle termination it degrades silently. `installTimeMs` survives in
+`chrome.storage.local`, so the fix is easy: register the listener at top level and
+do the install-time comparison inside the handler.
+
+---
+
+### P1-5 — Download takeover is global, permanent, and non-consensual
+
+`shouldForwardDownload()` (`background.js:396-405`) filters on exactly one thing:
+`startTime >= installTimeMs`. There is no allowlist, no per-site control, no
+popup toggle, and no modifier-key escape hatch. After a single install, **every
+download created anywhere in that browser profile, forever, is hijacked and
+cancelled.** The conservative design intent in the comments ("a download manager
+must not be a passive capture-everything tap", `content.js:22-26`) applies to the
+content script but never made it into the downloads path.
+
+Related: the comment at `background.js:458-462` says `removeFromDisk: false` is
+used so that *"we don't want the user to see 'this file is 879 B' in their
+Downloads folder."* As written, the partial file **is** left on disk: the
+documented `downloads.erase()` erases history only, and removing the file requires
+`downloads.removeFile()`. (Whether the undocumented `removeFromDisk` field is
+honoured is unverified — see §6.) Chrome's truncated partial is likely orphaned in
+the downloads folder, which is the opposite of the stated intent. **Worth verifying
+on a real profile.**
+
+---
+
+### P1-6 — The popup lies to the user at the worst possible moment
+
+```js
+chrome.runtime.sendMessage({ type: "grab", tabId: tab.id }, () => {
+  setStatus({ connected: true, lastSentAt: Date.now(), lastSentCount: 1 });  // popup.js:320-326
+});
+```
+
+The "Grab page media" button hardcodes success: it ignores `chrome.runtime.lastError`
+**and** the background's actual result, then renders "✓ Native host connected (port
+9157). Sent 1 request (last: 0s ago)" — overwriting the honest status the poller had
+just fetched. So the one surface that could tell the user the host is down reports
+the opposite, exactly when they try to use it.
+
+Also `background.js:522-527` (`grab`) never reads `chrome.runtime.lastError` after
+`chrome.tabs.sendMessage` → "Unchecked runtime.lastError" noise, and a silent no-op
+when the content script isn't present (restricted page, or a tab loaded before
+install).
+
+---
+
+### P2-7 — The interceptor hijacks page behaviour, not just downloads
+
+The listener sits on `documentElement` in the capture phase and calls
+`stopImmediatePropagation()`. For any anchor matching `MEDIA_RE` — which includes
+`pdf`, `zip`, `exe`, `iso`, `mp3`, `m4a`, `m3u8`, … — it therefore kills:
+
+* the page's own click handlers (login-gated download flows, paywall redirects,
+  analytics, SPA routers, viewer overlays), and
+* all ancestor capture handlers.
+
+Because `pdf` is in the list, **clicking essentially any PDF link on any site now
+diverts to DM's `CaptureDialog`** instead of the browser — a very broad behaviour
+change for a tool whose stated intent is to stay narrow.
+
+The non-http(s) guard (`content.js:164-183`) is correct and the reasoning behind it
+is sound — that part is well done. (`all_frames` is absent, so iframes are not
+covered; that is a deliberate-looking trade-off, not a bug.)
+
+---
+
+### P2-8 — Manifest hygiene and stale documentation
+
+| Issue | Detail |
+| --- | --- |
+| Unused permission | `scripting` is declared but never used — 0 references to `chrome.scripting` in all three JS files. |
+| Redundant permission | `activeTab` adds nothing on top of `tabs` + `<all_urls>` content scripts. |
+| Unneeded exposure | `web_accessible_resources` exposes `popup.html`/`popup.js` to `<all_urls>` (`manifest.json:51-61`). The popup is opened by the browser and never needs to be web-accessible; as shipped it lets **any site fingerprint that DM Grabber is installed**. |
+| Inert entry | `host_permissions: ws://127.0.0.1:9157/*` does not gate extension-page WebSockets (the real gate is `connect-src` CSP, which MV3 leaves unset). Harmless, but `INSTALL.md:139` tells users a missing entry causes `WebSocket ctor failed` — wrong mechanism. |
+| Wrong doc claim | `AGENTS.md:160` and the `background.js` header comment claim *"Chrome reads `background.scripts` as a service worker"*. False: MDN — Chrome **refuses to load** an MV3 extension with `background.scripts` before Chrome 121, and **ignores** the key from Chrome 121 onwards. Since the source manifest declares no `background.service_worker`, loading `browser-extension/` unpacked in Chrome yields **no background context at all**. |
+| Good news | The released `.zip` is correct — `package.sh:139-168` rewrites `background.scripts` → `background.service_worker: "background.js"` and strips the gecko block; `verify-package.sh` asserts the Chrome shape. Artifact inspection confirms it. So **the packaged flow works; the source-directory / dev workflow does not**, and the docs do not say so. |
+| Stale docs | `INSTALL.md:16` still calls the source manifest a "unified" Chrome+Firefox manifest. `AGENTS.md:95-97, 162` and `README.md:189-192` reference `com.app.dm.native.json` / `com.app.dm.native.chrome.json` and a `REPLACE_WITH_YOUR_CHROME_EXTENSION_ID` placeholder — all three were **deleted in 0.4.2** (`CHANGELOG.md:150-155`). |
+| Committed local path | `com.app.dm.native.firefox.json` shipped `"path": "/home/tomg/Other/Codes/Projects/DM/target/release/dm-native-host"` — one developer's absolute path. (Correction: this *is* the canonical path on this machine; `/home/tomg/Codes/Projects/DM` is a symlink to `/home/tomg/Other/Codes/Projects/DM`, so the path was not stale. It is still machine-specific, and a user who copies the template without editing it gets an opaque `Specified native messaging host not found.`) |
+
+---
+
+### P2-9 — Smaller correctness notes
+
+* **`probeHost()` double-resolve** (`background.js:355-380`): the 1.5 s safety-net
+  timer is never cleared, so a late `resolve` can win and the popup can render a
+  stale result.
+* **Native transport never calls back** (`background.js:303-318`): only the
+  WebSocket transport invokes `onConnected` (in the `open` handler, `:133-137`).
+  On Firefox "Test host connection" therefore always burns the full 1.5 s.
+* **`chrome.runtime.lastError` check on the Firefox-only path** (`:249-258`) is a
+  Chrome-ism applied where it cannot help.
+* **Queue is not durability.** The 64-entry queue is in-memory and dies with the
+  service worker (see P1-4); with no TTL, "queued" means "delivered later, or
+  never, or much later and out of context".
+* **`send()` semantics.** The `true` from the WS transport means "handed to an open
+  socket", not "delivered". That is fine — and it is exactly the right signal to
+  gate on.
+
+---
+
+## 4. "Host down" behaviour matrix (what the code actually does)
+
+| # | Action | Host up | Host down |
+| --- | --- | --- | --- |
+| 1 | Left-click `.zip`/`.pdf`/`.mp4` link | `preventDefault` → WS → DM dialog | `preventDefault` → queued → **dead link, no feedback** |
+| 2 | Ctrl/Cmd-click (open in new tab) | tab download cancelled, URL → DM | **download cancelled, URL queued, lost** |
+| 3 | Right-click → Save link as | user's chosen save cancelled, URL → DM | **user's save cancelled and lost** |
+| 4 | Middle-click | as #2 | as #2 |
+| 5 | Any other extension's download | cancelled, forwarded | **cancelled and lost** |
+| 6 | Popup "Grab page media" | works | **reports "✓ connected"** (P1-6) |
+| 7 | Popup status pill | ✓ green | ✗ red (honest) — the only honest surface |
+| 8 | Firefox, anything | n/a — cannot connect | **all of the above, permanently** (P0-1) |
+
+Rows 2–5 are reached through `chrome.downloads.onCreated`, i.e. the "safety net"
+is the most destructive path in the extension.
+
+---
+
+## 5. Recommended fix design
+
+The requirement — *"if the host dies, it should not intercept downloads from the
+browser"* — decomposes into a **gate** (don't take over what you can't deliver) and
+a **fallback** (if you already took over, give it back).
+
+### A. Gate the downloads path (2 lines, removes the data-loss case)
+
+```js
+// background.js — onCreated handler
+const delivered = send({ type: "download", url: item.url, filename: item.filename });
+if (!delivered) return;                  // host down → leave the browser's download alone
+if (item.id != null) takeOverChromeDownload(item);
+```
+
+Then tighten the policy so the takeover is opt-in rather than "everything after
+install time": require an explicit setting, and honour the modifier keys the
+content script already promises to respect.
+
+### B. Make the click path never able to swallow a download
+
+`preventDefault()` cannot be undone, so guarantee delivery-or-fallback instead.
+Two layers:
+
+1. **Cache host liveness in the content script.** The background pushes state
+   transitions (`connected` / `disconnected`) to all tabs; the content script keeps
+   a boolean and, when `false`, **returns without calling `preventDefault()`** — the
+   browser downloads normally. This covers the common case (DM simply isn't
+   running) with zero async in the click path.
+2. **Fallback for the race** (host died between the last push and the click). If the
+   background cannot deliver a `download-click`, it performs
+   `chrome.downloads.download({ url, filename })` itself — handing the request back
+   to the browser rather than dropping it. Guard the resulting `onCreated` against a
+   re-forward loop (ignore-set keyed by download id, or the URL within a short
+   window).
+
+This preserves the property the current design was reaching for — *no phantom
+"canceled" row in the browser download list when DM is up* — while making "URL is
+lost" impossible when DM is down. Plus: set the badge and log to the console on
+every fallback, so the degradation is visible rather than silent.
+
+### C. Correctness and hygiene
+
+* Add `nativeMessaging` to the Firefox permissions (P0-1).
+* Register `chrome.downloads.onCreated` synchronously at the top level (P1-4).
+* Add a TTL to the queue (e.g. drop payloads older than ~30 s) and clear it on boot.
+* Only call `takeOverChromeDownload` for downloads that actually look like captures,
+  and fix or document the `removeFromDisk` / orphan-partial behaviour (P1-5).
+* Make the popup's grab button report the real result (P1-6).
+* Drop `scripting`, `activeTab`, and the `web_accessible_resources` block (P2-8).
+* Fix `AGENTS.md` / `README.md` / `INSTALL.md` (deleted host manifests, the
+  `background.scripts` claim, "unified manifest"), and replace the committed
+  absolute path in the Firefox host template with a placeholder.
+* Decide the interception posture deliberately: narrow the extension list or invert
+  the modifier convention, so a plain PDF click is not silently diverted (P2-7).
+
+---
+
+## 6. Verification status
+
+**Verified directly**
+
+* All three JS files pass `node --check`.
+* `manifest.json`, the shipped `.zip`, and the shipped `.xpi` were parsed and
+  compared; the zip is Chrome-shaped (`background.service_worker`, no gecko block),
+  the xpi is Firefox-shaped (`background.scripts` + `gecko.id`).
+* Every `chrome.*` call site was enumerated; the unused `scripting` permission is
+  confirmed by zero references, not by inference.
+* `src-tauri/src/ws.rs` implements a correct RFC 6455 accept key (SHA-1) and carries
+  a real-listener round-trip test, so the Chromium server side is credible.
+* MDN citations: native-messaging permission requirement and its exact
+  `TypeError: browser.runtime.connectNative is not a function` failure mode;
+  MV3 `background.scripts` handling in Chrome (rejected before 121, ignored from 121).
+
+**Not verified — needs a live browser + DM app (`⚠️` in the text above)**
+
+* The `removeFromDisk` field on `downloads.erase()` (undocumented for
+  `DownloadQuery` in the MDN reference) — whether `erase` deletes the partial file.
+* Exact Chrome behaviour when an MV3 manifest declares only `background.scripts`:
+  *expected* "no background context at all" from Chrome 121. 30-second check —
+  load `browser-extension/` unpacked in Chrome and look for a service worker in
+  `chrome://extensions` → "service worker" / "Inspect views".
+* Whether Firefox really upgrades `ws://127.0.0.1` to `wss://` for extension pages
+  (the stated rationale for keeping the native path) — inherited assumption, not
+  re-derived here.
+* End-to-end delivery timing, and whether Chrome's MV3 SW stays alive across a
+  WebSocket idle window in this build.
+
+---
+
+## 7. Fixes applied — and how each one is verified
+
+Every P0 and P1 above, plus the P2 items that were cheap and clearly
+right, are fixed in the same commit as this document. Nothing here rests
+on "it looks correct now": each fix has a test that fails if the fix is
+removed.
+
+### The invariant
+
+> **Nothing is ever taken away from the browser unless DM actually
+> received it.**
+
+Interception now gates on liveness; a delivery failure degrades to
+normal browser behaviour instead of silently eating a download.
+
+### What changed
+
+| Finding | Fix | File |
+| --- | --- | --- |
+| P0-1 Firefox dead | `nativeMessaging` declared in the Firefox manifest; `package.sh` strips it from the Chromium `.zip`, `verify-package.sh` asserts both shapes | `manifest.json`, `scripts/*` |
+| P0-2 click swallowed with no host | `content.js` caches host liveness (pushed on every transition) and skips interception when DM is unreachable or the runtime is invalidated; fails *open* | `content.js` |
+| P0-3 download cancelled and lost | `onCreated` takes the download over only when `send()` returned `true` | `background.js` |
+| P0-2 no fallback | `handBackToBrowser()` re-issues the download via `chrome.downloads.download`, with an `ignoredUrls` guard against looping and `safeFilename()` so an invalid name can't lose it | `background.js` |
+| P1-4 listener after `await` | registered synchronously at the top level; `installTimeMs === 0` means "unknown" and the handler `await`s it before judging | `background.js` |
+| P1-5 global, non-consensual takeover | two `chrome.storage.local` switches in the popup; partial files removed with `removeFile()` only when not `complete` | `background.js`, `popup.*` |
+| P1-6 popup lies | grab reports the real result and the real transport | `popup.js` |
+| P2-7 page handlers killed | `preventDefault()` only + `e.isTrusted` | `content.js` |
+| P2-8 permissions | `scripting`/`activeTab` dropped (proved unused by a source-derived permission test); `web_accessible_resources` removed | `manifest.json` |
+| bonus | Referer/User-Agent were being discarded on the click path (`background.js:536-540`) — forwarded now, so `CaptureDialog` can pre-fill them | `background.js` |
+| bonus | `zip` updates an existing archive instead of replacing it: stale files from earlier builds survived into the release. Both package scripts now delete the outputs first, staging excludes `test/`, and the verifier fails if development files ship | `scripts/*` |
+
+### Verification
+
+* **48 tests + 9 mutations, all green.** `cd browser-extension && node --test test/*.test.mjs && node test/mutation-check.mjs`
+* `test/mutation-check.mjs` re-introduces each fixed defect (cancel-without-delivery, intercept-without-liveness, drop the fallback, drop `nativeMessaging`, defer the listener, delete a completed file, ignore the opt-out, fake popup success, re-add `stopImmediatePropagation`) and **requires the suite to fail on each**. All 9 are caught, which is what makes the suite evidence rather than decoration.
+* The tests are not mocks-of-the-code: `background.js`, `content.js` and `popup.js` are loaded unmodified through `node:vm` into a *shared* context, so a content-script click really does travel through `chrome.runtime.sendMessage` into the background and back.
+* **No browser was launched.** These are behavioural tests against a faithful fake of the extension APIs; they do not replace a manual pass on real Chrome + Firefox, which is still worth doing for the items in §6.
+* Packaging verified end to end: `./scripts/package.sh 0.4.2` then `scripts/verify-package.sh 0.4.2` — no development files, Chrome-shaped `.zip` (`background.service_worker`, no gecko block, no `nativeMessaging`), Firefox-shaped `.xpi` (`background.scripts`, gecko ID, `nativeMessaging`).
+
+### Still open (deliberately not changed)
+
+* **`MEDIA_RE` still includes `pdf`, `zip`, `exe`, `iso`.** That is the extension's job; the fix was to stop it breaking the *page*, and to give the user a switch, not to narrow the heuristic. If plain PDF clicks being diverted to DM is unwanted, turn off *Take over media link clicks*.
+* **The service worker still uses a WebSocket, not a long-poll fallback**, and the WebSocket-idle-lifetime question in §6 is unanswered. The queue is now TTL-bounded and in-memory, so nothing depends on it surviving.
+* **Firefox's `ws://`→`wss://` claim** (the reason the native transport exists) is still inherited, not re-derived.
+

@@ -99,12 +99,14 @@ jobs:
         run: npm run build
 
   # ───────────────────────────────────────────────────────────────────
-  # 3. Browser extension: manifest validity + script syntax. We
-  #    shell out to Node to validate the manifest JSON, and run
-  #    `node --check` on each .js file to catch parse errors. This
-  #    is the equivalent of a lint pass for the extension; full
-  #    ESLint would be heavier and isn't required for the .xpi/.zip
-  #    packaging to succeed.
+  # 3. Browser extension: manifest validity, script syntax, and the
+  #    regression suite under browser-extension/test/ (node:test, no
+  #    dependencies — this job deliberately never runs `npm install`).
+  #    The suite loads the real background/content/popup scripts
+  #    through node:vm against a fake chrome.* + DOM, so it catches
+  #    behaviour changes, not just parse errors. `mutation-check.mjs`
+  #    then re-introduces each historically-fixed bug and requires the
+  #    suite to fail — that is what keeps the tests honest.
   # ───────────────────────────────────────────────────────────────────
   extension:
     name: Browser extension
@@ -142,6 +144,13 @@ jobs:
                 + "(Firefox needs a fixed extension ID)"
               );
             }
+            if (!(m.permissions || []).includes("nativeMessaging")) {
+              throw new Error(
+                "missing the nativeMessaging permission; without it"
+                + " runtime.connectNative is not a function in Firefox and the"
+                + " extension can never reach DM"
+              );
+            }
             console.log("manifest OK:", m.name, m.version);
           '
 
@@ -151,3 +160,9 @@ jobs:
             echo "checking $f"
             node --check "$f"
           done
+
+      - name: Regression suite
+        run: node --test test/*.test.mjs
+
+      - name: Mutation check (the suite must fail on every fixed bug)
+        run: node test/mutation-check.mjs

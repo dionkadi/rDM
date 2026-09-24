@@ -69,17 +69,6 @@
         color: var(--muted);
         font-size: 11px;
       }
-      .err-detail .err-actions {
-        display: flex;
-        gap: 6px;
-        margin-top: 8px;
-      }
-      .err-detail .err-actions button {
-        margin-top: 0;
-        padding: 5px 8px;
-        font-size: 11.5px;
-        font-weight: 500;
-      }
       h3 .logo {
         width: 18px;
         height: 18px;
@@ -132,6 +121,40 @@
       #status.err {
         color: var(--danger);
       }
+      #status.warn {
+        color: #a8620a;
+      }
+      fieldset.options {
+        margin: 12px 0 0;
+        padding: 8px 10px 10px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+      }
+      fieldset.options legend {
+        padding: 0 4px;
+        color: var(--muted);
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+      label.opt {
+        display: flex;
+        align-items: flex-start;
+        gap: 7px;
+        font-size: 11.5px;
+        line-height: 1.4;
+        margin-top: 7px;
+        cursor: pointer;
+      }
+      label.opt input {
+        margin: 1px 0 0;
+        flex: none;
+      }
+      label.opt .why {
+        display: block;
+        color: var(--muted);
+        font-size: 10.5px;
+      }
       code {
         font-family: ui-monospace, "SF Mono", Menlo, monospace;
         font-size: 11px;
@@ -145,13 +168,33 @@
     <h3><span class="logo"></span>DM Grabber</h3>
     <p class="lead">Send media links from this page to DM.</p>
     <button id="grab" class="primary">Grab page media</button>
-    <button id="open">Open DM app</button>
+    <button id="open">Re-check host</button>
     <button
       id="test"
       style="font-size: 11.5px; padding: 6px 10px; margin-top: 6px"
     >
       Test host connection
     </button>
+    <fieldset class="options">
+      <legend>Behaviour</legend>
+      <label class="opt">
+        <input type="checkbox" id="opt-click" />
+        <span>
+          Take over media link clicks
+          <span class="why">Clicks on .zip/.pdf/.mp4-style links go to DM.</span>
+        </span>
+      </label>
+      <label class="opt">
+        <input type="checkbox" id="opt-takeover" />
+        <span>
+          Take over all browser downloads
+          <span class="why"
+            >Also cancels downloads DM didn't receive a click for (Save
+            link as, Ctrl-click).</span
+          >
+        </span>
+      </label>
+    </fieldset>
     <p id="status">Checking…</p>
     <div id="err-detail" class="err-detail"></div>
     <script src="popup.js"></script>

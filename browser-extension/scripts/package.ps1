@@ -45,6 +45,12 @@ if (-not (Get-Command zip -ErrorAction SilentlyContinue)) {
 New-Item -ItemType Directory -Path $DistDir -Force | Out-Null
 $OutBase = Join-Path $DistDir "dm-grabber-$Version"
 
+# `zip` *updates* an archive when the target already exists: it
+# rewrites the entries it knows about but silently keeps any entry we
+# no longer stage. Start from nothing so a removed file can never
+# survive into a release.
+Remove-Item -Force -ErrorAction SilentlyContinue "$OutBase.zip", "$OutBase.xpi"
+
 # Stage into a temp dir, stripping the same files as package.sh.
 $Tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("dm-ext-stage-" + [System.Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $Tmp | Out-Null
@@ -56,6 +62,7 @@ try {
         $name -ne "dist"          -and
         $name -ne "node_modules"  -and
         $name -ne "scripts"       -and
+        $name -ne "test"          -and
         $name -ne "Thumbs.db"     -and
         $name -notlike "*.log"    -and
         $name -notlike "com.app.dm.native*.json"
@@ -92,13 +99,18 @@ try {
 
     # Generate the Chrome-shaped manifest in place of the staged one.
     # Chrome MV3 strictly rejects `background.scripts`. We rewrite
-    # to `background.service_worker: "background.js"` and drop the
+    # to `background.service_worker: "background.js"`, drop the
     # `browser_specific_settings.gecko` block (Chrome ignores it
-    # but logs a warning; better to omit entirely).
+    # but logs a warning; better to omit entirely), and drop
+    # `nativeMessaging` (only the Firefox transport uses it, and the
+    # Chromium path talks to DM over WebSocket — keeping it would
+    # enlarge the install prompt for nothing).
     $Chrome = [ordered]@{}
     foreach ($prop in $SrcContent.PSObject.Properties) {
         if ($prop.Name -eq 'background') {
             $Chrome[$prop.Name] = [ordered]@{ service_worker = "background.js" }
+        } elseif ($prop.Name -eq 'permissions') {
+            $Chrome[$prop.Name] = @($prop.Value | Where-Object { $_ -ne 'nativeMessaging' })
         } elseif ($prop.Name -ne 'browser_specific_settings') {
             $Chrome[$prop.Name] = $prop.Value
         }
@@ -150,6 +162,9 @@ try {
         if ($ZipObj.browser_specific_settings.gecko) {
             throw ".zip manifest must NOT have browser_specific_settings.gecko (Chrome logs a warning)"
         }
+        if ($ZipObj.permissions -contains 'nativeMessaging') {
+            throw ".zip manifest must NOT request nativeMessaging (Chromium uses the WebSocket transport)"
+        }
         if (-not $XpiObj.background.scripts) {
             throw ".xpi manifest.background.scripts is missing (Firefox 109+ requires this)"
         }
@@ -158,6 +173,9 @@ try {
         }
         if (-not $XpiObj.browser_specific_settings.gecko.id) {
             throw ".xpi manifest missing browser_specific_settings.gecko.id"
+        }
+        if ($XpiObj.permissions -notcontains 'nativeMessaging') {
+            throw ".xpi manifest must request nativeMessaging or runtime.connectNative is not a function in Firefox"
         }
     } else {
         Write-Warning "'unzip' not installed; skipping manifest self-verify"

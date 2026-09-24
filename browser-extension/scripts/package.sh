@@ -69,6 +69,11 @@ fi
 
 mkdir -p "$DIST_DIR"
 OUT_BASE="$DIST_DIR/dm-grabber-$VERSION"
+# `zip` *updates* an archive when the target already exists: it
+# rewrites the entries it knows about but silently keeps any entry we
+# no longer stage. That is how a stale `test/` tree (or an old
+# manifest) survives into a release. Start from nothing.
+rm -f "$OUT_BASE.zip" "$OUT_BASE.xpi"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -86,6 +91,7 @@ for entry in "$EXT_DIR"/*; do
   node_modules) continue ;;
   scripts) continue ;; # this very script; lives in the repo
     # for re-runnability, not for users
+  test) continue ;; # the regression suite + harness; not shipped to users
   *.log) continue ;;
   .DS_Store) continue ;;
   Thumbs.db) continue ;;
@@ -139,6 +145,10 @@ node -e '
 #   * `background.scripts`   -> `background.service_worker: "background.js"`
 #   * `browser_specific_settings.gecko` is removed (Chrome ignores
 #     it but logs a warning; better to omit it entirely).
+#   * `nativeMessaging` is removed — it is only needed by the
+#     Firefox native-messaging transport, and the Chromium path talks
+#     to DM over WebSocket. Keeping it would add a permission warning
+#     to the Chrome install prompt for nothing.
 # The Firefox .xpi uses the source manifest as-is.
 CHROME_MANIFEST="$TMP/manifest.json" # already in the staged tree
 node -e '
@@ -155,6 +165,7 @@ node -e '
   const out = { ...m };
   out.background = { service_worker: "background.js" };
   delete out.browser_specific_settings;
+  out.permissions = (out.permissions || []).filter((p) => p !== "nativeMessaging");
   fs.writeFileSync(f, JSON.stringify(out, null, 2) + "\n");
 ' "$CHROME_MANIFEST" || exit 6
 
@@ -223,6 +234,9 @@ else
       if (m.browser_specific_settings?.gecko) {
         console.error("error: .zip manifest must NOT have browser_specific_settings.gecko (Chrome logs a warning)"); process.exit(1);
       }
+      if ((m.permissions || []).includes("nativeMessaging")) {
+        console.error("error: .zip manifest must NOT request nativeMessaging (Chromium uses the WebSocket transport; the extra permission only enlarges the install prompt)"); process.exit(1);
+      }
     });
   ' || exit 6
 
@@ -239,6 +253,9 @@ else
       }
       if (!m.browser_specific_settings?.gecko?.id) {
         console.error("error: .xpi manifest missing browser_specific_settings.gecko.id"); process.exit(1);
+      }
+      if (!(m.permissions || []).includes("nativeMessaging")) {
+        console.error("error: .xpi manifest must request nativeMessaging — without it runtime.connectNative is not a function in Firefox"); process.exit(1);
       }
     });
   ' || exit 6

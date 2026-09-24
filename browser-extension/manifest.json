@@ -24,8 +24,7 @@
   "permissions": [
     "downloads",
     "tabs",
-    "activeTab",
-    "scripting",
+    "nativeMessaging",
     "storage"
   ],
   "host_permissions": [
@@ -46,17 +45,6 @@
         "content.js"
       ],
       "run_at": "document_idle"
-    }
-  ],
-  "web_accessible_resources": [
-    {
-      "resources": [
-        "popup.html",
-        "popup.js"
-      ],
-      "matches": [
-        "<all_urls>"
-      ]
     }
   ],
   "browser_specific_settings": {

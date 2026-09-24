@@ -46,7 +46,18 @@ unzip -l "$XPI" | head -30
 echo
 echo "── sanity: $ZIP manifest.json valid JSON? ──"
 python3 -c "import json, sys, zipfile; z = zipfile.ZipFile('$ZIP'); m = json.loads(z.read('manifest.json')); assert m['manifest_version'] == 3, m; print('OK', m['name'], m['version'])"
+echo "── dev-only files must not ship ──"
+for archive in "$ZIP" "$XPI"; do
+  leaked="$(unzip -l "$archive" | awk '{print $4}' | grep -E '^(test/|scripts/)|\.test\.mjs$|^package\.(sh|ps1)$' || true)"
+  if [[ -n "$leaked" ]]; then
+    echo "error: $archive ships development files:" >&2
+    echo "$leaked" >&2
+    exit 1
+  fi
+done
+echo "OK no development files"
+
 echo "── shape: $ZIP is Chrome-shaped (background.service_worker)? ──"
-unzip -p "$ZIP" manifest.json | python3 -c "import json, sys; m = json.load(sys.stdin); assert isinstance(m.get('background', {}).get('service_worker'), str), 'zip must have background.service_worker (Chrome MV3)'; assert 'scripts' not in m.get('background', {}), 'zip must NOT have background.scripts (Chrome rejects it)'; assert 'gecko' not in m.get('browser_specific_settings', {}), 'zip must NOT have browser_specific_settings.gecko'; print('OK chrome-shaped')"
+unzip -p "$ZIP" manifest.json | python3 -c "import json, sys; m = json.load(sys.stdin); assert isinstance(m.get('background', {}).get('service_worker'), str), 'zip must have background.service_worker (Chrome MV3)'; assert 'scripts' not in m.get('background', {}), 'zip must NOT have background.scripts (Chrome rejects it)'; assert 'gecko' not in m.get('browser_specific_settings', {}), 'zip must NOT have browser_specific_settings.gecko'; assert 'nativeMessaging' not in m.get('permissions', []), 'zip must NOT request nativeMessaging (Chromium uses the WebSocket transport)'; print('OK chrome-shaped')"
 echo "── shape: $XPI is Firefox-shaped (background.scripts + gecko.id)? ──"
-unzip -p "$XPI" manifest.json | python3 -c "import json, sys; m = json.load(sys.stdin); assert isinstance(m.get('background', {}).get('scripts'), list), 'xpi must have background.scripts (Firefox 109+ event-page)'; assert 'service_worker' not in m.get('background', {}), 'xpi must NOT have background.service_worker'; assert m.get('browser_specific_settings', {}).get('gecko', {}).get('id'), 'xpi must have browser_specific_settings.gecko.id'; print('OK firefox-shaped')"
+unzip -p "$XPI" manifest.json | python3 -c "import json, sys; m = json.load(sys.stdin); assert isinstance(m.get('background', {}).get('scripts'), list), 'xpi must have background.scripts (Firefox 109+ event-page)'; assert 'service_worker' not in m.get('background', {}), 'xpi must NOT have background.service_worker'; assert m.get('browser_specific_settings', {}).get('gecko', {}).get('id'), 'xpi must have browser_specific_settings.gecko.id'; assert 'nativeMessaging' in m.get('permissions', []), 'xpi must request nativeMessaging or runtime.connectNative is not a function in Firefox'; print('OK firefox-shaped')"

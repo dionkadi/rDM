@@ -1,18 +1,31 @@
-// Popup UI: grab the current tab's media and surface the native host status.
+// Popup UI: grab the current tab's media, show the real host status,
+// and expose the two behaviour switches.
 //
-// The status pill at the bottom shows the *headline*; when the host is
-// down we also surface a more visible error block with the actual
+// Two things this file used to get wrong and no longer does:
+//   * The "Grab page media" button reported success unconditionally.
+//     It hardcoded `{connected: true, lastSentCount: 1}` in the
+//     message callback and never looked at `chrome.runtime.lastError`
+//     or the background's answer, so the one screen that exists to
+//     tell you DM is unreachable told you the opposite.
+//   * The status line said "port 9157" even on the Firefox
+//     native-messaging transport, where there is no port.
+//
+// The status pill shows the *headline*; when the host is down we also
+// surface a more visible error block with the actual
 // `chrome.runtime.lastError.message` Firefox/Chrome returned. On
 // Firefox that message is usually the generic "No such native
 // application com.app.dm.native" — which means the host manifest
 // could not be located, the extension's ID isn't in
 // `allowed_extensions`, or the binary path is wrong. The "Test host
-// connection" button forces a fresh `connectNative` and reports the
-// result verbatim, so the user can see what's actually wrong
+// connection" button forces a fresh connection attempt and reports
+// the result verbatim, so the user can see what's actually wrong
 // without opening the browser console.
 const status = document.getElementById("status");
 const errDetail = document.getElementById("err-detail");
 const openBtn = document.getElementById("open");
+const grabBtn = document.getElementById("grab");
+const optClick = document.getElementById("opt-click");
+const optTakeover = document.getElementById("opt-takeover");
 
 /** Clear the children of `el` without using `innerHTML = ""`. */
 function clearChildren(el) {
@@ -49,6 +62,17 @@ function renderMarkup(parent, parts) {
   }
 }
 
+/** Human-readable name for the transport that is actually in use. */
+function transportLabel(kind) {
+  if (kind === "native") {
+    return "native messaging (com.app.dm.native)";
+  }
+  if (kind === "websocket") {
+    return "WebSocket 127.0.0.1:9157";
+  }
+  return "transport unknown";
+}
+
 // Map a `chrome.runtime.lastError.message` to a one-line hint
 // pointing at the most likely fix. The messages below are exactly
 // what Chrome and Firefox emit; see NativeMessaging.sys.mjs in
@@ -57,6 +81,19 @@ function renderMarkup(parent, parts) {
 function hintForError(msg) {
   if (!msg) return null;
   const m = msg.toLowerCase();
+  // The P0 regression this popup can now actually diagnose: without
+  // the `nativeMessaging` permission, `runtime.connectNative` is not
+  // even a function in Firefox.
+  if (m.includes("is not a function") || m.includes("nativemessaging")) {
+    return [
+      { tag: "b", text: "The extension is missing the " },
+      { tag: "code", text: "nativeMessaging" },
+      {
+        tag: "b",
+        text: " permission — reload it from a build that declares it.",
+      },
+    ];
+  }
   if (m.includes("no such native application")) {
     return [
       "Firefox can't find a valid host manifest for this extension. " +
@@ -102,52 +139,84 @@ function hintForError(msg) {
   return null;
 }
 
-function setStatus(state) {
-  status.className = "";
+// ─── Transient notes ────────────────────────────────────────────
+//
+// A note is the result of something the user just did ("nothing was
+// sent", "found 3 URLs"). It outlives a couple of poll ticks so the
+// 1.5 s refresh doesn't wipe it, and then goes away on its own.
+const NOTE_TTL_MS = 6000;
+let note = null;
+
+function setNote(cls, text) {
+  note = { cls, text, at: Date.now() };
+}
+
+function activeNote() {
+  if (note && Date.now() - note.at < NOTE_TTL_MS) return note;
+  note = null;
+  return null;
+}
+
+function syncOptions(settings) {
+  if (!settings) return;
+  if (optClick) optClick.checked = !!settings.interceptOnClick;
+  if (optTakeover) optTakeover.checked = !!settings.takeoverBrowserDownloads;
+}
+
+let lastState = null;
+
+function setStatus(state, pendingNote) {
+  errDetail.className = "err-detail";
   clearChildren(errDetail);
-  errDetail.classList.remove("shown");
+  clearChildren(status);
+
   if (!state) {
-    clearChildren(status);
+    status.className = "";
     appendText(status, "Checking…");
-    // While the first probe is in flight we don't know if the host
-    // is up; leave the "Open DM app" button alone (whatever its
-    // previous state was).
     return;
   }
-  if (state.connected) {
-    status.className = "ok";
-    clearChildren(status);
+
+  const connected = !!state.connected;
+  status.className = pendingNote ? pendingNote.cls : connected ? "ok" : "err";
+  appendText(
+    status,
+    connected
+      ? `✓ DM host connected — ${transportLabel(state.transportKind)}.\n`
+      : "✗ DM host not running.\n",
+  );
+
+  if (connected) {
     const sent = state.lastSentCount || 0;
     const ago =
       state.lastSentAt > 0
         ? `${Math.round((Date.now() - state.lastSentAt) / 1000)}s ago`
         : "never";
-    appendText(status, "✓ Native host connected (port 9157).\n");
     appendText(
       status,
-      `Sent ${sent} ${sent === 1 ? "request" : "requests"} (last: ${ago}).`,
+      `Sent ${sent} ${sent === 1 ? "request" : "requests"} (last: ${ago}).\n`,
     );
+  }
+
+  if (pendingNote) {
+    appendText(status, pendingNote.text);
+  }
+
+  if (connected) {
     // The "Open DM app" button can't actually launch a Tauri app
     // from a browser (no `chrome.app` API in MV3; the Tauri
-    // `tauri://` scheme is unknown to Chrome). When the host is up
-    // we keep the button enabled as a no-op so the user can click
-    // it without seeing a modal that blocks the rest of the popup
-    // (the previous `alert()` was unclosable in MV3 popup context).
+    // `tauri://` scheme is unknown to Chrome), so it's really a
+    // one-click re-check. Label it as such rather than implying it
+    // launches anything.
     if (openBtn) {
-      openBtn.disabled = true;
       openBtn.title =
-        "DM is already running (the native host is reachable). " +
-        "Use the DM window directly — this browser extension can't " +
-        "launch the Tauri app.";
+        "Ask the background to re-read the connection state. " +
+        "This browser extension can't launch the Tauri app for you.";
     }
     return;
   }
-  // Not connected. Show the headline + a detail block with the
-  // actual `chrome.runtime.lastError.message` so the user can
-  // diagnose without opening the browser console.
-  status.className = "err";
-  clearChildren(status);
-  appendText(status, "✗ Native host not running.");
+
+  // Not connected: show the actual `chrome.runtime.lastError.message`
+  // so the user can diagnose without opening the browser console.
   const detail = (state.lastError || "").toString();
   if (detail) {
     renderMarkup(errDetail, [
@@ -161,7 +230,7 @@ function setStatus(state) {
       renderMarkup(hintEl, hint);
       errDetail.appendChild(hintEl);
     }
-    errDetail.classList.add("shown");
+    errDetail.className = "err-detail shown";
   } else {
     const hintEl = document.createElement("span");
     hintEl.className = "hint";
@@ -171,20 +240,33 @@ function setStatus(state) {
     hintEl.appendChild(b);
     appendText(hintEl, " below to retry and see the actual error.");
     errDetail.appendChild(hintEl);
-    errDetail.classList.add("shown");
+    errDetail.className = "err-detail shown";
   }
-  // When the host is down, give the user a way to re-check from
-  // here: the "Open DM app" button no longer fires a modal alert;
-  // it's repurposed as a one-click re-probe so the user can confirm
-  // whether launching the DM app on their desktop has fixed the
-  // problem. The button label and title explain what it does.
   if (openBtn) {
-    openBtn.disabled = false;
-    openBtn.textContent = "Re-check host";
     openBtn.title =
       "The DM app doesn't seem to be running. Launch it on your " +
       "desktop, then click here to re-check the connection.";
   }
+}
+
+function render() {
+  setStatus(lastState, activeNote());
+}
+
+// ─── Talking to the background ──────────────────────────────────
+
+/** One-shot message with `lastError` folded into the result. */
+function sendMessage(msg) {
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage(msg, (res) => {
+        const err = chrome.runtime.lastError;
+        resolve(err ? { ok: false, error: err.message } : res);
+      });
+    } catch (e) {
+      resolve({ ok: false, error: (e && e.message) || String(e) });
+    }
+  });
 }
 
 // Probe the background service worker for current state.
@@ -261,9 +343,8 @@ function probeOnce() {
         }
         // No error, no `state` — the SW accepted the message but
         // didn't reply. This happens on a fresh cold start when the
-        // SW was still in the middle of its boot sequence
-        // (`loadInstallTime().then(registerDownloadsListener)…`)
-        // when the message arrived. Treat as a cold-start transient.
+        // SW was still in the middle of its boot sequence when the
+        // message arrived. Treat as a cold-start transient.
         resolve({ ok: false, error: "no response from background" });
       });
     } catch (e) {
@@ -295,7 +376,9 @@ async function refresh() {
       r = await probeOnce();
     }
     if (r.ok && r.state) {
-      setStatus(r.state);
+      lastState = r.state;
+      syncOptions(r.state.settings);
+      render();
       return;
     }
     // We never got a state from the SW. Show the actual error
@@ -303,71 +386,141 @@ async function refresh() {
     // for cold-start exhaustion it'll be the genuine
     // "Receiving end does not exist" the user can paste into a
     // bug report.
-    setStatus({
+    lastState = {
       connected: false,
       lastError: r.error || "background not reachable",
-    });
+    };
+    render();
   } finally {
     probeInFlight = false;
   }
 }
+
 refresh();
 setInterval(refresh, 1500);
 
-document.getElementById("grab").addEventListener("click", async () => {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab) return;
-  chrome.runtime.sendMessage({ type: "grab", tabId: tab.id }, () => {
-    setStatus({
-      connected: true,
-      lastSentAt: Date.now(),
-      lastSentCount: 1,
-    });
-  });
-});
+// ─── Actions ────────────────────────────────────────────────────
 
-document.getElementById("open").addEventListener("click", () => {
-  // The previous version of this handler called `alert(...)` when
-  // the host was down. `alert()` in an MV3 popup is a synchronous,
-  // unclosable native dialog that takes focus away from the popup
-  // and (in some Chromium versions) cannot be dismissed without
-  // killing the popup. That's the worst possible UX for a status
-  // indicator.
-  //
-  // Instead we re-issue the status probe. The next `setInterval`
-  // tick (1.5 s) will pick up the result and re-render the status
-  // pill. If the user has just launched the DM app on their
-  // desktop, this is exactly what they want — a single click to
-  // confirm the host is now reachable.
-  refresh();
-});
-
-document.getElementById("test").addEventListener("click", async () => {
-  const btn = document.getElementById("test");
-  btn.disabled = true;
-  btn.textContent = "Testing…";
-  try {
-    const res = await chrome.runtime.sendMessage({ type: "probe" });
-    if (res && res.probe) {
-      setStatus({
-        connected: !!res.probe.ok,
-        lastError: res.probe.ok
-          ? null
-          : res.probe.lastError || "host did not respond",
+if (grabBtn) {
+  grabBtn.addEventListener("click", async () => {
+    grabBtn.disabled = true;
+    const label = grabBtn.textContent;
+    grabBtn.textContent = "Grabbing…";
+    try {
+      const [tab] = await chrome.tabs.query({
+        active: true,
+        currentWindow: true,
       });
-    } else {
-      setStatus({
-        connected: false,
-        lastError: "probe returned no result: " + JSON.stringify(res),
-      });
+      if (!tab || tab.id == null) {
+        setNote("err", "No active tab to grab from.");
+        render();
+        return;
+      }
+      const res = await sendMessage({ type: "grab", tabId: tab.id });
+      if (!res || !res.ok) {
+        setNote(
+          "err",
+          `Grab failed: ${(res && res.error) || "no response from the background"}.`,
+        );
+      } else if (!res.urls) {
+        setNote("warn", "No media found on this page.");
+      } else if (!res.delivered) {
+        setNote(
+          "err",
+          `Found ${res.urls} media URL(s) but nothing was sent — ${
+            res.error || "DM is unreachable"
+          }.`,
+        );
+      } else {
+        setNote("ok", `Sent ${res.urls} media URL(s) to DM.`);
+      }
+      // Re-read the real state and render it together with the note.
+      await refresh();
+      render();
+    } catch (e) {
+      setNote("err", "Grab failed: " + ((e && e.message) || e));
+      render();
+    } finally {
+      grabBtn.disabled = false;
+      grabBtn.textContent = label;
     }
-  } catch (e) {
-    setStatus({
-      connected: false,
-      lastError: "probe failed: " + (e && e.message ? e.message : e),
-    });
-  } finally {
-    btn.disabled = false;
-    btn.textContent = "Test host connection";
+  });
+}
+
+if (openBtn) {
+  openBtn.addEventListener("click", () => {
+    // The previous version of this handler called `alert(...)` when
+    // the host was down. `alert()` in an MV3 popup is a synchronous,
+    // unclosable native dialog that takes focus away from the popup
+    // and (in some Chromium versions) cannot be dismissed without
+    // killing the popup. That's the worst possible UX for a status
+    // indicator.
+    //
+    // Instead we re-issue the status probe. If the user has just
+    // launched the DM app on their desktop, this is exactly what
+    // they want — a single click to confirm the host is now
+    // reachable.
+    void refresh();
+  });
+}
+
+const testBtn = document.getElementById("test");
+if (testBtn) {
+  testBtn.addEventListener("click", async () => {
+    testBtn.disabled = true;
+    const label = testBtn.textContent;
+    testBtn.textContent = "Testing…";
+    try {
+      const res = await sendMessage({ type: "probe" });
+      if (res && res.probe) {
+        const ok = !!res.probe.ok;
+        lastState = {
+          connected: ok,
+          lastError: ok ? null : res.probe.lastError || "host did not respond",
+          transportKind: res.probe.transportKind,
+          lastSentAt: lastState ? lastState.lastSentAt : 0,
+          lastSentCount: lastState ? lastState.lastSentCount : 0,
+          settings: lastState ? lastState.settings : undefined,
+        };
+        syncOptions(lastState.settings);
+      } else {
+        lastState = {
+          connected: false,
+          lastError:
+            "probe returned no result: " + JSON.stringify(res),
+        };
+      }
+      render();
+    } catch (e) {
+      lastState = {
+        connected: false,
+        lastError: "probe failed: " + ((e && e.message) || e),
+      };
+      render();
+    } finally {
+      testBtn.disabled = false;
+      testBtn.textContent = label;
+    }
+  });
+}
+
+async function onOptionChange() {
+  const patch = {
+    interceptOnClick: optClick ? !!optClick.checked : true,
+    takeoverBrowserDownloads: optTakeover ? !!optTakeover.checked : true,
+  };
+  const res = await sendMessage({ type: "set-settings", settings: patch });
+  if (res && res.state) {
+    lastState = res.state;
+    syncOptions(res.state.settings);
+  } else {
+    setNote(
+      "err",
+      "Couldn't save that setting: " + ((res && res.error) || "no response"),
+    );
   }
-});
+  render();
+}
+
+if (optClick) optClick.addEventListener("change", onOptionChange);
+if (optTakeover) optTakeover.addEventListener("change", onOptionChange);

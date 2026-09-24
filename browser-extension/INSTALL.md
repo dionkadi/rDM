@@ -13,15 +13,33 @@ The pieces (for reference):
 
 ```
 browser-extension/
-├── manifest.json                       # Chrome / Edge / Brave / Arc + Firefox 109+ (unified)
+├── manifest.json                       # Firefox 109+ template. scripts/package.sh
+│                                       #   rewrites it (background.service_worker,
+│                                       #   no gecko block, no nativeMessaging) for
+│                                       #   the Chromium .zip — see "Manifest shapes"
 ├── background.js                       # MV3 background page (picks transport at load time)
 ├── content.js                          # Scans every page for <video>/<source>/<a>
-├── popup.html / popup.js               # Toolbar popup with host status + "Test host connection"
+├── popup.html / popup.js               # Toolbar popup: host status, behaviour switches,
+│                                       #   "Test host connection"
 ├── icons/icon.svg                      # Shared icon (rasterize for production)
 ├── com.app.dm.native.firefox.json      # Native-messaging host template (Firefox only)
+├── test/                               # Regression suite; not shipped
 ├── INSTALL.md                          # This file
 └── scripts/                            # Package scripts (.zip + .xpi); not shipped
 ```
+
+> **Manifest shapes.** The `manifest.json` in the repo is the
+> **Firefox** template (`background.scripts` + `browser_specific_settings.gecko`;
+> `background.service_worker` is rejected by Firefox 109-127). The
+> Chromium `.zip` is not built from it directly — `scripts/package.sh`
+> emits a Chrome-shaped copy with `background.service_worker`, no gecko
+> block, and no `nativeMessaging` permission.
+>
+> This matters if you load the extension by hand: pointing Chrome at the
+> repo's `browser-extension/` folder gives you a manifest with no
+> background context at all (Chrome ignores `background.scripts` in MV3),
+> so nothing works and the popup reports "background not reachable".
+> **Always install Chromium builds from the released `.zip`.**
 
 ## Chromium browsers — Chrome, Edge, Brave, Arc, Vivaldi, Opera
 
@@ -82,20 +100,29 @@ extension talks to it via Chrome's native-messaging protocol.
    ```
 
 3. **Place the host manifest** for Firefox (this is the
-   `com.app.dm.native.firefox.json` template, with the path
-   edited to your binary):
+   `com.app.dm.native.firefox.json` template, with the placeholder
+   `path` edited to your binary):
 
    ```bash
    mkdir -p ~/.mozilla/native-messaging-hosts
    cp browser-extension/com.app.dm.native.firefox.json \
       ~/.mozilla/native-messaging-hosts/com.app.dm.native.json
    $EDITOR ~/.mozilla/native-messaging-hosts/com.app.dm.native.json
-   # set: "path": "/absolute/path/to/target/release/dm-native-host"
+   # replace the placeholder:
+   #   "path": "/absolute/path/to/dm-native-host"
+   # with the real absolute path, e.g.
+   #   "path": "/home/you/dm/target/release/dm-native-host"
    ```
 
    The Firefox template is preconfigured with
    `dm-grabber@dm-project` in `allowed_extensions` — no ID
    substitution needed.
+
+   > The `.xpi` requests the `nativeMessaging` permission. It must —
+   > without it Firefox makes `runtime.connectNative` an undefined
+   > function and the extension can never reach DM at all. If you
+   > build the extension yourself, don't strip that permission from
+   > the Firefox manifest.
 4. **Load the extension**:
    - Open `about:debugging#/runtime/this-firefox`
    - Click **Load Temporary Add-on…** and select
@@ -113,6 +140,27 @@ extension talks to it via Chrome's native-messaging protocol.
 > install via `about:addons` → gear icon → "Install Add-on From
 > File…". For AMO-signed distribution, submit through the
 > Firefox Add-ons site.
+
+## What the extension will and won't do to your browser
+
+The popup has two switches, both **on** by default:
+
+| Switch | On | Off |
+| --- | --- | --- |
+| **Take over media link clicks** | Clicking a `.zip` / `.pdf` / `.mp4`-style link sends it to DM instead of the browser | Those links behave exactly as they would without the extension |
+| **Take over all browser downloads** | Downloads DM *didn't* get a click for — right-click "Save link as", Ctrl-click, another extension's download — are redirected to DM | DM only ever sees URLs you clicked, or grabbed from the popup |
+
+The invariant behind both switches: **nothing is taken away from the
+browser unless DM actually received the URL.**
+
+* If the DM app isn't running, links are left completely alone — the
+  browser downloads them normally. (The toolbar badge shows `!`.)
+* If a URL can't be delivered mid-flight, the extension re-issues the
+  download through the browser itself rather than dropping it.
+* Only real user clicks are intercepted; a page's own programmatic
+  clicks are not. Interception also no longer stops the event from
+  reaching the page, so sites whose download flow is JS-driven keep
+  working.
 
 ## Verify the connection
 
@@ -135,25 +183,34 @@ pointing at the most likely cause.
 
 | Popup error | What it means | Fix |
 | --- | --- | --- |
-| `disconnected (code 1006)` | The WebSocket to `ws://127.0.0.1:9157/` was closed unexpectedly | Make sure the DM app is running. The extension auto-reconnects with backoff, so this should clear within 5 s. |
-| `WebSocket ctor failed` | The browser refused to open a WebSocket at all | Confirm `host_permissions` in `manifest.json` includes `ws://127.0.0.1:9157/*` and reload the extension. |
+| `disconnected (code 1006)` | The WebSocket to `ws://127.0.0.1:9157/` was closed unexpectedly | Make sure the DM app is running. The extension auto-reconnects with backoff, so this should clear within 5 s. While it's disconnected, media links are left to the browser. |
+| `WebSocket ctor failed` | The browser refused to open a WebSocket at all | Reload the extension. Note this is *not* caused by `host_permissions` — extension pages aren't gated by host permissions for WebSockets. It usually means the background script failed to load. |
+| `connectNative is not a function` (Firefox) | The extension was built without the `nativeMessaging` permission | Install the released `.xpi`, or add `"nativeMessaging"` to `permissions` in the Firefox `manifest.json` and reload. |
 | `No such native application com.app.dm.native` (Firefox) | Firefox couldn't find a valid host manifest for the extension | Confirm `~/.mozilla/native-messaging-hosts/com.app.dm.native.json` exists, is valid JSON, and lists `dm-grabber@dm-project` in `allowed_extensions`. |
-| `Specified native messaging host not found.` (Firefox) | The host manifest's `path` is unreachable | Verify the binary at the `path` is absolute and executable. |
+| `Specified native messaging host not found.` (Firefox) | The host manifest's `path` is unreachable — often because the `REPLACE`-style placeholder was never edited | Verify the binary at the `path` is absolute and executable. |
 | The popup flashes a red error for ~1 s on first open, then recovers | MV3 service worker cold start | Expected behaviour: the popup retries `sendMessage` with backoff for ~680 ms before surfacing any error. If the error persists past 1 s, the service worker is genuinely unreachable. |
 | Extension installed but downloads don't appear | Either the host isn't reachable or the extension is mis-configured | Click **Test host connection** in the popup and read the red error block — it tells you which file/path/ID is wrong. |
+| "Grab page media" says *nothing was sent* | The page had media but DM was unreachable | Start the DM app and try again. Nothing was queued or lost. |
 | Firefox rejects the extension | Missing `browser_specific_settings` | `manifest.json` already carries the `gecko` block; if you see this, make sure you loaded the source `browser-extension/manifest.json`, not a copy that has been modified. |
 
 ## Permissions the extension asks for
 
-| Permission | Why |
-| --- | --- |
-| `downloads` | Intercept real browser downloads ("Save link as") |
-| `tabs` | Look up the active tab when you click the popup |
-| `activeTab` | Run content scripts on the page you actually visit |
-| `scripting` | Reserved for future "inject grab button" features |
-| `storage` | Reserved for the future "always-grab these sites" list |
-| `<all_urls>` (host) | The content script can run on any page so it can scan whatever media is there |
-| `ws://127.0.0.1:9157/*` (host) | Open a WebSocket to the running DM app |
+The two shipped manifests ask for different sets, because the two
+transports are different:
 
-All of these are minimal; no telemetry, no remote endpoints, no
-auto-update channel.
+| Permission | `.zip` (Chromium) | `.xpi` (Firefox) | Why |
+| --- | --- | --- | --- |
+| `downloads` | yes | yes | Take over downloads the browser starts on its own, and hand one back when DM is unreachable |
+| `tabs` | yes | yes | Find the active tab from the popup, and push connection state to content scripts |
+| `storage` | yes | yes | The install-time filter and the behaviour switches |
+| `nativeMessaging` | — | **yes** | Firefox has no usable localhost WebSocket path, so it talks to `dm-native-host` over stdio. Without this permission `runtime.connectNative` doesn't exist and the extension cannot reach DM at all. |
+| `<all_urls>` (host) | yes | yes | The content script runs on any http(s) page so it can see media links |
+| `ws://127.0.0.1:9157/*` (host) | yes | yes | Declared for the WebSocket transport. Informational — see the note below. |
+
+> Host permissions do not gate WebSocket connections made from an
+> extension's own background page; the extension's `connect-src` CSP
+> does, and MV3 leaves it unset. The `ws://` entry is harmless and kept
+> so the intent is legible, but it is not what makes the socket work.
+> What *does* matter is that the DM app is listening on `127.0.0.1:9157`.
+
+No telemetry, no remote endpoints, no auto-update channel.

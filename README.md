@@ -177,19 +177,38 @@ Output: `browser-extension/dist/dm-grabber-<version>.zip` and
 
 ## Browser extension
 
-`browser-extension/` is a Manifest V3 Chromium extension with:
+`browser-extension/` is a Manifest V3 extension that works in Chromium
+browsers and Firefox 109+:
 
-- a content script that scrapes `<video>`, `<source>`, `<audio>`, and `<a>` tags for media URLs plus HLS (`*.m3u8`) and DASH (`manifest`) hints,
-- a service worker that connects to the `com.app.dm.native` host and forwards URLs,
-- a popup with **Grab page media** and **Open DM** buttons.
+- a content script that finds media on a page (`<video>`, `<source>`,
+  `<audio>`, `<a>`, HLS `*.m3u8` and DASH `manifest` hints) and, when you
+  click a download-looking link, sends it to DM instead of the browser,
+- a service worker that reaches the running app over
+  `ws://127.0.0.1:9157/` on Chromium, or over
+  `com.app.dm.native` native messaging on Firefox,
+- a popup with **Grab page media**, **Test host connection**, and two
+  switches for what the extension is allowed to take over.
 
-To install:
+**Install (Chromium — no native binary, no host manifest):** start the DM
+app, then unzip the released `dm-grabber-<version>.zip` and load it
+unpacked from `chrome://extensions` → Developer mode → Load unpacked.
 
-1. Build the native host: `cargo build --release -p dm-native-host`.
-2. Edit `browser-extension/com.app.dm.native.json` to point `"path"` at the absolute path of the produced binary, and replace `REPLACE_WITH_EXTENSION_ID` with the extension's id once loaded into Chrome.
-3. Load the extension unpacked from `browser-extension/`.
+> Load the **`.zip`**, not the repo's `browser-extension/` folder: the
+> manifest in the repo is the Firefox template, and Chrome ignores
+> `background.scripts` under MV3, which leaves the extension with no
+> background context at all.
 
-See the [native messaging docs](https://developer.chrome.com/docs/apps/nativeMessaging/) for the per-platform manifest install location.
+**Install (Firefox):** build the host
+(`cargo build --release -p dm-native-host`), copy
+`browser-extension/com.app.dm.native.firefox.json` to
+`~/.mozilla/native-messaging-hosts/com.app.dm.native.json`, and edit its
+`"path"` to the absolute path of the built binary. Then install the
+`.xpi`. The extension ID is fixed (`dm-grabber@dm-project`), so there is
+nothing to copy from the browser.
+
+See `browser-extension/INSTALL.md` for the long version, and
+`browser-extension/AGENTS`-level notes in `AGENTS.md` for the invariants
+the extension must not break.
 
 ## Project layout
 

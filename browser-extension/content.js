@@ -3,17 +3,36 @@
 // 1. **Click interception** — when the user left-clicks a link to a
 //    downloadable URL (e.g. `<a href="archive.zip">`, `<a download>`,
 //    or anything matching the `MEDIA_RE` heuristic), we suppress
-//    Firefox's default "start a download" behaviour, then forward
-//    the URL to the background so it can be pushed to DM. The result:
-//    Firefox never creates a "canceled" download row in the downloads
-//    library — the user only sees the DM entry.
+//    the browser's default "start a download" behaviour and forward
+//    the URL to the background so it can be pushed to DM. The
+//    result: the browser never creates a "canceled" download row in
+//    the downloads library — the user only sees the DM entry.
+//
+//    Three deliberate restrictions keep this from being hostile to
+//    the browser it runs in:
+//
+//    * **Host-liveness gate.** We only intercept when DM is known to
+//      be reachable (`hostAlive`). If the DM app isn't running, the
+//      link is left completely alone and the browser downloads it
+//      normally. Interception used to be unconditional, which meant
+//      a dead host turned every media link into a silent no-op.
+//    * **`e.isTrusted`.** Only real user clicks are intercepted, so
+//      the page's own programmatic clicks are never swallowed.
+//    * **No `stopPropagation`.** We call `preventDefault()` and
+//      nothing else, so the page's own click handlers still run.
+//      Interception used to call `stopImmediatePropagation()`, which
+//      broke any site whose download flow is JS-driven. We still
+//      suppress the browser's default action: `preventDefault()` in
+//      a capture-phase listener on `documentElement` marks the event
+//      cancelled for the whole dispatch, which is what stops the
+//      browser from starting its own download.
 //
 //    Modifier keys (Ctrl, Cmd, Shift, Alt, Meta), middle-click, and
-//    right-click are NOT intercepted — those should keep the browser's
+//    right-click are NOT intercepted — those keep the browser's
 //    normal "open in new tab" / "save as" behaviour. "Save link as"
-//    from the right-click context menu will still hit the
-//    background's `onCreated` safety net, which cancels + erases
-//    as best it can.
+//    from the right-click context menu reaches the background's
+//    `onCreated` path instead, which now only takes the download
+//    over when it has actually handed the URL to DM.
 //
 // 2. **Manual media scan** — the popup's "Grab page media" button
 //    explicitly asks the content script to scan via a `collect`
@@ -26,6 +45,68 @@
 // not a passive capture-everything tap on the browser".
 const MEDIA_RE =
   /\.(m3u8|mp4|webm|mkv|mov|flv|avi|ts|m4v|ogg|mp3|m4a|wav|flac|zip|7z|rar|pdf|iso|exe)(\?|#|$)/i;
+
+// ─── Mirrored background state ──────────────────────────────────
+//
+// `hostAlive`       — the DM host is reachable right now. Starts
+//                     **false** on purpose: until the background
+//                     tells us otherwise we must behave as if DM
+//                     isn't installed. Failing open (letting the
+//                     browser download) is always better than
+//                     failing closed (swallowing the click).
+// `interceptOnClick` — the user's popup toggle. When off, we never
+//                     handle clicks; the popup's manual "Grab page
+//                     media" button still works.
+let hostAlive = false;
+let interceptOnClick = true;
+
+/**
+ * True if this content script can still talk to its extension. After
+ * the extension is reloaded or updated, already-open tabs keep
+ * running the *old* content script with an invalidated runtime; any
+ * `chrome.runtime.*` call then throws. Checking this up front means
+ * an orphaned content script stops intercepting entirely instead of
+ * calling `preventDefault()` and then failing to deliver.
+ */
+function runtimeAlive() {
+  try {
+    return !!(chrome && chrome.runtime && chrome.runtime.id);
+  } catch (_e) {
+    return false;
+  }
+}
+
+function applyState(state) {
+  if (!state) return;
+  hostAlive = !!state.connected;
+  if (state.settings) interceptOnClick = !!state.settings.interceptOnClick;
+}
+
+/**
+ * Ask the background for the current state. The background pushes
+ * every transition to us afterwards (see `broadcastState` in
+ * background.js), so this only needs to run once at load.
+ */
+function refreshState() {
+  if (!runtimeAlive()) {
+    hostAlive = false;
+    return;
+  }
+  try {
+    chrome.runtime.sendMessage({ type: "get-status" }, (res) => {
+      // Read `lastError` in the same tick as the callback — both
+      // Chromium and Firefox clear it on the next runtime API call.
+      if (chrome.runtime.lastError) {
+        hostAlive = false;
+        return;
+      }
+      if (res && res.state) applyState(res.state);
+    });
+  } catch (err) {
+    hostAlive = false;
+    console.warn("DM Grabber: get-status failed:", err);
+  }
+}
 
 /** Walk the event's `composedPath()` to find the closest anchor. */
 function findAnchor(e) {
@@ -42,8 +123,11 @@ function findAnchor(e) {
  *   - non-primary mouse button (middle/right);
  *   - any modifier key (Ctrl/Cmd/Shift/Alt/Meta);
  *   - the event was already preventDefault'd (e.g. by the page);
+ *   - a synthetic (non-trusted) click — only a real user gesture
+ *     gets to trigger a takeover;
  *   - the resolved target is not an `<a>`;
- *   - the URL is not http(s) or doesn't look downloadable.
+ *   - the URL is not http(s) or doesn't look downloadable;
+ *   - the user turned click handling off, or DM isn't reachable.
  *
  * "Looks downloadable" = the `<a>` has a `download` attribute OR
  * its URL matches `MEDIA_RE`. We deliberately keep this heuristic
@@ -54,9 +138,14 @@ function shouldIntercept(e, anchor) {
   if (e.defaultPrevented) return false;
   if (e.button !== 0) return false; // primary only
   if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return false;
+  if (e.isTrusted === false) return false; // synthetic clicks are not ours
   if (!anchor) return false;
   const url = anchor.href;
   if (!/^https?:/i.test(url)) return false;
+  // ── The gate that keeps a dead host from breaking the browser ──
+  if (!interceptOnClick) return false;
+  if (!hostAlive) return false;
+  if (!runtimeAlive()) return false;
   if (anchor.hasAttribute("download")) return true;
   if (MEDIA_RE.test(url)) return true;
   return false;
@@ -65,22 +154,17 @@ function shouldIntercept(e, anchor) {
 function onClickCapture(e) {
   const anchor = findAnchor(e);
   if (!shouldIntercept(e, anchor)) return;
-  // **CRITICAL** — synchronously suppress the browser's default
-  // "start a download" behaviour, *before* the click event
-  // propagates to the page and *before* the browser's own
-  // download-anchor handler runs. `capture: true` on the
-  // listener (see below) plus the synchronous preventDefault is
-  // what makes Firefox never create the download entry. If we
-  // were a bubble-phase listener, or async, Firefox would win
-  // the race and we'd be back to cancel+erase.
+  // Suppress the browser's default "start a download" behaviour.
+  // `capture: true` on the listener (see below) plus the
+  // synchronous preventDefault is what stops the browser creating
+  // a download entry in the first place. We intentionally do NOT
+  // stop propagation — the page's own handlers keep working.
   e.preventDefault();
-  e.stopPropagation();
-  e.stopImmediatePropagation();
-  // Now forward the URL to the background. This is async but
-  // that's fine — the click has already been suppressed and the
-  // browser will not start a download regardless of when (or
-  // whether) the message arrives. The background's onMessage
-  // handler turns this into a native-host send to DM.
+  // Forward the URL to the background. This is async but that's
+  // fine: the click has already been suppressed, and if the
+  // background can't hand the URL to DM it re-issues the download
+  // through `chrome.downloads` itself (see `handBackToBrowser` in
+  // background.js), so the download is never lost.
   try {
     chrome.runtime.sendMessage({
       type: "download-click",
@@ -103,11 +187,11 @@ function onClickCapture(e) {
       userAgent: navigator.userAgent,
     });
   } catch (err) {
-    // If the runtime is gone (e.g. the extension was reloaded
-    // mid-click), the URL is lost — but Firefox's default
-    // behaviour is also suppressed, so the user can just click
-    // again. Better than silently letting Firefox create a
-    // download we'd then have to cancel.
+    // The runtime is gone (e.g. the extension was reloaded
+    // mid-click). We can't undo the preventDefault, but we do
+    // latch `hostAlive` off so every *subsequent* click in this
+    // tab is left to the browser.
+    hostAlive = false;
     console.warn("DM Grabber: sendMessage(download-click) failed:", err);
   }
 }
@@ -121,6 +205,11 @@ function collectMedia() {
       const s = el.getAttribute("src");
       if (s && /^https?:/i.test(s)) urls.add(s);
     });
+  // Iframe sources (e.g., embedded players like bilibili's player.html)
+  document.querySelectorAll("iframe[src]").forEach((el) => {
+    const s = el.getAttribute("src");
+    if (s && /^https?:/i.test(s)) urls.add(s);
+  });
   // Anchor tags that look like downloadable media.
   document.querySelectorAll("a[href]").forEach((el) => {
     if (MEDIA_RE.test(el.href)) urls.add(el.href);
@@ -141,7 +230,16 @@ function collectMedia() {
       const c = el.getAttribute("content");
       if (c && /^https?:/i.test(c)) urls.add(c);
     });
-  return { type: "media", pageUrl: location.href, urls: Array.from(urls) };
+  return {
+    type: "media",
+    pageUrl: location.href,
+    // The same page-level hints the click path sends, so a grab
+    // from the popup lands in DM with the Referer / User-Agent
+    // pre-filled too.
+    referer: location.href,
+    userAgent: navigator.userAgent,
+    urls: Array.from(urls),
+  };
 }
 
 // Capture-phase click interceptor. Registered once at document
@@ -175,13 +273,21 @@ if (_proto === "http:" || _proto === "https:") {
     // there yet — wait for it.
     document.addEventListener("readystatechange", install, { once: true });
   }
+  // Learn whether DM is reachable before the user's first click.
+  refreshState();
 }
 
-// Respond to explicit "collect" messages from the popup / background.
+// Respond to explicit "collect" messages from the popup / background,
+// and accept state pushes from the background.
 // We do **not** call `collectMedia()` ourselves and we do **not** start
 // a MutationObserver — see the top-of-file comment for the rationale.
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg && msg.type === "collect") {
+  if (!msg) return;
+  if (msg.type === "collect") {
     sendResponse(collectMedia());
+    return;
+  }
+  if (msg.type === "state") {
+    applyState(msg.state);
   }
 });

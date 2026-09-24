@@ -11,6 +11,115 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Browser-extension correctness pass. The extension had two
+interception paths and **neither was gated on DM being reachable**:
+interception was unconditional, only *delivery* was conditional.
+When the DM app was closed, a click on a `.zip` link did nothing at
+all, and a download the browser started on its own was cancelled and
+erased with nothing to replace it. Full audit:
+[`EXTENSION_AUDIT.md`](EXTENSION_AUDIT.md).
+
+### Added
+
+- **`browser-extension/test/`** — a dependency-free regression suite
+  (48 tests) on `node:test`, with a fake `chrome.*`, a controllable
+  clock, a minimal DOM and a fake `WebSocket`. `background.js`,
+  `content.js` and `popup.js` are loaded through `node:vm` into a
+  *shared* context, so messages really travel between them. Plus
+  `test/mutation-check.mjs`, which re-introduces each fixed defect and
+  requires the suite to catch it (9/9 today) — a regression test that
+  cannot fail is decoration.
+- **Two behaviour switches in the popup** (`dmSettings` in
+  `chrome.storage.local`, both default on so nothing changes for an
+  existing user): *Take over media link clicks* and *Take over all
+  browser downloads*. The second one is the escape hatch that did not
+  exist — previously every download in the browser profile was hijacked
+  after install with no way to opt out.
+- `WS_QUEUE_TTL_MS`: a payload that can't be delivered is dropped after
+  30 s instead of being replayed as a surprise dialog whenever DM
+  eventually starts.
+
+### Fixed
+
+- **A dead host no longer breaks the browser** ([`EXTENSION_AUDIT.md`](EXTENSION_AUDIT.md) P0-2).
+  `content.js` caches host liveness (pushed on every transport
+  transition) and skips interception entirely when DM is unreachable or
+  when the extension runtime was invalidated by a reload. It fails
+  *open*: if in doubt, the browser does the download.
+- **A download is no longer cancelled unless DM received it**
+  (P0-3). `chrome.downloads.onCreated` forwarded the URL and then called
+  `takeOverChromeDownload()` unconditionally — so with DM down, a
+  Ctrl-click or right-click "Save link as" was cancelled mid-transfer,
+  erased from `chrome://downloads`, and lost. The takeover now happens
+  only when `send()` returned `true`.
+- **Firefox never could connect, but still swallowed links** (P0-1).
+  `nativeMessaging` had been dropped from the manifest in 0.4.2 while
+  `chrome.runtime.connectNative` was still called for Firefox, so
+  `runtime.connectNative` was not a function — the transport could never
+  connect, while clicks were still `preventDefault()`ed. The permission
+  is declared again, and `scripts/package.sh` strips it from the
+  Chromium `.zip` (which doesn't need it) with `verify-package.sh`
+  asserting both shapes.
+- **A click that can't be delivered is handed back to the browser**
+  rather than dropped (`handBackToBrowser`), with an `ignoredUrls` guard
+  so the fallback can't loop back through `onCreated`, and a
+  `safeFilename()` check because `downloads.download` throws on an
+  invalid filename.
+- **`downloads.onCreated` is registered synchronously at the top level**
+  (P1-4), as MV3 requires; the install-time filter it used to wait for is
+  applied inside the handler. `installTimeMs` uses `0` to mean "not read
+  yet" and nothing is forwarded while it is — a worker woken *by* a
+  download would otherwise compare that download against a boot time
+  later than its own `startTime` and silently drop it.
+- **The truncated partial is actually removed** (P1-5).
+  `downloads.erase()` never deletes bytes; the file is now removed with
+  `downloads.removeFile()` — but only when the item is not `complete`,
+  so a finished file is never destroyed.
+- **The popup reports the truth** (P1-6). "Grab page media" hardcoded
+  `{connected: true, lastSentCount: 1}` and ignored both
+  `chrome.runtime.lastError` and the background's answer, so the one
+  screen that exists to say "DM is unreachable" said the opposite.
+- **Interception no longer hijacks the page** (P2-7). The content script
+  called `stopImmediatePropagation()`, which broke every site whose
+  download flow is JS-driven. It now calls `preventDefault()` only, and
+  additionally requires `e.isTrusted`, so a page's own programmatic
+  clicks are never swallowed.
+- **Referer and User-Agent now reach DM on the click path.** The content
+  script had always sent them; the background discarded them, so
+  `CaptureDialog` never pre-filled the per-download headers.
+- **`probeHost()` can no longer resolve twice** with a stale result, and
+  the Firefox transport now calls back so "Test host connection" doesn't
+  always burn the full timeout.
+- **Packaging: `zip` *updates* an existing archive.** Stale entries from
+  previous builds (a whole `test/` tree, an old manifest) survived into
+  the release because `dist/dm-grabber-<v>.zip` was never deleted first.
+  Both package scripts remove the outputs up front, the staging list
+  excludes `test/`, and `verify-package.sh` fails if development files
+  ship.
+
+### Changed
+
+- `manifest.json` permissions are now `downloads`, `tabs`,
+  `nativeMessaging`, `storage`. `scripting` and `activeTab` were
+  declared but never used (verified by a test that derives the required
+  permission set from the source), and `web_accessible_resources` — which
+  let any site fingerprint that DM Grabber is installed — is gone; the
+  popup never needed to be reachable from a page.
+- `com.app.dm.native.firefox.json` no longer ships a developer-machine
+  absolute path; `path` is a placeholder the user edits.
+
+### Documentation
+
+- Corrected `AGENTS.md`'s claim that "Chrome reads `background.scripts`
+  as a service worker" (Chrome refuses the key before 121 and ignores it
+  after; the repo manifest is the Firefox template and the Chromium
+  manifest is generated at package time), removed the references to the
+  host-manifest templates deleted in 0.4.2, and documented the
+  "nothing is taken from the browser unless DM received it" invariant.
+- `INSTALL.md`: per-manifest permission table, the Firefox
+  `nativeMessaging` prerequisite, the behaviour switches, and two
+  troubleshooting rows that pointed at the wrong mechanism.
+
 ## [0.4.2] — 2026-09-05
 
 A focused patch release that fixes three regressions introduced
