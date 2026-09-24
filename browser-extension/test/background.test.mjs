@@ -299,6 +299,42 @@ test("P1-5: the takeover opt-out actually stops the takeover", async () => {
   assert.equal(ctl.ws.latest().payloads().length, 0);
 });
 
+test("a stale socket's close event cannot knock out the live socket", async () => {
+  // The popup's "Test host connection" closes the current socket and
+  // opens a replacement in the same tick. The closed socket's `close`
+  // event arrives later; if it isn't tied to its own socket it nulls
+  // out the live reference, reports "disconnected" while DM is up, and
+  // leaks an extra connection on every click.
+  const { clock, ctl } = boot();
+  await settle(clock);
+
+  const status = () =>
+    new Promise((resolve) => ctl.sendMessage({ type: "get-status" }, resolve));
+
+  const first = ctl.ws.latest();
+  first.simulateOpen();
+  await settle(clock);
+  assert.equal((await status()).state.connected, true);
+
+  const probe = new Promise((resolve) => ctl.sendMessage({ type: "probe" }, resolve));
+  const second = ctl.ws.latest();
+  assert.notEqual(second, first, "Test must open a fresh socket");
+  second.simulateOpen();
+  await clock.advance(2000);
+  assert.equal((await probe).probe.ok, true);
+
+  // Now the superseded socket finally reports its close.
+  first.simulateClose(1000);
+  await settle(clock);
+
+  assert.equal(
+    (await status()).state.connected,
+    true,
+    "the live socket is still open, so the state must stay connected",
+  );
+  assert.equal(ctl.ws.instances.length, 2, "and no extra socket was leaked");
+});
+
 test("probe reports the real state and never hangs the popup", async () => {
   const { clock, ctl } = boot();
   await settle(clock);

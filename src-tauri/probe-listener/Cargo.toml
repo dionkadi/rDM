@@ -1,0 +1,16 @@
+# Standalone harness for the real WebSocket listener.
+#
+# Deliberately detached from the DM workspace (the empty `[workspace]`
+# table below) so `cargo check --workspace` and the release build never
+# pick it up. See README.md.
+[package]
+name = "probe-listener"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+sha1 = "0.10.7"
+base64 = "0.21.7"
+
+[workspace]

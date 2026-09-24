@@ -414,8 +414,8 @@ normal browser behaviour instead of silently eating a download.
 
 ### Verification
 
-* **48 tests + 9 mutations, all green.** `cd browser-extension && node --test test/*.test.mjs && node test/mutation-check.mjs`
-* `test/mutation-check.mjs` re-introduces each fixed defect (cancel-without-delivery, intercept-without-liveness, drop the fallback, drop `nativeMessaging`, defer the listener, delete a completed file, ignore the opt-out, fake popup success, re-add `stopImmediatePropagation`) and **requires the suite to fail on each**. All 9 are caught, which is what makes the suite evidence rather than decoration.
+* **51 tests + 11 mutations, all green.** `cd browser-extension && node --test test/*.test.mjs && node test/mutation-check.mjs`
+* **`browser-extension/test/` is 51 tests** and `test/mutation-check.mjs` re-introduces each fixed defect (cancel-without-delivery, intercept-without-liveness, drop the fallback, drop `nativeMessaging`, defer the listener, delete a completed file, ignore the opt-out, fake popup success, re-add `stopImmediatePropagation`, let a stale socket clobber the live one, blame the host for a missing background) and **requires the suite to fail on each**. All 11 are caught, which is what makes the suite evidence rather than decoration.
 * The tests are not mocks-of-the-code: `background.js`, `content.js` and `popup.js` are loaded unmodified through `node:vm` into a *shared* context, so a content-script click really does travel through `chrome.runtime.sendMessage` into the background and back.
 * **No browser was launched.** These are behavioural tests against a faithful fake of the extension APIs; they do not replace a manual pass on real Chrome + Firefox, which is still worth doing for the items in §6.
 * Packaging verified end to end: `./scripts/package.sh 0.4.2` then `scripts/verify-package.sh 0.4.2` — no development files, Chrome-shaped `.zip` (`background.service_worker`, no gecko block, no `nativeMessaging`), Firefox-shaped `.xpi` (`background.scripts`, gecko ID, `nativeMessaging`).
@@ -425,4 +425,82 @@ normal browser behaviour instead of silently eating a download.
 * **`MEDIA_RE` still includes `pdf`, `zip`, `exe`, `iso`.** That is the extension's job; the fix was to stop it breaking the *page*, and to give the user a switch, not to narrow the heuristic. If plain PDF clicks being diverted to DM is unwanted, turn off *Take over media link clicks*.
 * **The service worker still uses a WebSocket, not a long-poll fallback**, and the WebSocket-idle-lifetime question in §6 is unanswered. The queue is now TTL-bounded and in-memory, so nothing depends on it surviving.
 * **Firefox's `ws://`→`wss://` claim** (the reason the native transport exists) is still inherited, not re-derived.
+
+---
+
+## 8. Follow-up: "the app is running, but the extension won't connect"
+
+Reported after §7 shipped. The browser reports `close code 1006` for
+**every** way a WebSocket can fail, so this symptom cannot be diagnosed
+from the extension side — each layer had to be tested separately.
+
+### The server half is sound (verified, not assumed)
+
+`ws.rs` is pure `std` + `sha1` + `base64` with no Tauri dependency, so it
+compiles standalone. `src-tauri/probe-listener/` now does that, and the
+real listener was driven with a browser-shaped client — Chrome's exact
+handshake headers including `Origin`, then a masked text frame carrying
+the extension's real payload:
+
+```
+handshake              HTTP/1.1 101 Switching Protocols
+accept key             correct
+server frame 0x1       {"ok":true}
+close reply 0x8        server echoed close
+```
+
+and on the server side:
+
+```
+ws: client connected
+ws: frame {"type":"download","url":"…","filename":"probe.zip",
+           "referer":"https://site.example.test/page","userAgent":"…"}
+ws: clean close
+```
+
+Every payload field survives, including the `referer`/`userAgent` that
+§7 fixed the extension side of. The handshake's `Sec-WebSocket-Accept`
+was also cross-checked against an independent implementation (Node's `ws`
+library, via Vite's HMR server): identical. **So when this symptom is
+reported, `ws.rs` is the least likely suspect** — the app build, the
+extension's background context, or the environment come first.
+
+### Two defects this did find
+
+* **A superseded socket's `close` event could knock out the live one.**
+  The `close` handler nulled the shared `ws` reference unconditionally.
+  `forceReconnect` — the popup's "Test host connection" — closes the
+  current socket and opens a replacement in the same tick, so the *old*
+  socket's `close` event (which arrives later) would null the reference
+  to the live socket, flip the state to "disconnected" while DM was
+  reachable, and schedule another connect, leaking a connection per
+  click. Each socket's handlers are now bound to their own socket;
+  mutation `conn` covers it.
+* **The popup blamed the wrong program.** "Not connected" always rendered
+  as *"✗ DM host not running"*. In the most likely real-world case — a
+  Chromium MV3 extension with **no service worker at all**, because the
+  repo folder was loaded instead of the released `.zip` — the popup
+  cannot even ask the background for state, and DM is fine. The popup now
+  separates `background` / `blocked` / `host`, and the `host` case points
+  at the probe rather than leaving the user to guess between "the app is
+  closed" and "the app is too old". Mutation `diag` covers it.
+
+### The diagnostic now exists
+
+`browser-extension/scripts/check-host.mjs` classifies the five possible
+states of port 9157 by performing a real upgrade request, and its
+`--self-test` (in CI) proves it can tell them apart. The one that matters
+most is `no-response`: a port that accepts a TCP connection and never
+answers the upgrade is the signature of a **pre-0.4.2 DM build**, whose
+listener only spoke line-delimited JSON and silently swallows the
+browser's `GET / HTTP/1.1`. That case looks exactly like "the app isn't
+running" from inside a browser, and nothing in the extension could ever
+have distinguished it.
+
+Still not verified here: whether a *real* Chrome service worker can open
+`ws://127.0.0.1:9157/` under the user's Chrome version (CSP / local
+network access policy). If the probe says `ok` and the popup says
+`WebSocket ctor failed`, that is the remaining candidate — and the popup
+now says so.
+
 

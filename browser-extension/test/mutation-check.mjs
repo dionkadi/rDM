@@ -98,6 +98,22 @@ const MUTATIONS = [
     test: "test/content.test.mjs",
     pattern: "P2-7: interception no longer stops propagation",
   },
+  {
+    name: "conn  let a superseded socket's close clobber the live one",
+    file: "background.js",
+    find: "      if (ws !== socket) return; // a superseded attempt: `ws` is the live one\n",
+    replace: "",
+    test: "test/background.test.mjs",
+    pattern: "a stale socket's close event cannot knock out the live socket",
+  },
+  {
+    name: "diag  blame the DM host when the background is missing",
+    file: "popup.js",
+    find: '    return "background";',
+    replace: '    return "host";',
+    test: "test/integration.test.mjs",
+    pattern: "a missing background is not blamed on the DM host",
+  },
 ];
 
 const results = [];

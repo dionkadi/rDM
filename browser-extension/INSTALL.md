@@ -174,6 +174,41 @@ browser unless DM actually received the URL.**
 4. Visit any page with `<video>` (e.g. a Twitch clip) and the
    URL should land in the DM queue within ~1 s.
 
+## "The DM app is running, but the extension won't connect"
+
+This is the most confusing failure mode, because the browser gives you
+almost nothing to go on. Every way the WebSocket can fail reports the
+same thing — `close code 1006` — whether nothing is listening, whether
+something is listening but never answers the upgrade, or whether the
+handshake itself is broken.
+
+Run the bundled probe. It does what a browser does (TCP connect, upgrade
+request, verify `Sec-WebSocket-Accept`, exercise a masked frame) and tells
+you which case you're in:
+
+```bash
+node browser-extension/scripts/check-host.mjs
+```
+
+**It sends no URLs to DM** — nothing lands in your download queue.
+
+| Probe says | What's wrong | Fix |
+| --- | --- | --- |
+| `NOTHING IS LISTENING on 127.0.0.1:9157` | The app isn't running, or it failed to bind the port (often a stale second instance) | Start DM. Check `ss -ltnp \| grep 9157`. Grep the session log for `listener bind failed`. |
+| `PORT 9157 IS OPEN BUT SILENT` | Something is listening but never answers the WebSocket upgrade — the signature of a **DM build older than 0.4.2**, whose listener only spoke line-delimited JSON | Update/rebuild the DM desktop app. The WebSocket listener landed in 0.4.2. |
+| `PORT 9157 IS OPEN BUT NOT A WebSocket ENDPOINT` | Some other program owns the port | Find it with `ss -ltnp \| grep 9157` |
+| `HANDSHAKE ANSWERED BUT WRONG` | The server's `Sec-WebSocket-Accept` is wrong, so browsers reject the connection | That's a bug in `src-tauri/src/ws.rs` — please report it |
+| `OK — 127.0.0.1:9157 is a working WebSocket server` | The app side is fine | It's the extension side. Read the popup's message: if it says **"Extension background isn't running"** you installed the repo folder instead of the released `.zip` (Chrome ignores `background.scripts` under MV3, so there is no background at all). |
+
+If the app side checks out and you want to test the extension *without*
+the GUI, `src-tauri/probe-listener/` runs the real listener as a plain
+terminal program on port 9158:
+
+```bash
+cd src-tauri/probe-listener && cargo run
+node browser-extension/scripts/check-host.mjs 9158
+```
+
 ## Troubleshooting
 
 The popup has a **Test host connection** button that forces a
@@ -183,11 +218,12 @@ pointing at the most likely cause.
 
 | Popup error | What it means | Fix |
 | --- | --- | --- |
-| `disconnected (code 1006)` | The WebSocket to `ws://127.0.0.1:9157/` was closed unexpectedly | Make sure the DM app is running. The extension auto-reconnects with backoff, so this should clear within 5 s. While it's disconnected, media links are left to the browser. |
-| `WebSocket ctor failed` | The browser refused to open a WebSocket at all | Reload the extension. Note this is *not* caused by `host_permissions` — extension pages aren't gated by host permissions for WebSockets. It usually means the background script failed to load. |
+| `disconnected (code 1006)` | Nothing completed a WebSocket handshake on `127.0.0.1:9157` | Run `node browser-extension/scripts/check-host.mjs` — it distinguishes the four causes above. While it's disconnected, media links are left to the browser. |
+| `Could not establish connection. Receiving end does not exist.` | The extension has **no background service worker**, so the popup can't even ask it for status. Almost always: you loaded the repo's `browser-extension/` folder in Chrome | Install the released `dm-grabber-<version>.zip` (see the top of this file), then Reload on `chrome://extensions`. |
+| `WebSocket ctor failed` | The browser refused to open a WebSocket at all | Reload the extension. This is *not* caused by `host_permissions` — extension pages aren't gated by host permissions for WebSockets. Check for a restrictive `content_security_policy`. |
 | `connectNative is not a function` (Firefox) | The extension was built without the `nativeMessaging` permission | Install the released `.xpi`, or add `"nativeMessaging"` to `permissions` in the Firefox `manifest.json` and reload. |
 | `No such native application com.app.dm.native` (Firefox) | Firefox couldn't find a valid host manifest for the extension | Confirm `~/.mozilla/native-messaging-hosts/com.app.dm.native.json` exists, is valid JSON, and lists `dm-grabber@dm-project` in `allowed_extensions`. |
-| `Specified native messaging host not found.` (Firefox) | The host manifest's `path` is unreachable — often because the `REPLACE`-style placeholder was never edited | Verify the binary at the `path` is absolute and executable. |
+| `Specified native messaging host not found.` (Firefox) | The host manifest's `path` is unreachable — often because the placeholder was never edited | Verify the binary at the `path` is absolute and executable. |
 | The popup flashes a red error for ~1 s on first open, then recovers | MV3 service worker cold start | Expected behaviour: the popup retries `sendMessage` with backoff for ~680 ms before surfacing any error. If the error persists past 1 s, the service worker is genuinely unreachable. |
 | Extension installed but downloads don't appear | Either the host isn't reachable or the extension is mis-configured | Click **Test host connection** in the popup and read the red error block — it tells you which file/path/ID is wrong. |
 | "Grab page media" says *nothing was sent* | The page had media but DM was unreachable | Start the DM app and try again. Nothing was queued or lost. |

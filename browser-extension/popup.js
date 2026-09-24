@@ -73,14 +73,82 @@ function transportLabel(kind) {
   return "transport unknown";
 }
 
+/**
+ * Which layer is actually broken?
+ *
+ * "Not connected" used to always render as "DM host not running", which
+ * is a lie in two of the three cases below — and the two lies send the
+ * user to the wrong place. The most common one by far is `background`:
+ * loading the repo folder in Chrome gives an MV3 extension with no
+ * service worker at all (Chrome ignores `background.scripts`), so the
+ * popup cannot even ask the background for state, let alone reach DM.
+ */
+function failureKind(state) {
+  const msg = (state.lastError || "").toLowerCase();
+  if (
+    msg.includes("receiving end does not exist") ||
+    msg.includes("message port closed") ||
+    msg.includes("no response from background") ||
+    msg.includes("background not reachable")
+  ) {
+    return "background";
+  }
+  if (msg.includes("websocket ctor failed")) return "blocked";
+  return "host";
+}
+
+function headline(connected, kind) {
+  if (connected) return "✓ DM host connected";
+  if (kind === "background") return "✗ Extension background isn't running.";
+  if (kind === "blocked") return "✗ The browser blocked the connection to DM.";
+  return "✗ DM host not running.";
+}
+
+/**
+ * The one hint worth more than all the others: DM is up, and the
+ * extension still can't reach it. The browser only ever reports
+ * `close code 1006`, which is identical whether nothing is listening or
+ * whether a pre-0.4.2 DM build is listening (its listener only spoke
+ * line-delimited JSON and swallows the upgrade request). The bundled
+ * probe tells them apart in two seconds.
+ */
+const HOST_DOWN_HINT =
+  "The browser only reports `close code 1006` for every way this can " +
+  "fail, so the app being open doesn't rule it out. Run this to find " +
+  "out which it is: node browser-extension/scripts/check-host.mjs";
+
 // Map a `chrome.runtime.lastError.message` to a one-line hint
 // pointing at the most likely fix. The messages below are exactly
 // what Chrome and Firefox emit; see NativeMessaging.sys.mjs in
 // Firefox (the `_throwGenericError` helper) and the Chrome
 // "Native Messaging" docs.
-function hintForError(msg) {
+function hintForError(msg, kind) {
+  const m = (msg || "").toLowerCase();
+  if (kind === "background") {
+    return [
+      { tag: "b", text: "The extension's service worker never started, so " },
+      { tag: "b", text: "nothing" },
+      {
+        tag: "b",
+        text: " can reach DM — the host may well be running fine. This is " +
+          "what happens when the extension is loaded from the source folder " +
+          "in Chrome: Chrome ignores ",
+      },
+      { tag: "code", text: "background.scripts" },
+      { tag: "b", text: " under Manifest V3, so there is no background at all. Install the released " },
+      { tag: "code", text: "dm-grabber-<version>.zip" },
+      { tag: "b", text: " (not the repo folder), then Reload on chrome://extensions." },
+    ];
+  }
+  if (kind === "blocked") {
+    return [
+      { tag: "b", text: "The browser refused to open the WebSocket. Check that the extension " },
+      { tag: "b", text: "isn't built with a restrictive " },
+      { tag: "code", text: "content_security_policy" },
+      { tag: "b", text: " (connect-src) and reload it." },
+    ];
+  }
   if (!msg) return null;
-  const m = msg.toLowerCase();
   // The P0 regression this popup can now actually diagnose: without
   // the `nativeMessaging` permission, `runtime.connectNative` is not
   // even a function in Firefox.
@@ -92,6 +160,14 @@ function hintForError(msg) {
         tag: "b",
         text: " permission — reload it from a build that declares it.",
       },
+    ];
+  }
+  // Connected-but-not-really: the socket failed. `1006` is the only
+  // thing the browser will ever say, and it can't distinguish "not
+  // running" from "running but never answered the upgrade".
+  if (kind === "host" && (m.includes("1006") || m.includes("disconnected"))) {
+    return [
+      { tag: "b", text: HOST_DOWN_HINT },
     ];
   }
   if (m.includes("no such native application")) {
@@ -177,12 +253,13 @@ function setStatus(state, pendingNote) {
   }
 
   const connected = !!state.connected;
+  const kind = connected ? null : failureKind(state);
   status.className = pendingNote ? pendingNote.cls : connected ? "ok" : "err";
   appendText(
     status,
     connected
       ? `✓ DM host connected — ${transportLabel(state.transportKind)}.\n`
-      : "✗ DM host not running.\n",
+      : `${headline(false, kind)}\n`,
   );
 
   if (connected) {
@@ -223,7 +300,7 @@ function setStatus(state, pendingNote) {
       { tag: "b", text: "Browser said: " },
       { tag: "code", text: detail },
     ]);
-    const hint = hintForError(detail);
+    const hint = hintForError(detail, kind);
     if (hint) {
       const hintEl = document.createElement("span");
       hintEl.className = "hint";

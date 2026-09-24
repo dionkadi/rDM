@@ -261,6 +261,62 @@ test("turning click handling back on restores interception", async () => {
   assert.equal(click(doc, ZIP).event.prevented, true);
 });
 
+test("a missing background is not blamed on the DM host", async () => {
+  // The single most likely real-world cause of "the app is running but
+  // the popup won't connect": a Chromium MV3 extension whose manifest
+  // declares only `background.scripts` (Chrome ignores it) has no
+  // service worker at all. The popup used to render that as
+  // "DM host not running", pointing the user at the wrong program.
+  const clock = createClock(START);
+  const ctl = createChromeMock({
+    noBackground: true,
+    tabs: [{ id: 1, hasContentScript: true }],
+  });
+  const doc = new FakeDocument();
+  const els = {};
+  for (const id of [
+    "status",
+    "err-detail",
+    "open",
+    "grab",
+    "test",
+    "opt-click",
+    "opt-takeover",
+  ]) {
+    els[id] = doc.register(id, new FakeElement("div"));
+  }
+  loadExtension(["popup.js"], {
+    chrome: ctl,
+    clock,
+    document: doc,
+    location: { href: PAGE, protocol: "https:" },
+    navigator: { userAgent: "UA" },
+  });
+  // Let the cold-start retry budget (80+200+400 ms) play out.
+  await clock.advance(3000);
+
+  const text = textOf(els.status);
+  assert.match(text, /Extension background isn't running/);
+  assert.ok(!/DM host not running/.test(text), text);
+  assert.match(textOf(els["err-detail"]), /background\.scripts/, "and says why");
+});
+
+test("a host that refuses the connection points at the probe", async () => {
+  // `close code 1006` is the only thing the browser ever reports, and it
+  // cannot distinguish "not running" from "running but never answered
+  // the upgrade" (a pre-0.4.2 DM build). So the popup must send the user
+  // to something that can.
+  const { clock, ctl, els } = bootAll({ popup: true });
+  await settle(clock);
+  ctl.ws.latest().simulateClose(1006);
+  await pollOnce(clock);
+
+  const text = textOf(els.status);
+  assert.match(text, /DM host not running/);
+  assert.match(textOf(els["err-detail"]), /check-host\.mjs/, "points at the probe");
+  assert.match(textOf(els["err-detail"]), /1006/);
+});
+
 test("the status never hardcodes a port for the Firefox transport", async () => {
   const clock = createClock(START);
   const ctl = createChromeMock({

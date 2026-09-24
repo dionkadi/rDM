@@ -29,6 +29,18 @@ erased with nothing to replace it. Full audit:
   `test/mutation-check.mjs`, which re-introduces each fixed defect and
   requires the suite to catch it (9/9 today) — a regression test that
   cannot fail is decoration.
+- **`browser-extension/scripts/check-host.mjs`** — answers "is 9157
+  actually speaking WebSocket?" by doing what a browser does (TCP
+  connect, Chrome-shaped upgrade request, verify
+  `Sec-WebSocket-Accept`, exercise a masked close frame) and reporting
+  which layer is broken: nothing listening, listening but silent (the
+  pre-0.4.2 build signature), listening but not WebSocket, wrong accept
+  key, or OK. Sends no URLs to DM. `--self-test` runs it against fake
+  listeners of each kind and is wired into CI.
+- **`src-tauri/probe-listener/`** — runs the **real** `ws.rs` listener as
+  a plain terminal program on port 9158, so the extension's Chromium
+  transport can be tested without building or launching the Tauri app.
+  Excluded from the workspace; never shipped.
 - **Two behaviour switches in the popup** (`dmSettings` in
   `chrome.storage.local`, both default on so nothing changes for an
   existing user): *Take over media link clicks* and *Take over all
@@ -96,6 +108,23 @@ erased with nothing to replace it. Full audit:
   Both package scripts remove the outputs up front, the staging list
   excludes `test/`, and `verify-package.sh` fails if development files
   ship.
+- **The popup no longer blames the DM host for everything.**
+  "Not connected" always rendered as *"✗ DM host not running"*, which is
+  wrong in the most common case: a Chromium MV3 extension with no
+  service worker at all (the repo folder loaded instead of the `.zip`)
+  reports `Could not establish connection. Receiving end does not exist.`
+  and has nothing to do with DM. The popup now distinguishes a missing
+  background from a blocked socket from an unreachable host, and the
+  host case points at `check-host.mjs` instead of leaving the user to
+  guess between "the app is closed" and "the app is too old".
+- **A superseded WebSocket can no longer knock out the live one.** The
+  `close` handler nulled the shared `ws` reference unconditionally, so
+  the "Test host connection" button — which closes the current socket
+  and opens a replacement in the same tick — would let the *old*
+  socket's `close` event flip the state to "disconnected" while a
+  perfectly good socket was open, and schedule yet another connect,
+  leaking a connection per click. Each socket's handlers are now bound
+  to their own socket.
 
 ### Changed
 

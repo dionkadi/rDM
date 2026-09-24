@@ -189,14 +189,27 @@ function makeWebSocketTransport() {
 
   function connect() {
     if (ws || closing) return;
+    // Hold this attempt's socket locally and have every handler below
+    // check `ws === socket` first.
+    //
+    // `forceReconnect` (the popup's "Test host connection") closes the
+    // current socket and opens a replacement in the same tick; the
+    // closed socket's `close` event then arrives *later*. Without the
+    // identity check that stale event nulls out the reference to the
+    // live socket, flips the state to "disconnected" while a perfectly
+    // good socket is open — so the popup says DM isn't running — and
+    // schedules yet another connect, leaking a connection every time.
+    let socket;
     try {
-      ws = new WebSocket(WS_URL);
+      socket = new WebSocket(WS_URL);
     } catch (e) {
       setState(false, "WebSocket ctor failed: " + (e && e.message ? e.message : e));
       scheduleReconnect();
       return;
     }
-    ws.addEventListener("open", () => {
+    ws = socket;
+    socket.addEventListener("open", () => {
+      if (ws !== socket) return; // a superseded attempt
       backoffIdx = 0;
       setState(true, null);
       // Drain anything queued while we were disconnected, skipping
@@ -208,7 +221,7 @@ function makeWebSocketTransport() {
         const entry = pending[i];
         if (now - entry.at > WS_QUEUE_TTL_MS) continue;
         try {
-          ws.send(JSON.stringify(entry.payload));
+          socket.send(JSON.stringify(entry.payload));
           state.lastSentAt = Date.now();
           state.lastSentCount++;
         } catch (e) {
@@ -224,19 +237,20 @@ function makeWebSocketTransport() {
         cb();
       }
     });
-    ws.addEventListener("message", () => {
+    socket.addEventListener("message", () => {
       // The Tauri side acks every payload with `{"ok":true}`.
       // We don't need the ack for correctness (the next send
       // would fail loudly if the socket were broken), but we
       // keep the listener wired so Chrome's WebSocket impl
       // doesn't fill an internal buffer.
     });
-    ws.addEventListener("close", (ev) => {
+    socket.addEventListener("close", (ev) => {
+      if (ws !== socket) return; // a superseded attempt: `ws` is the live one
       ws = null;
       setState(false, `disconnected (code ${ev.code})`);
       if (!closing) scheduleReconnect();
     });
-    ws.addEventListener("error", () => {
+    socket.addEventListener("error", () => {
       // The `error` event fires just before `close`. Chrome
       // does not populate a useful message here, so we let
       // `close` set the user-facing error string.
@@ -282,6 +296,9 @@ function makeWebSocketTransport() {
         }
         ws = null;
       }
+      // The `close` handler now ignores events from superseded
+      // sockets, so the state has to be set here rather than there.
+      setState(false, "disconnected");
       queue = [];
     },
     forceReconnect(onDone) {

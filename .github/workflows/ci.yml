@@ -164,5 +164,14 @@ jobs:
       - name: Regression suite
         run: node --test test/*.test.mjs
 
+      - name: Host probe self-test
+        # check-host.mjs tells "nothing listening" apart from "something
+        # listening that never answers the WebSocket upgrade" — the two
+        # causes of the same `close code 1006` the browser reports. Its
+        # self-test runs it against fake listeners of each kind, so a
+        # probe that can't discriminate fails here rather than misleading
+        # someone debugging a real install.
+        run: node scripts/check-host.mjs --self-test
+
       - name: Mutation check (the suite must fail on every fixed bug)
         run: node test/mutation-check.mjs

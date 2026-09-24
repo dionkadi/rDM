@@ -273,6 +273,16 @@ export function createChromeMock(options = {}) {
       onStartup: { addListener: (fn) => listeners.onStartup.push(fn) },
       sendMessage(msg, cb) {
         clearLastError();
+        // Model an extension whose service worker never started — e.g.
+        // a Chromium MV3 extension whose manifest declares only
+        // `background.scripts`, which Chrome ignores.
+        if (opts.noBackground) {
+          setLastError(
+            "Could not establish connection. Receiving end does not exist.",
+          );
+          if (cb) cb(undefined);
+          return undefined;
+        }
         // Only record messages the *extension* sends. Messages
         // injected by a test (via `ctl.sendMessage`) are not part of
         // the extension's behaviour.

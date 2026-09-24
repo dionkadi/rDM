@@ -5,3 +5,11 @@ members = [
     "crates/native-host",
     "src-tauri",
 ]
+# A debugging harness that runs the real WebSocket listener standalone,
+# so the browser extension's Chromium transport can be tested without
+# building the Tauri app. It is self-contained (its own Cargo.toml ends
+# with an empty `[workspace]` table) and must never be built, checked or
+# shipped as part of the app. See src-tauri/probe-listener/README.md.
+exclude = [
+    "src-tauri/probe-listener",
+]
