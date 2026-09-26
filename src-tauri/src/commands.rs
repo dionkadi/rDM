@@ -59,8 +59,24 @@ pub fn app_info() -> AppInfo {
 /// credentials". The `add_download` command wires the auth
 /// data through the same `set_headers_auth` path that the
 /// `AuthDialog` uses after creation.
+///
+/// This command is **async** on purpose. Synchronous Tauri commands
+/// run on the main thread, and this one emits the `Added` event while
+/// it runs; on Windows that combination (webview API call from inside
+/// a sync command) wedges the WebView2 IPC channel — the UI keeps
+/// painting but every `invoke` afterwards never resolves, so the new
+/// row never appears and all buttons that talk to the engine look
+/// dead (see tauri-apps/tauri#9453). Async commands run on the async
+/// runtime thread pool instead, which avoids the re-entrancy entirely.
+///
+/// The `checksum` argument is validated here, at add time, so the user
+/// gets an immediate "unsupported checksum algorithm" error instead of
+/// a failed download at 100 %. The expected digest is trimmed and the
+/// algorithm normalized to its canonical name (`md5`, `sha1`, `sha256`,
+/// `sha512`) before the row is created. An empty expected digest means
+/// "no verification requested" and is dropped to `None`.
 #[tauri::command]
-pub fn add_download(
+pub async fn add_download(
     state: State<'_, DownloadManager>,
     url: String,
     category: Option<String>,
@@ -69,10 +85,27 @@ pub fn add_download(
     checksum: Option<ChecksumSpec>,
     headers: Option<std::collections::BTreeMap<String, String>>,
     auth: Option<AuthSpec>,
-) -> Download {
+) -> Result<Download, String> {
     let dir = state.save_dir_for(category.as_deref());
     let fname = filename.unwrap_or_else(|| protocol::suggest_filename(&url, None, "download.bin"));
     let save_path = dir.join(&fname);
+
+    // Validate + normalize the checksum spec up front (see doc above).
+    let checksum = match checksum {
+        Some(cs) if !cs.expected.trim().is_empty() => {
+            let algo = dm_engine::model::ChecksumAlgorithm::parse(&cs.algorithm).ok_or_else(|| {
+                format!(
+                    "unsupported checksum algorithm: {} (supported: md5, sha1, sha256, sha512)",
+                    cs.algorithm
+                )
+            })?;
+            Some(ChecksumSpec {
+                algorithm: algo.as_str().to_string(),
+                expected: cs.expected.trim().to_string(),
+            })
+        }
+        _ => None,
+    };
 
     let mut d = Download::new(url);
     d.category = category;
@@ -91,7 +124,7 @@ pub fn add_download(
     if headers.is_some() || auth.is_some() {
         state.set_headers_auth(&d.id, headers.unwrap_or_default(), auth);
     }
-    d
+    Ok(d)
 }
 
 /// Snapshot of all in-memory downloads.
@@ -106,24 +139,38 @@ pub fn get_download(state: State<'_, DownloadManager>, id: String) -> Option<Dow
     state.get(&id)
 }
 
+// The pause / resume / cancel / remove / reorder / priority / trash
+// commands are **async** for the same reason `add_download` is: each
+// of them emits a lifecycle event (`StatusChanged` / `Removed`) while
+// the command runs. On Windows, emitting from a synchronous command
+// deadlocks the WebView2 IPC channel (UI keeps rendering, but every
+// subsequent `invoke` hangs and engine-driven updates never arrive —
+// the "buttons unresponsive, task invisible until restart" report).
+// Async commands run off the main thread, so the emit path can never
+// wedge the event loop. They return `Result` because async Tauri
+// commands with borrowed parameters (`State<'_, T>`) must.
 #[tauri::command]
-pub fn pause_download(state: State<'_, DownloadManager>, id: String) {
+pub async fn pause_download(state: State<'_, DownloadManager>, id: String) -> Result<(), String> {
     state.pause(&id);
+    Ok(())
 }
 
 #[tauri::command]
-pub fn resume_download(state: State<'_, DownloadManager>, id: String) {
+pub async fn resume_download(state: State<'_, DownloadManager>, id: String) -> Result<(), String> {
     state.resume(&id);
+    Ok(())
 }
 
 #[tauri::command]
-pub fn cancel_download(state: State<'_, DownloadManager>, id: String) {
+pub async fn cancel_download(state: State<'_, DownloadManager>, id: String) -> Result<(), String> {
     state.cancel(&id);
+    Ok(())
 }
 
 #[tauri::command]
-pub fn remove_download(state: State<'_, DownloadManager>, id: String) {
+pub async fn remove_download(state: State<'_, DownloadManager>, id: String) -> Result<(), String> {
     state.remove(&id);
+    Ok(())
 }
 
 /// Set or clear a per-download speed cap (bytes/sec).
@@ -146,9 +193,16 @@ pub fn set_global_speed_limit(state: State<'_, DownloadManager>, limit: Option<u
 /// reorders still have integer room to land. Rows that are
 /// not in `ids` are left alone. Per-row `StatusChanged` events
 /// are emitted so the list re-renders without a full refresh.
+///
+/// Async + Result for the same reason as `add_download` (emits
+/// events; must not run on the Windows main thread).
 #[tauri::command]
-pub fn reorder_downloads(state: State<'_, DownloadManager>, ids: Vec<String>) {
+pub async fn reorder_downloads(
+    state: State<'_, DownloadManager>,
+    ids: Vec<String>,
+) -> Result<(), String> {
     state.reorder(&ids);
+    Ok(())
 }
 
 /// Set the per-download priority.
@@ -157,13 +211,17 @@ pub fn reorder_downloads(state: State<'_, DownloadManager>, ids: Vec<String>) {
 /// where `0` = low, `1` = normal (default), `2` = high. Higher
 /// priority downloads run before lower priority when the
 /// scheduler picks the next transfer.
+///
+/// Async + Result for the same reason as `add_download` (emits
+/// events; must not run on the Windows main thread).
 #[tauri::command]
-pub fn set_download_priority(
+pub async fn set_download_priority(
     state: State<'_, DownloadManager>,
     id: String,
     priority: u8,
-) {
+) -> Result<(), String> {
     state.set_priority(&id, priority);
+    Ok(())
 }
 
 /// Set per-download HTTP headers and optional `Authorization`
@@ -631,8 +689,11 @@ pub fn trash_paths(paths: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+/// Async + Result for the same reason as `add_download`: the trailing
+/// `state.remove(&id)` emits a `Removed` event, and emitting from a
+/// synchronous command wedges the WebView2 IPC channel on Windows.
 #[tauri::command]
-pub fn trash_download(
+pub async fn trash_download(
     state: State<'_, DownloadManager>,
     id: String,
 ) -> Result<(), String> {

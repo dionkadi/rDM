@@ -5,9 +5,8 @@ use crate::chunk::download_chunk;
 use crate::control::SharedControl;
 use crate::limiter::CombinedLimiter;
 use crate::manager::{DownloadEvent, RunContext};
-use crate::model::{ChunkState, Download, DownloadStatus};
+use crate::model::{ChecksumAlgorithm, ChunkState, Download, DownloadStatus};
 use crate::protocol::{build_plan, plan_chunks};
-use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -524,27 +523,33 @@ pub async fn run_download(ctx: Arc<RunContext>, state: Arc<TaskState>) {
         }
 
         // Checksum verification.
-        if let Some(cs) = &d.checksum {
-            if cs.algorithm.eq_ignore_ascii_case("sha256") {
-                match sha256_of(&save_path) {
-                    Ok(actual) if actual.eq_ignore_ascii_case(&cs.expected) => {}
-                    Ok(actual) => {
-                        d.status = DownloadStatus::Error;
-                        d.error = Some(format!("checksum mismatch (got {actual})"));
-                        let _ = ctx.storage.mark_error(&id, &d.error.clone().unwrap());
-                        ctx.emit(DownloadEvent::Error(d.clone()));
-                        ctx.scheduler.release_download_state(&id);
-                        return;
-                    }
-                    Err(e) => {
-                        d.status = DownloadStatus::Error;
-                        d.error = Some(format!("checksum read failed: {e}"));
-                        let _ = ctx.storage.mark_error(&id, &d.error.clone().unwrap());
-                        ctx.emit(DownloadEvent::Error(d.clone()));
-                        ctx.scheduler.release_download_state(&id);
-                        return;
-                    }
-                }
+        //
+        // The digest is computed over the `.part` file — the bytes the
+        // chunk workers actually wrote — because at this point the
+        // `.part` → final rename has NOT happened yet. The previous
+        // implementation hashed `save_path` here, which does not exist
+        // until after the rename, so every checksum-verified download
+        // on a fresh path failed with "checksum read failed: No such
+        // file or directory" even when the bytes were correct.
+        if let Some(cs) = d.checksum.clone() {
+            let verified: Result<(), String> = match ChecksumAlgorithm::parse(&cs.algorithm) {
+                Some(algo) => match file_digest(&part_path, algo) {
+                    Ok(actual) if actual.eq_ignore_ascii_case(cs.expected.trim()) => Ok(()),
+                    Ok(actual) => Err(format!("checksum mismatch (got {actual})")),
+                    Err(e) => Err(format!("checksum read failed: {e}")),
+                },
+                None => Err(format!(
+                    "unsupported checksum algorithm: {} (supported: md5, sha1, sha256, sha512)",
+                    cs.algorithm
+                )),
+            };
+            if let Err(msg) = verified {
+                d.status = DownloadStatus::Error;
+                d.error = Some(msg.clone());
+                let _ = ctx.storage.mark_error(&id, &msg);
+                ctx.emit(DownloadEvent::Error(d.clone()));
+                ctx.scheduler.release_download_state(&id);
+                return;
             }
         }
 
@@ -590,25 +595,218 @@ pub async fn run_download(ctx: Arc<RunContext>, state: Arc<TaskState>) {
     }
 }
 
-/// Compute the SHA-256 hex digest of a file.
-pub fn sha256_of(path: &Path) -> Result<String, std::io::Error> {
+/// Compute the lowercase hex digest of a file for the given algorithm.
+///
+/// Streams the file in 64 KiB chunks so verifying a multi-gigabyte ISO
+/// never loads it into memory. Each match arm imports its crate's
+/// `Digest` trait locally: `md5`, `sha1` and `sha2` all re-export the
+/// same `digest::Digest` trait, but a single top-level `use` would
+/// name-collide when the crates resolve to different `digest` versions.
+pub fn file_digest(
+    path: &Path,
+    algorithm: ChecksumAlgorithm,
+) -> Result<String, std::io::Error> {
     use std::io::Read;
     let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
+    let hex = match algorithm {
+        ChecksumAlgorithm::Md5 => {
+            use md5::Digest;
+            let mut hasher = md5::Md5::new();
+            loop {
+                let n = file.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            ::hex::encode(hasher.finalize())
         }
-        hasher.update(&buf[0..n]);
-    }
-    Ok(hex::encode(hasher.finalize()))
+        ChecksumAlgorithm::Sha1 => {
+            use sha1::Digest;
+            let mut hasher = sha1::Sha1::new();
+            loop {
+                let n = file.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            ::hex::encode(hasher.finalize())
+        }
+        ChecksumAlgorithm::Sha256 => {
+            use sha2::Digest;
+            let mut hasher = sha2::Sha256::new();
+            loop {
+                let n = file.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            ::hex::encode(hasher.finalize())
+        }
+        ChecksumAlgorithm::Sha512 => {
+            use sha2::Digest;
+            let mut hasher = sha2::Sha512::new();
+            loop {
+                let n = file.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            ::hex::encode(hasher.finalize())
+        }
+    };
+    Ok(hex)
 }
 
 /// Helper used by resume: build a fresh chunk layout for a known-size download.
 pub fn layout_for_resume(total: u64, max_connections: usize) -> Vec<ChunkState> {
     plan_chunks(total, max_connections.max(1))
+}
+
+#[cfg(test)]
+mod digest_tests {
+    use super::*;
+    use crate::model::ChecksumAlgorithm;
+
+    /// Write `data` to a temp file and return its path.
+    fn temp_file(name: &str, data: &[u8]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("dm_digest_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, data).unwrap();
+        p
+    }
+
+    /// Known digest vectors for the empty input (RFC 1321 / RFC 3174 /
+    /// FIPS 180-4 test vectors).
+    const EMPTY_DIGESTS: [(ChecksumAlgorithm, &str); 4] = [
+        (ChecksumAlgorithm::Md5, "d41d8cd98f00b204e9800998ecf8427e"),
+        (ChecksumAlgorithm::Sha1, "da39a3ee5e6b4b0d3255bfef95601890afd80709"),
+        (
+            ChecksumAlgorithm::Sha256,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+        (
+            ChecksumAlgorithm::Sha512,
+            "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce\
+             47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e",
+        ),
+    ];
+
+    /// Known digest vectors for `"abc"` (the canonical NIST/RFC test
+    /// message).
+    const ABC_DIGESTS: [(ChecksumAlgorithm, &str); 4] = [
+        (ChecksumAlgorithm::Md5, "900150983cd24fb0d6963f7d28e17f72"),
+        (ChecksumAlgorithm::Sha1, "a9993e364706816aba3e25717850c26c9cd0d89d"),
+        (
+            ChecksumAlgorithm::Sha256,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        ),
+        (
+            ChecksumAlgorithm::Sha512,
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
+             2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
+        ),
+    ];
+
+    #[test]
+    fn digest_matches_known_vectors_empty_input() {
+        let path = temp_file("empty.bin", b"");
+        for (algo, expected) in EMPTY_DIGESTS {
+            let got = file_digest(&path, algo)
+                .unwrap_or_else(|e| panic!("{:?} on empty file failed: {e}", algo));
+            assert_eq!(got, expected, "{:?} digest of empty input", algo);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn digest_matches_known_vectors_abc() {
+        let path = temp_file("abc.bin", b"abc");
+        for (algo, expected) in ABC_DIGESTS {
+            let got = file_digest(&path, algo)
+                .unwrap_or_else(|e| panic!("{:?} on abc failed: {e}", algo));
+            assert_eq!(got, expected, "{:?} digest of \"abc\"", algo);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The 64 KiB buffer loop must handle inputs larger than one
+    /// read buffer identically to a single-shot hash.
+    #[test]
+    fn digest_streams_large_file_correctly() {
+        let data: Vec<u8> = (0..256 * 1024u32).map(|i| (i as u8).wrapping_mul(31).wrapping_add(7)).collect();
+        let path = temp_file("big.bin", &data);
+        // Compare against a one-shot hash of the same bytes.
+        use sha2::Digest;
+        let expected = {
+            let mut h = sha2::Sha256::new();
+            h.update(&data);
+            ::hex::encode(h.finalize())
+        };
+        assert_eq!(
+            file_digest(&path, ChecksumAlgorithm::Sha256).unwrap(),
+            expected,
+            "streamed digest must equal one-shot digest"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn digest_of_missing_file_is_an_error() {
+        let err = file_digest(Path::new("/nonexistent/dm/definitely-missing.bin"), ChecksumAlgorithm::Md5);
+        assert!(err.is_err(), "missing file must surface as an error");
+    }
+
+    #[test]
+    fn parse_accepts_common_spellings() {
+        // The canonical wire names…
+        for name in ["md5", "sha1", "sha256", "sha512"] {
+            let parsed = ChecksumAlgorithm::parse(name).unwrap_or_else(|| panic!("{name} must parse"));
+            assert_eq!(parsed.as_str(), name);
+        }
+        // …the coreutils-style tool names (what a user pastes out of
+        // a `.sha256sum` listing)…
+        assert_eq!(ChecksumAlgorithm::parse("md5sum"), Some(ChecksumAlgorithm::Md5));
+        assert_eq!(ChecksumAlgorithm::parse("sha1sum"), Some(ChecksumAlgorithm::Sha1));
+        assert_eq!(ChecksumAlgorithm::parse("sha256sum"), Some(ChecksumAlgorithm::Sha256));
+        assert_eq!(ChecksumAlgorithm::parse("sha512sum"), Some(ChecksumAlgorithm::Sha512));
+        // …separator variants…
+        assert_eq!(ChecksumAlgorithm::parse("sha-256"), Some(ChecksumAlgorithm::Sha256));
+        assert_eq!(ChecksumAlgorithm::parse("SHA_512"), Some(ChecksumAlgorithm::Sha512));
+        // …and case-insensitivity.
+        assert_eq!(ChecksumAlgorithm::parse("MD5"), Some(ChecksumAlgorithm::Md5));
+        assert_eq!(ChecksumAlgorithm::parse("SHA-1"), Some(ChecksumAlgorithm::Sha1));
+        assert_eq!(ChecksumAlgorithm::parse("Sha256"), Some(ChecksumAlgorithm::Sha256));
+    }
+
+    #[test]
+    fn parse_rejects_unknown_algorithms() {
+        for name in ["", "crc32", "blake3", "sh1", "sha", "xxhash", "sha3-256"] {
+            assert!(ChecksumAlgorithm::parse(name).is_none(), "{name:?} must not parse");
+        }
+        // Whitespace is trimmed before matching, so padded-but-valid
+        // names still parse.
+        assert_eq!(ChecksumAlgorithm::parse("  sha256  "), Some(ChecksumAlgorithm::Sha256));
+    }
+
+    #[test]
+    fn wire_format_stays_lowercase_string() {
+        // The checksum JSON blob in SQLite and the Tauri wire format
+        // both carry the algorithm as a plain lowercase string. Pin
+        // the serialization so an accidental format change (e.g.
+        // "Md5" or "md-5") can't silently break old rows.
+        let spec = crate::model::ChecksumSpec {
+            algorithm: "sha256".into(),
+            expected: "abc".into(),
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(json.contains(r#""algorithm":"sha256""#), "wire json: {json}");
+    }
 }
 
 #[cfg(test)]
