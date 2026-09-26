@@ -29,49 +29,15 @@
   const dispatch = createEventDispatcher();
 
   // ── Drag and drop ────────────────────────────────────────
-  // We use the native HTML5 drag API rather than a library
-  // because the use case is small: drag a row by its handle,
-  // drop on another row, the parent reorders the array. The
-  // browser handles the visual feedback (the row is
-  // automatically half-transparent while dragged). We do
-  // *not* use the `dataTransfer` payload for ordering — the
-  // parent knows the source id from the `dragstart` event.
-  let dragOver: "above" | "below" | null = null;
-  function onDragStart(e: DragEvent) {
-    if (!e.dataTransfer) return;
-    e.dataTransfer.setData("text/x-dm-download-id", download.id);
-    // `effectAllowed = "move"` is the default for most browsers
-    // but setting it explicitly prevents some browsers from
-    // showing the "copy" cursor when the row is over a text
-    // field by accident.
-    e.dataTransfer.effectAllowed = "move";
-  }
-  function onDragOver(e: DragEvent) {
-    e.preventDefault();
-    if (!e.dataTransfer) return;
-    e.dataTransfer.dropEffect = "move";
-    // The top/bottom half of the row determines whether the
-    // drop is "insert above" or "insert below". A 12 px deadband
-    // near the row edges keeps the cursor steady when the
-    // pointer hovers exactly on the boundary.
-    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    const y = e.clientY - r.top;
-    dragOver = y < r.height / 2 ? "above" : "below";
-  }
-  function onDragLeave() {
-    dragOver = null;
-  }
-  function onDrop(e: DragEvent) {
-    e.preventDefault();
-    dragOver = null;
-    const sourceId = e.dataTransfer?.getData("text/x-dm-download-id");
-    if (!sourceId || sourceId === download.id) return;
-    dispatch("reorder", {
-      sourceId,
-      targetId: download.id,
-      position: dragOver === "above" ? "before" : "after",
-    });
-  }
+  // Rows are deliberately NOT draggable. The window is the drop
+  // target: dragging a link (or anything with a URL) from the
+  // browser *into* the app adds it as a download, and the row
+  // must neither hijack nor swallow those drops — the row's own
+  // drag handlers used to `preventDefault()` every dragover and
+  // read only their private payload type, which blocked the
+  // app-level drop handler and made the task card itself drag
+  // around like a ghost. Reordering stays available through the
+  // keyboard (Alt+↑ / Alt+↓), which dispatches `reorder-keyboard`.
 
   let expanded = false;
   let menuOpen = false;
@@ -210,18 +176,11 @@
   class:expanded
   class:compact
   class:selected
-  class:drag-above={dragOver === "above"}
-  class:drag-below={dragOver === "below"}
-  draggable="true"
   role="button"
   aria-label="Download: {download.filename || download.url}, press Enter to {expanded ? 'collapse' : 'expand'} details"
   tabindex="0"
   on:keydown={onKeydown}
   on:click={onRowClick}
-  on:dragstart={onDragStart}
-  on:dragover={onDragOver}
-  on:dragleave={onDragLeave}
-  on:drop={onDrop}
 >
   <div class="lead">
     {#if selectable}
@@ -461,18 +420,6 @@
      mid-drag without overshooting. We avoid a box-shadow on
      the whole row — it would shift the layout and the user's
      pointer would no longer line up with the slot they aimed at. */
-  .drow.drag-above {
-    box-shadow: inset 0 2px 0 0 var(--accent);
-  }
-  .drow.drag-below {
-    box-shadow: inset 0 -2px 0 0 var(--accent);
-  }
-  .drow[draggable="true"] {
-    cursor: grab;
-  }
-  .drow[draggable="true"]:active {
-    cursor: grabbing;
-  }
   .drow.status-completed {
     border-color: var(--color-success-strong);
   }

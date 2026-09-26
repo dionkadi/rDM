@@ -848,6 +848,9 @@ function handleGrab(tabId, sendResponse) {
         urls,
         referer: (res && res.referer) || "",
         userAgent: (res && res.userAgent) || "",
+        // Page metadata (title / date / uploader) for a meaningful
+        // merged filename and container tags.
+        meta: (res && res.meta) || null,
       });
       sendResponse({
         ok: true,

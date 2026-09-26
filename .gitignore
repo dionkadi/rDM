@@ -23,3 +23,7 @@ Thumbs.db
 # gitignored so the next agent doesn't try to commit them).
 coredump/
 images/
+
+# System / agent artifacts
+.Trash-0/
+.workbuddy/

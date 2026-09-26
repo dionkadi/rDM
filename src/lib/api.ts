@@ -207,6 +207,16 @@ export function trashDownload(id: string): Promise<void> {
 }
 
 /**
+ * Move arbitrary on-disk files to the OS trash. The paired-capture
+ * auto-merge uses it to remove the temporary part files once the merged
+ * file exists (the first row is retargeted at the merged file, so its
+ * original part would otherwise linger in the save directory).
+ */
+export function trashPaths(paths: string[]): Promise<void> {
+ return invoke("trash_paths", { paths });
+}
+
+/**
  * Set per-download HTTP headers + auth. Routes through the
  * existing `set_download_auth` Tauri command. Headers and auth
  * are in-memory only — they are NOT persisted to SQLite, so a
@@ -294,11 +304,25 @@ export function probeFfmpeg(): Promise<ToolInfo> {
  * wrong pairing fails with a message instead of producing a
  * picture-less file. The two sources are left on disk; the first
  * download's row is retargeted at the merged file so it shows up in the
- * list.
+ * list. `outputName` optionally names the merged file (paired-capture
+ * flow); the file is renamed next to the same directory.
  */
 export function mergeDownloads(
   firstId: string,
   secondId: string,
+  outputName?: string | null,
+  metadata?: { title?: string | null; date?: string | null; artist?: string | null } | null,
 ): Promise<MergeResult> {
-  return invoke("merge_downloads", { firstId, secondId });
+  return invoke("merge_downloads", {
+    firstId,
+    secondId,
+    outputName: outputName ?? null,
+    metadata: metadata
+      ? {
+          title: metadata.title ?? null,
+          date: metadata.date ?? null,
+          artist: metadata.artist ?? null,
+        }
+      : null,
+  });
 }

@@ -83,6 +83,11 @@ export interface CapturedUrl {
  source: string;
  /** The raw URL the browser handed us. */
  url: string;
+ /** Second half of a video+audio pair (DASH). When set, the capture
+  *  is ONE logical download: both halves are queued from a single
+  *  confirmation and automatically merged into one playable file
+  *  (ffmpeg) once both finish. `null`/absent for ordinary captures. */
+ pairSecond?: string | null;
  /** Filename extracted from the URL path / Content-Disposition
   *  on the Rust side. The user can edit this in the dialog. */
  suggestedFilename: string;
@@ -107,6 +112,13 @@ export interface CapturedUrl {
   *  per-download headers is the path of least surprise.
   *  `null` when the native host didn't relay one. */
  userAgent: string | null;
+ /** Page metadata harvested by the grab (title / upload date /
+  *  uploader). Pre-fills a meaningful filename and is written into
+  *  the merged file's container tags. Absent when the page offered
+  *  nothing. */
+ metaTitle?: string | null;
+ metaDate?: string | null;
+ metaArtist?: string | null;
  /** Monotonic ID for dedupe. If the same URL comes in twice in
   *  quick succession (e.g. double-click) the frontend can drop
   *  the second one. */

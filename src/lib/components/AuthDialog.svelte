@@ -689,12 +689,18 @@
     font-weight: 600;
     font-family: inherit;
     cursor: pointer;
-    transition: background 0.12s, border-color 0.12s;
+    transition: background 0.12s, border-color 0.12s, filter 0.12s;
   }
   .mini:hover:not(:disabled) { background: var(--color-surface-active); border-color: var(--color-border-strong); }
   .mini:disabled { opacity: 0.5; cursor: not-allowed; }
   .mini.primary { background: var(--color-accent); color: #fff; border-color: transparent; }
-  .mini.primary:hover:not(:disabled) { filter: brightness(1.08); }
+  /* Re-asserts the accent: `.mini:hover` (0,3,0) outranks
+   * `.mini.primary` (0,2,0) and would otherwise swap the accent for a
+   * translucent near-white surface while the text stays #fff. */
+  .mini.primary:hover:not(:disabled) {
+    background: var(--color-accent);
+    filter: brightness(1.08);
+  }
   .hint {
     color: var(--color-text-muted);
     font-size: 11.5px;
@@ -765,14 +771,20 @@
     font-weight: 600;
     font-family: inherit;
     cursor: pointer;
-    transition: background 0.12s, transform 0.04s;
+    transition: background 0.12s, filter 0.12s, transform 0.04s;
   }
   .btn:hover:not(:disabled) { background: var(--color-surface-active); }
   .btn:active:not(:disabled) { transform: translateY(1px); }
   .btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .btn.ghost { background: transparent; }
   .btn.primary { background: var(--color-accent); color: #fff; border-color: transparent; }
-  .btn.primary:hover:not(:disabled) { filter: brightness(1.08); }
+  /* Re-asserts the accent: `.btn:hover` (0,3,0) outranks `.btn.primary`
+   * (0,2,0) and would otherwise swap the accent for a translucent
+   * near-white surface while the text stays #fff. */
+  .btn.primary:hover:not(:disabled) {
+    background: var(--color-accent);
+    filter: brightness(1.08);
+  }
   .dirty-tag {
     color: transparent;
     font-size: 14px;

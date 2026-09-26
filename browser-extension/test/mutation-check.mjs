@@ -139,10 +139,17 @@ const MUTATIONS = [
     pattern: "the tooling runs when invoked through a symlinked path",
   },
   {
-    name: "grab  offer the player's HTML again",
+    // The old mutations "offer the player's HTML again" (removing the
+    // DOCUMENT_RE guard / the iframe filter) became behaviorally inert
+    // once the grab was curated down to extension-verified candidates:
+    // an HTML URL is now excluded by construction (rank < 2), so no
+    // single-layer mutation can make it reappear. The live mutants for
+    // the grab contract are the pair gate and the range-request strip
+    // below.
+    name: "grab  stop pairing the two stream halves",
     file: "content.js",
-    find: '    if (src && RESOURCE_MEDIA_RE.test(src)) add(src, "iframe");',
-    replace: '    if (src) add(src, "iframe");',
+    find: "  if (episodeBases.length >= 2) {",
+    replace: "  if (false) {",
     test: "test/content.test.mjs",
     pattern: "grab: a bilibili-style page yields the real streams",
   },
@@ -155,12 +162,20 @@ const MUTATIONS = [
     pattern: "grab: a bilibili-style page yields the real streams",
   },
   {
-    name: "grab  drop the ranking / cap",
+    name: "grab  ignore the page's play info (stay half-observed)",
     file: "content.js",
-    find: "    .slice(0, MAX_GRAB_URLS)",
-    replace: "    .slice(0, 999)",
+    find: "  for (const src of sources) {",
+    replace: "  for (const src of []) {",
     test: "test/content.test.mjs",
-    pattern: "grab: results are ranked best-first and capped",
+    pattern: "grab: the page's play info completes the pair",
+  },
+  {
+    name: "grab  send byte-range fragments instead of stream bases",
+    file: "content.js",
+    find: "  function withoutRangeParam(raw) {",
+    replace: "  function withoutRangeParam(raw) { return raw;",
+    test: "test/content.test.mjs",
+    pattern: "grab: one grab, one download",
   },
 ];
 

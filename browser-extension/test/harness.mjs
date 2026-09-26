@@ -594,9 +594,19 @@ export class FakeDocument {
     this.documentElement = new FakeElement("html");
     this.body = new FakeElement("body");
     this.readyState = "complete";
+    this.title = options.title ?? "";
     this._byId = new Map();
     this._listeners = {};
     this.querySelectorAllResults = options.querySelectorAllResults || {};
+  }
+  /**
+   * Minimal `querySelector` matching the registered results map by
+   * selector (first element), so content scripts reading meta tags
+   * (page metadata harvest) work against the fake.
+   */
+  querySelector(selector) {
+    const found = this.querySelectorAllResults[selector];
+    return Array.isArray(found) ? (found[0] ?? null) : null;
   }
   createElement(tag) {
     return new FakeElement(tag);
@@ -703,6 +713,24 @@ export function loadExtension(scripts, env) {
     chrome: chromeApi,
   };
   if (env.WebSocket !== undefined) sandbox.WebSocket = env.WebSocket;
+  // `URL` is a standard global every browser context has (content.js
+  // uses it to compare origins/directories when deciding whether two
+  // files are a DASH pair). The vm context does not get host globals
+  // for free, so hand over the host's own `URL`.
+  if (typeof URL !== "undefined") sandbox.URL = URL;
+  // `fetch` for the play-info enhancement (content.js re-fetches the
+  // page's playurl API). Injected per-test via `env.fetch`; when
+  // absent, content.js takes its synchronous heuristic-only path.
+  if (env.fetch !== undefined) sandbox.fetch = env.fetch;
+  // AbortController is used for the enhancement's timeout.
+  if (typeof AbortController !== "undefined") {
+    sandbox.AbortController = AbortController;
+  }
+  // `window` for the embedded `__playinfo__` source. Must be
+  // self-referential via `top`, or content.js's top-frame guard would
+  // treat the script as running inside an iframe and never answer a
+  // collect message.
+  if (env.window !== undefined) sandbox.window = env.window;
   if (env.location !== undefined) sandbox.location = env.location;
   if (env.document !== undefined) sandbox.document = env.document;
   if (env.navigator !== undefined) sandbox.navigator = env.navigator;

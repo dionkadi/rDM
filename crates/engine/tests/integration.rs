@@ -96,6 +96,39 @@ fn handle(stream: &mut std::net::TcpStream, data: &[u8], mode: u8) {
         .unwrap_or("")
         .to_string();
 
+    // Mode 2: an anti-leech server. Every request WITHOUT a `Referer:`
+    // header is answered with `403` + a tiny text/html stub, exactly the
+    // shape bilibili's PCDN edge uses (and the shape the probe used to
+    // misread as a successful probe: content-length 150, text/html,
+    // no Accept-Ranges). With a referer it behaves like mode 0.
+    if mode == 2 && !req.to_ascii_lowercase().contains("referer:") {
+        let body = "<html>403 forbidden</html>";
+        let resp = format!(
+            "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(resp.as_bytes());
+        let _ = stream.flush();
+        return;
+    }
+
+    // Mode 3: HEAD is rejected with 405 but ranged GETs work. The probe
+    // must take the resource total from `Content-Range` of the 206 — the
+    // 206's own `Content-Length` is the 1-byte probe range, and reading
+    // it as the total planned a 1-byte "completed" download.
+    if mode == 3 && method.eq_ignore_ascii_case("HEAD") {
+        let body = "method not allowed";
+        let resp = format!(
+            "HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(resp.as_bytes());
+        let _ = stream.flush();
+        return;
+    }
+
     if method.eq_ignore_ascii_case("HEAD") {
         let body = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
@@ -608,4 +641,218 @@ async fn remove_while_downloading_leaves_no_ghost_row() {
         resurrected.is_empty(),
         "the worker's finalize path must not re-insert a removed row, found {resurrected:?}"
     );
+}
+
+// ── Anti-leech probe regressions ────────────────────────────────────
+//
+// Reported with a real bilibili PCDN URL: the grab produced a
+// "Completed" download of exactly 150 B whose content was the head of
+// the real stream. The chain: the probe sent no per-download Referer,
+// the CDN answered `403 + text/html + Content-Length: 150`, and the
+// probe consumed that error page's headers as a successful probe —
+// total_size = 150, one chunk. The chunk worker (which *did* carry the
+// Referer) then requested `Range: bytes=0-149`, got 206 with the first
+// 150 real bytes, and the task renamed it done. These tests pin both
+// halves of the fix: the probe must carry the download's credentials,
+// and a non-success probe response must fail the download instead of
+// describing it.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn anti_leech_probe_succeeds_with_per_download_referer() {
+    let port = spawn_server(2, 0);
+    let tmp = std::env::temp_dir().join(format!("dm_it_leech_ok_{}.bin", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+
+    let storage = Storage::open_memory().expect("memory storage");
+    let mgr = DownloadManager::with_settings(storage, Settings::default());
+
+    let mut d = Download::new(format!("http://127.0.0.1:{port}/video.m4s"));
+    d.id = "leech-ok".into();
+    d.save_path = tmp.clone();
+    // The capture dialog pre-fills these from the browser for
+    // browser-grabbed URLs; they must reach the PROBE, not just the
+    // chunk workers.
+    d.headers.insert("Referer".into(), "https://www.bilibili.com/".into());
+    let id = d.id.clone();
+    mgr.add(d);
+
+    let d = wait_until_downloaded(&mgr, &id).await;
+    assert_eq!(
+        d.status,
+        DownloadStatus::Completed,
+        "status was {:?}: {:?}",
+        d.status,
+        d.error
+    );
+    // The old bug planned total = the 403 stub's Content-Length (150)
+    // and "completed" after one tiny ranged slice.
+    assert_eq!(
+        d.total_size,
+        Some(payload().len() as u64),
+        "total must be the real resource size, got {:?}",
+        d.total_size
+    );
+    let written = std::fs::read(&tmp).expect("output file exists");
+    assert_eq!(written, payload(), "bytes match exactly");
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn anti_leech_probe_without_credentials_fails_loudly() {
+    let port = spawn_server(2, 0);
+    let tmp = std::env::temp_dir().join(format!("dm_it_leech_no_{}.bin", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+
+    let storage = Storage::open_memory().expect("memory storage");
+    let mgr = DownloadManager::with_settings(storage, Settings::default());
+
+    let mut d = Download::new(format!("http://127.0.0.1:{port}/video.m4s"));
+    d.id = "leech-no".into();
+    d.save_path = tmp.clone();
+    let id = d.id.clone();
+    mgr.add(d);
+
+    let d = wait_until_downloaded(&mgr, &id).await;
+    // The download must NOT "complete" with the error page. It fails —
+    // loudly, with the real HTTP status — instead.
+    assert_eq!(
+        d.status,
+        DownloadStatus::Error,
+        "a 403 on every request must surface as an error, got {:?} ({:?})",
+        d.status,
+        d.error
+    );
+    let err = d.error.unwrap_or_default();
+    assert!(err.contains("403"), "error should name the status: {err:?}");
+    assert!(
+        !tmp.exists(),
+        "the final file must never be created for a refused download"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_total_prefers_content_range_on_206() {
+    let port = spawn_server(3, 0);
+    let tmp = std::env::temp_dir().join(format!("dm_it_cr_{}.bin", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+
+    let storage = Storage::open_memory().expect("memory storage");
+    let mgr = DownloadManager::with_settings(storage, Settings::default());
+
+    let mut d = Download::new(format!("http://127.0.0.1:{port}/file.bin"));
+    d.id = "cr".into();
+    d.save_path = tmp.clone();
+    let id = d.id.clone();
+    mgr.add(d);
+
+    let d = wait_until_downloaded(&mgr, &id).await;
+    assert_eq!(
+        d.status,
+        DownloadStatus::Completed,
+        "status was {:?}: {:?}",
+        d.status,
+        d.error
+    );
+    // HEAD was rejected; the ranged 0-0 probe answered
+    // `Content-Length: 1` + `Content-Range: bytes 0-0/{N}`. The total
+    // must come from Content-Range — Content-Length of a 206 is the
+    // partial size, and reading it as the total planned a 1-byte
+    // "completed" download.
+    assert_eq!(
+        d.total_size,
+        Some(payload().len() as u64),
+        "total must come from Content-Range, got {:?}",
+        d.total_size
+    );
+    let written = std::fs::read(&tmp).expect("output file exists");
+    assert_eq!(written, payload(), "bytes match exactly");
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+// ── Startup self-heal + resume guard ────────────────────────────────
+//
+// Real-world report: a COMPLETED (merged) task became "Queued at 0 %"
+// after an app restart while the file sat intact on disk. Chain: the
+// row was resumed/resumed-again after completion (re-downloading its
+// original part URL, which 403'd), persisted as `error` with
+// downloaded = 0, and on restart the error row loaded as active →
+// `Queued` + verify reset the progress. Two fixes, both pinned here:
+// `resume()` must ignore completed rows, and `start()` must restore a
+// row whose final file is already complete on disk.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn startup_self_heals_a_complete_file_marked_error() {
+    let port = spawn_server(0, 0);
+    let tmp = std::env::temp_dir().join(format!("dm_it_heal_{}.bin", std::process::id()));
+    // The "intact file": full payload already on disk.
+    std::fs::write(&tmp, payload()).expect("write intact file");
+
+    let storage = Storage::open_memory().expect("memory storage");
+    let mgr = DownloadManager::with_settings(storage, Settings::default());
+
+    // The row as it would be persisted after the crash/re-download
+    // mess: status error, progress zeroed, but the file is complete.
+    let mut d = Download::new(format!("http://127.0.0.1:{port}/file.bin"));
+    d.id = "heal".into();
+    d.save_path = tmp.clone();
+    d.total_size = Some(payload().len() as u64);
+    d.downloaded = 0;
+    d.chunks = vec![dm_engine::model::ChunkState {
+        index: 0,
+        start: 0,
+        end: payload().len() as u64 - 1,
+        downloaded: 0,
+    }];
+    d.status = DownloadStatus::Error;
+    d.error = Some("http error: 403".into());
+    let id = d.id.clone();
+    // `add` persists the row as-is (error rows are not spawned).
+    mgr.add(d);
+    mgr.start().await;
+
+    let d = mgr.get(&id).expect("row exists");
+    assert_eq!(
+        d.status,
+        DownloadStatus::Completed,
+        "an intact final file must self-heal to Completed, got {:?} ({:?})",
+        d.status,
+        d.error
+    );
+    assert_eq!(d.downloaded, payload().len() as u64);
+    let written = std::fs::read(&tmp).expect("file still on disk");
+    assert_eq!(written, payload(), "the intact file is untouched");
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_on_a_completed_row_is_a_no_op() {
+    let port = spawn_server(0, 0);
+    let tmp = std::env::temp_dir().join(format!("dm_it_res_{}.bin", std::process::id()));
+    std::fs::write(&tmp, payload()).expect("write file");
+
+    let storage = Storage::open_memory().expect("memory storage");
+    let mgr = DownloadManager::with_settings(storage, Settings::default());
+
+    let mut d = Download::new(format!("http://127.0.0.1:{port}/file.bin"));
+    d.id = "res".into();
+    d.save_path = tmp.clone();
+    d.total_size = Some(payload().len() as u64);
+    d.downloaded = payload().len() as u64;
+    d.status = DownloadStatus::Completed;
+    let id = d.id.clone();
+    mgr.add(d);
+
+    // Resuming a completed row used to re-download the row's ORIGINAL
+    // url — for a merged pair row that overwrote the merged file.
+    mgr.resume(&id);
+    let d = mgr.get(&id).expect("row exists");
+    assert_eq!(d.status, DownloadStatus::Completed);
+    assert_eq!(d.downloaded, payload().len() as u64);
+    let written = std::fs::read(&tmp).expect("merged file intact");
+    assert_eq!(written, payload(), "the file must not be touched");
+
+    let _ = std::fs::remove_file(&tmp);
 }

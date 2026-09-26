@@ -109,7 +109,6 @@ pub fn forward_url(
     referer: Option<&str>,
     user_agent: Option<&str>,
 ) -> std::io::Result<()> {
-    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
     let mut payload = serde_json::json!({ "url": url });
     if let Some(r) = referer {
         if !r.is_empty() {
@@ -121,12 +120,31 @@ pub fn forward_url(
             payload["userAgent"] = serde_json::Value::String(ua.to_string());
         }
     }
-    let body = payload.to_string() + "\n";
-    stream.write_all(body.as_bytes())?;
+    send_line(&payload.to_string(), port)
+}
+
+/// Write one line-delimited JSON payload to the app's localhost socket.
+fn send_line(line: &str, port: u16) -> std::io::Result<()> {
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
+    stream.write_all(format!("{line}\n").as_bytes())?;
     stream.flush()
 }
 
-fn handle_message(msg: &serde_json::Value, port: u16) {
+/// Collect the URLs a native-messaging message is actually offering as
+/// download candidates.
+///
+/// Two message shapes exist:
+///
+///   * single forward (`forward_url`): `{"url":"…"}` (+ optional
+///     `"html"` page source). Here `"url"` IS the candidate, and
+///     `"download"` / `"src"` are legacy aliases.
+///   * grab batch (the extension's "Grab page media"): `{"type":
+///     "capture","url":"<the page>","urls":[…],"referer":…,…}`. Here
+///     `"url"` is the **page the grab ran on** — context, not a
+///     candidate. Forwarding it used to hand DM the embed/watch page
+///     itself (e.g. `player.html`, `iframe.html`) alongside the real
+///     media, which is the bug this split exists to fix.
+fn candidate_urls(msg: &serde_json::Value) -> Vec<String> {
     let mut urls: Vec<String> = Vec::new();
     if let Some(html) = msg.get("html").and_then(|v| v.as_str()) {
         urls.extend(extract_media_urls(html));
@@ -139,6 +157,9 @@ fn handle_message(msg: &serde_json::Value, port: u16) {
                 }
             }
         }
+        // Batch shape: `urls` is authoritative; the page-level `url`
+        // must never be re-added as a download.
+        return urls;
     }
     for key in ["url", "download", "src"] {
         if let Some(u) = msg.get(key).and_then(|v| v.as_str()) {
@@ -147,7 +168,68 @@ fn handle_message(msg: &serde_json::Value, port: u16) {
             }
         }
     }
-    for u in urls {
+    urls
+}
+
+/// Build the line-JSON payload a grab batch is forwarded as.
+///
+/// The batch is forwarded **as one payload** (not per-URL): the two
+/// halves of a grabbed DASH pair must reach the app together, with the
+/// extension's `pair` flag intact, or the app treats them as unrelated
+/// single downloads (and its same-origin pairing heuristic un-pairs
+/// cross-mirror grabs — video from one `upos-sz-*` mirror, audio from
+/// another). Returns `None` for messages without a usable batch.
+fn batch_payload(msg: &serde_json::Value) -> Option<serde_json::Value> {
+    let arr = msg.get("urls").and_then(|v| v.as_array())?;
+    if arr.is_empty() {
+        return None;
+    }
+    let urls: Vec<String> = arr
+        .iter()
+        .filter_map(|u| u.as_str())
+        .filter(|s| looks_like_downloadable_url(s))
+        .map(|s| s.to_string())
+        .collect();
+    if urls.is_empty() {
+        return None;
+    }
+    let mut payload = serde_json::json!({
+        "type": "capture",
+        "urls": urls,
+        "pair": msg.get("pair").and_then(|p| p.as_bool()).unwrap_or(false),
+    });
+    if let Some(r) = msg.get("referer").and_then(|v| v.as_str()) {
+        if !r.is_empty() {
+            payload["referer"] = serde_json::Value::String(r.to_string());
+        }
+    }
+    if let Some(ua) = msg.get("userAgent").and_then(|v| v.as_str()) {
+        if !ua.is_empty() {
+            payload["userAgent"] = serde_json::Value::String(ua.to_string());
+        }
+    }
+    // Page metadata (title / date / uploader) — forwarded verbatim for
+    // the app's merged-file tags and filename.
+    if let Some(meta) = msg.get("meta") {
+        if meta.is_object() {
+            payload["meta"] = meta.clone();
+        }
+    }
+    Some(payload)
+}
+
+fn handle_message(msg: &serde_json::Value, port: u16) {
+    // Grab batches go out as one payload (pairing intent preserved).
+    if let Some(payload) = batch_payload(msg) {
+        if let Err(e) = send_line(&payload.to_string(), port) {
+            // App not listening (or unreachable) — drop silently; the
+            // extension will retry on the next capture.
+            eprintln!("dm-native-host: could not forward batch: {e}");
+        }
+        return;
+    }
+    // Single-URL shapes (click / save-as): one forward per candidate.
+    for u in candidate_urls(msg) {
         // Pull the page-level Referer / User-Agent off the
         // top-level message so the per-URL call below
         // doesn't have to redo the work. The browser
@@ -248,5 +330,93 @@ mod tests {
         assert!(extract_media_urls(r#"<a href="/relative/path.mp4">x</a>"#).is_empty());
         assert!(extract_media_urls(r#"<a href="javascript:alert(1)">x</a>"#).is_empty());
         assert!(extract_media_urls(r#"<a href="data:application/zip;base64,AAA">x</a>"#).is_empty());
+    }
+
+    /// The grab batch shape carries the *page* URL in `"url"` next to
+    /// the real candidates in `"urls"`. Forwarding `"url"` too is how
+    /// DM ended up with `player.html` / `iframe.html` rows alongside
+    /// the media the user actually asked for.
+    #[test]
+    fn capture_batch_does_not_forward_the_page_url() {
+        let msg: serde_json::Value = serde_json::json!({
+            "type": "capture",
+            "url": "https://player.example.test/embed/player.html?vid=42",
+            "urls": [
+                "https://cdn.example.test/stream.m3u8",
+                "https://cdn.example.test/video.mp4",
+            ],
+            "referer": "https://site.example.test/watch/42",
+            "userAgent": "Mozilla/5.0 (Test)",
+        });
+        let urls = candidate_urls(&msg);
+        assert_eq!(
+            urls,
+            vec![
+                "https://cdn.example.test/stream.m3u8".to_string(),
+                "https://cdn.example.test/video.mp4".to_string(),
+            ]
+        );
+    }
+
+    /// The legacy single-forward shape (`forward_url`) must keep
+    /// working: `"url"` is the candidate there, and nothing else in
+    /// the message says otherwise.
+    #[test]
+    fn single_forward_still_uses_the_url_field() {
+        let msg: serde_json::Value = serde_json::json!({
+            "url": "https://files.example.test/archive.zip",
+            "referer": "https://site.example.test/page",
+            "userAgent": "Mozilla/5.0 (Test)",
+        });
+        assert_eq!(
+            candidate_urls(&msg),
+            vec!["https://files.example.test/archive.zip".to_string()]
+        );
+    }
+
+    /// An empty `urls` batch must not fall back to forwarding the page
+    /// URL either — the extension never sends an empty batch, but a
+    /// buggy one should degrade to "forward nothing", not "forward the
+    /// page the user was on".
+    #[test]
+    fn empty_batch_forwards_nothing() {
+        let msg: serde_json::Value = serde_json::json!({
+            "type": "capture",
+            "url": "https://site.example.test/watch/42",
+            "urls": [],
+        });
+        assert!(candidate_urls(&msg).is_empty());
+        assert!(batch_payload(&msg).is_none());
+    }
+
+    /// Batches are forwarded AS ONE payload with the pairing intent
+    /// intact — per-URL forwarding produced two unrelated captures and
+    /// cross-mirror pairs were un-paired by the app's same-origin
+    /// heuristic.
+    #[test]
+    fn batch_is_forwarded_as_one_payload_with_pair_flag() {
+        let msg: serde_json::Value = serde_json::json!({
+            "type": "capture",
+            "url": "https://site.example.test/watch/42",
+            "urls": [
+                "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/42/42-1-100022.m4s?upsign=v",
+                "https://upos-sz-mirrorkb.bilivideo.com/upgcxcode/1/2/42/42-1-30216.m4s?upsign=a",
+            ],
+            "pair": true,
+            "referer": "https://www.bilibili.com/video/BV1x",
+            "userAgent": "Mozilla/5.0 (Test)",
+        });
+        let payload = batch_payload(&msg).expect("batch payload");
+        assert_eq!(
+            payload.get("urls").and_then(|v| v.as_array()).map(|a| a.len()),
+            Some(2)
+        );
+        assert_eq!(payload.get("pair").and_then(|p| p.as_bool()), Some(true));
+        // The page URL must not sneak in as a download candidate.
+        assert!(payload.get("url").is_none());
+        assert_eq!(
+            payload.get("referer").and_then(|v| v.as_str()),
+            Some("https://www.bilibili.com/video/BV1x")
+        );
     }
 }

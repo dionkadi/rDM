@@ -89,7 +89,33 @@ export async function refreshDownloads(): Promise<void> {
     // `removedIds` came back, stop blocking it, otherwise a late event
     // for it would be swallowed forever.
     for (const d of list) removedIds.delete(d.id);
-    downloads.set(list);
+    // One-task pair view: hide the second halves (keeping their state
+    // for progress folding) and fold their progress into the visible
+    // first rows.
+    const visible: Download[] = [];
+    for (const d of list) {
+      if (hiddenSeconds.has(d.id)) {
+        hiddenRows.set(d.id, d);
+        continue;
+      }
+      const partnerId = pairPartner.get(d.id);
+      const hidden = partnerId ? hiddenRows.get(partnerId) : undefined;
+      if (hidden) {
+        const pending = pendingMerges.get(d.id);
+        visible.push({
+          ...d,
+          filename: pending ? pending.mergedName : d.filename,
+          downloaded: (d.downloaded || 0) + (hidden.downloaded || 0),
+          totalSize:
+            (d.totalSize || 0) + (hidden.totalSize || 0) > 0
+              ? (d.totalSize || 0) + (hidden.totalSize || 0)
+              : d.totalSize,
+        });
+        continue;
+      }
+      visible.push(d);
+    }
+    downloads.set(visible);
     error.set("");
   } catch (e) {
     error.set(String(e));
@@ -122,23 +148,334 @@ export async function addDownload(opts: {
   }
 }
 
+// ── Paired captures (DASH video + audio → one download) ─────────────
+//
+// The browser extension curates a grab down to ONE logical download;
+// for a DASH page that is a *pair* of `.m4s` streams. The capture
+// dialog confirms the pair once, both halves are queued here, and the
+// merge runs automatically when both finish — the IDM contract of one
+// grab → one (playable) file, with no manual "select two rows → Merge"
+// step.
+
+/** Queue both halves of a paired capture. Same category / headers /
+ *  speed limit for both (they are halves of one download); filenames
+ *  come from the engine's `suggest_filename` (the halves are
+ *  temporary). Returns the created row ids. */
+export interface PairMeta {
+  title?: string | null;
+  date?: string | null;
+  artist?: string | null;
+}
+
+export async function addPairedDownloads(opts: {
+  firstUrl: string;
+  secondUrl: string;
+  category?: string | null;
+  speedLimit?: number | null;
+  headers?: Record<string, string> | null;
+  meta?: PairMeta | null;
+}): Promise<{ firstId: string; secondId: string }> {
+  const build = (url: string) => ({
+    url,
+    category: opts.category ?? null,
+    filename: null,
+    speedLimit: opts.speedLimit ?? null,
+    checksum: null,
+    headers: opts.headers ?? null,
+  });
+  try {
+    const first = await api.addDownload(build(opts.firstUrl));
+    const second = await api.addDownload(build(opts.secondUrl));
+    await refreshDownloads();
+    return { firstId: first.id, secondId: second.id };
+  } catch (e) {
+    error.set(String(e));
+    throw e;
+  }
+}
+
+/**
+ * Pending auto-merges: pairs queued from one capture that must become
+ * one file when both halves finish. Keyed by BOTH part ids (either
+ * half's completion event can trigger the merge); `firstId` is the row
+ * the merged file gets attached to, `mergedName` is what the user
+ * typed in the capture dialog.
+ */
+const pendingMerges = new Map<
+  string,
+  { firstId: string; otherId: string; mergedName: string; meta?: PairMeta | null }
+>();
+
+// ── One-task pair display ───────────────────────────────────────────
+//
+// A confirmed pair queues TWO engine rows (the halves), but the list
+// shows ONE task: the first row, whose progress is the sum of both
+// halves. The second row is hidden (tracked here) and the pair
+// dissolves when the merge completes. Persisted so restarting the app
+// mid-download keeps both the single-task view and the auto-merge
+// arming.
+const PAIR_STORAGE_KEY = "dmPendingPairs";
+const pairPartner = new Map<string, string>(); // both directions
+const hiddenSeconds = new Set<string>(); // second-half ids (hidden rows)
+const hiddenRows = new Map<string, Download>(); // last known hidden-half state
+
+function persistPairs(): void {
+  try {
+    if (typeof localStorage === "undefined") return;
+    const entries: {
+      firstId: string;
+      otherId: string;
+      mergedName: string;
+      meta?: PairMeta | null;
+    }[] = [];
+    for (const entry of pendingMerges.values()) {
+      if (entry.firstId === entry.otherId) continue;
+      // One record per pair (keyed by the first id).
+      if (entries.some((e) => e.firstId === entry.firstId)) continue;
+      entries.push({
+        firstId: entry.firstId,
+        otherId: entry.otherId,
+        mergedName: entry.mergedName,
+        meta: entry.meta ?? null,
+      });
+    }
+    localStorage.setItem(PAIR_STORAGE_KEY, JSON.stringify(entries));
+  } catch (_e) {
+    // Storage unavailable (private mode) — the in-memory state still
+    // covers this session.
+  }
+}
+
+function restorePairs(): void {
+  try {
+    if (typeof localStorage === "undefined") return;
+    const raw = localStorage.getItem(PAIR_STORAGE_KEY);
+    if (!raw) return;
+    const entries = JSON.parse(raw) as {
+      firstId: string;
+      otherId: string;
+      mergedName: string;
+      meta?: PairMeta | null;
+    }[];
+    for (const e of entries) {
+      if (!e || !e.firstId || !e.otherId) continue;
+      const entry = {
+        firstId: e.firstId,
+        otherId: e.otherId,
+        mergedName: e.mergedName,
+        meta: e.meta ?? null,
+      };
+      pendingMerges.set(e.firstId, entry);
+      pendingMerges.set(e.otherId, entry);
+      pairPartner.set(e.firstId, e.otherId);
+      pairPartner.set(e.otherId, e.firstId);
+      hiddenSeconds.add(e.otherId);
+    }
+  } catch (_e) {
+    // Corrupt payload — start clean.
+  }
+}
+restorePairs();
+
+export function armAutoMerge(
+  firstId: string,
+  secondId: string,
+  mergedName: string,
+  meta?: PairMeta | null,
+): void {
+  const entry = {
+    firstId,
+    otherId: secondId,
+    mergedName,
+    meta: meta ?? null,
+  };
+  pendingMerges.set(firstId, entry);
+  pendingMerges.set(secondId, entry);
+  // One-task display: the second half is hidden; its progress folds
+  // into the first row.
+  pairPartner.set(firstId, secondId);
+  pairPartner.set(secondId, firstId);
+  hiddenSeconds.add(secondId);
+  persistPairs();
+}
+
+function dissolvePair(firstId: string, secondId: string): void {
+  pairPartner.delete(firstId);
+  pairPartner.delete(secondId);
+  hiddenSeconds.delete(secondId);
+  hiddenRows.delete(secondId);
+  persistPairs();
+}
+
+/** Fold the hidden half's progress into the visible first row. The
+ * visible task always carries the FINAL name the user typed in the
+ * capture dialog — never the engine's part filename. */
+function foldPairProgress(secondId: string): void {
+  const firstId = pairPartner.get(secondId);
+  if (!firstId) return;
+  const second = hiddenRows.get(secondId);
+  const pending = pendingMerges.get(firstId);
+  downloads.update((list) => {
+    const i = list.findIndex((x) => x.id === firstId);
+    if (i < 0) return list;
+    const first = list[i];
+    const combined: Download = { ...first };
+    if (pending) combined.filename = pending.mergedName;
+    if (second) {
+      combined.downloaded = (first.downloaded || 0) + (second.downloaded || 0);
+      combined.totalSize =
+        (first.totalSize || 0) + (second.totalSize || 0) > 0
+          ? (first.totalSize || 0) + (second.totalSize || 0)
+          : first.totalSize;
+      // While the hidden half is still moving, the task is not
+      // "completed" — the first half finishing first must not flip the
+      // single task to Completed and back.
+      if (
+        second.status === "downloading" ||
+        second.status === "connecting"
+      ) {
+        combined.status = "downloading";
+      }
+      // Surface the hidden half's failure on the visible task: a pair
+      // with a dead half can't merge.
+      if (
+        (second.status === "error" || second.status === "canceled") &&
+        first.status !== "error"
+      ) {
+        combined.status = second.status === "error" ? "error" : first.status;
+        combined.error = second.error ?? combined.error;
+      }
+    }
+    const next = list.slice();
+    next[i] = combined;
+    return next;
+  });
+}
+
+function dropPendingMerge(id: string): void {
+  const entry = pendingMerges.get(id);
+  if (!entry) return;
+  pendingMerges.delete(entry.firstId);
+  pendingMerges.delete(entry.otherId);
+}
+
+/** Fired from the event listener when a pending-merge part completes.
+ *  Runs the merge exactly once, when BOTH halves are completed. */
+async function maybeAutoMerge(id: string): Promise<void> {
+  const entry = pendingMerges.get(id);
+  if (!entry) return;
+  const list = get(downloads);
+  const first = list.find((d) => d.id === entry.firstId);
+  // The hidden half never enters the visible list — read its last
+  // known state from the pair registry.
+  const other = hiddenRows.get(entry.otherId);
+  if (!first || !other) return; // partner's event has not arrived yet
+  if (first.status !== "completed" || other.status !== "completed") return;
+
+  // Clear BEFORE awaiting so a duplicate event can't double-merge.
+  pendingMerges.delete(entry.firstId);
+  pendingMerges.delete(entry.otherId);
+  // Snapshot the first part's on-disk file BEFORE the merge: the merge
+  // retargets the row at the merged file, and the original part would
+  // otherwise linger in the save directory next to the result.
+  const firstPartPath = first.savePath;
+  try {
+    await api.mergeDownloads(
+      entry.firstId,
+      entry.otherId,
+      entry.mergedName,
+      entry.meta ?? null,
+    );
+    // The second half is a temporary fragment of this merge; the merged
+    // file is now attached to the first row, so the leftover row (and
+    // its part file) only adds noise. Move it to the OS trash —
+    // recoverable, unlike a hard delete.
+    await api.trashDownload(entry.otherId).catch(() => {});
+    // The first half's original part file lingers for the same reason
+    // (the row survives, retargeted at the merged file). Trash it too,
+    // leaving exactly ONE file for the whole download.
+    await api.trashPaths([firstPartPath]).catch(() => {});
+    // The pair is done: dissolve the one-task display state so the
+    // merged row stands alone.
+    dissolvePair(entry.firstId, entry.otherId);
+    // The halves' own completions were suppressed for the one-task
+    // view — the merged file is the completion the user cares about.
+    api
+      .notify_on_complete(
+        "Download Complete",
+        `${entry.mergedName} is ready`,
+      )
+      .catch(() => {});
+    await refreshDownloads();
+    const ui = await import("./ui");
+    ui.showToast({
+      kind: "success",
+      title: "Video merged",
+      message: entry.mergedName,
+      duration: 6000,
+    });
+  } catch (e) {
+    // Both rows stay (the parts are intact); the user can retry via
+    // the manual "Merge" bulk action after fixing the cause (usually
+    // a missing ffmpeg).
+    const ui = await import("./ui");
+    ui.showToast({
+      kind: "error",
+      title: "Auto-merge failed",
+      message: String(e),
+      duration: 8000,
+    });
+  }
+}
+
+/** A pending-merge part that ended in a terminal failure state cancels
+ *  the auto-merge: merging half a download produces nothing useful. */
+function cancelAutoMergeFor(id: string, status: string): void {
+  if (!pendingMerges.has(id)) return;
+  const entry = pendingMerges.get(id)!;
+  dropPendingMerge(id);
+  const ui = import("./ui");
+  void ui.then((m) =>
+    m.showToast({
+      kind: "error",
+      title: "Auto-merge cancelled",
+      message: `"${entry.mergedName}" will not be merged — one of its parts ended as ${status}.`,
+      duration: 8000,
+    }),
+  );
+}
+
+/**
+ * Paired downloads are ONE task in the UI but TWO engine rows; control
+ * actions on the visible row must reach the hidden half as well, or a
+ * pause would halt only the video while the audio keeps downloading.
+ */
+function withHiddenPartner(ids: string[]): string[] {
+  const out = new Set<string>(ids);
+  for (const id of ids) {
+    const partner = pairPartner.get(id);
+    if (partner && hiddenSeconds.has(partner)) out.add(partner);
+  }
+  return [...out];
+}
+
 export async function pauseDownload(id: string): Promise<void> {
-  await api.pauseDownload(id);
+  for (const target of withHiddenPartner([id])) await api.pauseDownload(target);
   await refreshDownloads();
 }
 
 export async function resumeDownload(id: string): Promise<void> {
-  await api.resumeDownload(id);
+  for (const target of withHiddenPartner([id])) await api.resumeDownload(target);
   await refreshDownloads();
 }
 
 export async function cancelDownload(id: string): Promise<void> {
-  await api.cancelDownload(id);
+  for (const target of withHiddenPartner([id])) await api.cancelDownload(target);
   await refreshDownloads();
 }
 
 export async function removeDownload(id: string): Promise<void> {
-  await api.removeDownload(id);
+  for (const target of withHiddenPartner([id])) await api.removeDownload(target);
   await refreshDownloads();
 }
 
@@ -182,21 +519,27 @@ async function bulkApply(
 }
 
 export async function bulkPause(ids: readonly string[]): Promise<void> {
-  const r = await bulkApply(ids, pauseDownload);
+  const r = await bulkApply(withHiddenPartner([...ids]), (id) =>
+    api.pauseDownload(id),
+  );
   await refreshDownloads();
   if (r.failed > 0)
     throw new Error(`${r.ok} paused, ${r.failed} failed: ${r.firstError}`);
 }
 
 export async function bulkResume(ids: readonly string[]): Promise<void> {
-  const r = await bulkApply(ids, resumeDownload);
+  const r = await bulkApply(withHiddenPartner([...ids]), (id) =>
+    api.resumeDownload(id),
+  );
   await refreshDownloads();
   if (r.failed > 0)
     throw new Error(`${r.ok} resumed, ${r.failed} failed: ${r.firstError}`);
 }
 
 export async function bulkRemove(ids: readonly string[]): Promise<void> {
-  const r = await bulkApply(ids, removeDownload);
+  const r = await bulkApply(withHiddenPartner([...ids]), (id) =>
+    api.removeDownload(id),
+  );
   await refreshDownloads();
   if (r.failed > 0)
     throw new Error(`${r.ok} removed, ${r.failed} failed: ${r.firstError}`);
@@ -213,7 +556,9 @@ export async function bulkRemove(ids: readonly string[]): Promise<void> {
  * Trash".
  */
 export async function bulkTrash(ids: readonly string[]): Promise<void> {
-  const r = await bulkApply(ids, (id) => api.trashDownload(id));
+  const r = await bulkApply(withHiddenPartner([...ids]), (id) =>
+    api.trashDownload(id),
+  );
   await refreshDownloads();
   if (r.failed > 0)
     throw new Error(`${r.ok} trashed, ${r.failed} failed: ${r.firstError}`);
@@ -271,6 +616,15 @@ let unlistenFn: (() => void) | null = null;
  */
 const removedIds = new Set<string>();
 
+/**
+ * Rows whose completion has already been announced. The engine emits a
+ * completed status more than once per row (the task's own `Completed`
+ * event, then the merged file's retargeting `StatusChanged`) — without
+ * this guard each emission became a separate OS notification
+ * ("Download complete" spam).
+ */
+const notifiedComplete = new Set<string>();
+
 export async function startEventListener(): Promise<void> {
   try {
     const { listen } = await import("@tauri-apps/api/event");
@@ -287,6 +641,10 @@ export async function startEventListener(): Promise<void> {
         const captured: CapturedUrl = {
           source: e.source,
           url: e.url,
+          pairSecond: e.pairSecond ?? null,
+          metaTitle: e.metaTitle ?? null,
+          metaDate: e.metaDate ?? null,
+          metaArtist: e.metaArtist ?? null,
           suggestedFilename: e.suggestedFilename,
           defaultSaveDir: e.defaultSaveDir,
           referer: e.referer,
@@ -301,10 +659,14 @@ export async function startEventListener(): Promise<void> {
         // complaint. When the window *is* focused the dialog plus the
         // in-app toast are feedback enough, so we skip the duplicate.
         if (typeof document !== "undefined" && !document.hasFocus()) {
+          // Name the capture after the page's title when the grab could
+          // read one — "41875472475-1-100022.m4s" tells nobody anything.
           api
             .notify(
               "New download captured",
-              captured.suggestedFilename || captured.url,
+              captured.metaTitle ||
+                captured.suggestedFilename ||
+                captured.url,
             )
             .catch(() => {});
         }
@@ -313,7 +675,26 @@ export async function startEventListener(): Promise<void> {
       if (e.kind === "removed") {
         const removedId = e.id;
         removedIds.add(removedId);
+        if (hiddenSeconds.has(removedId)) {
+          // The hidden half's row was dropped engine-side (auto-merge
+          // cleanup or control fan-out) — nothing visible to remove.
+          hiddenRows.delete(removedId);
+          hiddenSeconds.delete(removedId);
+          const firstId = pairPartner.get(removedId);
+          pairPartner.delete(removedId);
+          if (firstId) pairPartner.delete(firstId);
+          persistPairs();
+          return;
+        }
         downloads.update((list) => list.filter((d) => d.id !== removedId));
+        // A removed row can be half of a pending auto-merge; there is
+        // nothing left to merge for it. If the removed row was the
+        // visible half of a pair, dissolve the whole pair (the
+        // control fan-out below already removed the hidden half
+        // engine-side).
+        const removedPartner = pairPartner.get(removedId);
+        if (removedPartner) dissolvePair(removedId, removedPartner);
+        dropPendingMerge(removedId);
         // Lazy-import to avoid a circular dependency: `ui.ts` is
         // also imported by the download store, so reaching back
         // into it from a top-level `import` would be a cycle.
@@ -330,15 +711,23 @@ export async function startEventListener(): Promise<void> {
       // A late event for a row the user already removed must not
       // resurrect it. See `removedIds` above.
       if (removedIds.has(d.id)) return;
-      // Notify on completion
-      if (d.status === "completed") {
-        api
-          .notify_on_complete(
-            "Download Complete",
-            `${d.filename} finished downloading`,
-          )
-          .catch(() => {});
+      // Hidden pair halves never enter the list: their progress folds
+      // into the visible first row (one task in the UI), and their
+      // completion drives the auto-merge. Notifications for halves are
+      // suppressed — the merged row announces itself.
+      if (hiddenSeconds.has(d.id)) {
+        hiddenRows.set(d.id, d);
+        if (d.status === "completed") {
+          void maybeAutoMerge(d.id);
+        } else if (d.status === "error" || d.status === "canceled") {
+          cancelAutoMergeFor(d.id, d.status);
+        }
+        foldPairProgress(d.id);
+        return;
       }
+      // Merge the event into the list FIRST: the auto-merge trigger
+      // below reads the store, and it must see this row's new status
+      // (the second half's Completed event is what fires the merge).
       downloads.update((list) => {
         const i = list.findIndex((x) => x.id === d.id);
         if (i >= 0) {
@@ -348,6 +737,37 @@ export async function startEventListener(): Promise<void> {
         }
         return [d, ...list];
       });
+      // Now that the store reflects `d`, run the paired-capture hooks.
+      const isPairFirst = pairPartner.has(d.id);
+      if (isPairFirst) {
+        // Keep the single task's name/progress combined after every
+        // engine event.
+        const partner = pairPartner.get(d.id);
+        if (partner) foldPairProgress(partner);
+      }
+      // Notify on completion — once per row, and never for a half of a
+      // pending pair: the merged file announces itself when the merge
+      // succeeds.
+      if (d.status === "completed") {
+        if (isPairFirst && pendingMerges.has(d.id)) {
+          // Half of a pending pair — the merge notification follows.
+        } else if (!notifiedComplete.has(d.id)) {
+          notifiedComplete.add(d.id);
+          api
+            .notify_on_complete(
+              "Download Complete",
+              `${d.filename} finished downloading`,
+            )
+            .catch(() => {});
+        }
+        // Paired capture: this may be one half finishing. The merge
+        // runs when BOTH halves are completed (maybeAutoMerge is
+        // idempotent and waits for the partner otherwise).
+        void maybeAutoMerge(d.id);
+      } else if (d.status === "error" || d.status === "canceled") {
+        notifiedComplete.delete(d.id);
+        cancelAutoMergeFor(d.id, d.status);
+      }
     });
   } catch {
     // Tauri not available (preview mode)

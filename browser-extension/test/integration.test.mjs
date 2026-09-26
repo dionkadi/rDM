@@ -173,7 +173,9 @@ test("P1-6: the popup refuses to claim success when nothing was sent", async () 
 
   const text = textOf(els.status);
   assert.match(text, /DM host not running/);
-  assert.match(text, /Found 2 media URL\(s\) but nothing was sent/, text);
+  // The grab is curated (one logical download: the mp4 — the zip link
+  // is not media and loses to it), so exactly one URL was selected.
+  assert.match(text, /Found 1 media URL\(s\) but nothing was sent/, text);
 });
 
 test("the popup reports a real success", async () => {
@@ -188,7 +190,7 @@ test("the popup reports a real success", async () => {
 
   const text = textOf(els.status);
   assert.match(text, /DM host connected — WebSocket 127\.0\.0\.1:9157/);
-  assert.match(text, /Sent 2 media URL\(s\) to DM\./);
+  assert.match(text, /Sent 1 media URL\(s\) to DM\./);
   assert.ok(!/nothing was sent/.test(text));
 });
 

@@ -24,7 +24,14 @@
   import { fly, fade } from "svelte/transition";
   import { cubicOut } from "svelte/easing";
   import type { Category, CapturedUrl } from "../types";
-  import { captureQueue, popCapture, addDownload, refreshDownloads } from "../stores/downloads";
+  import {
+    captureQueue,
+    popCapture,
+    addDownload,
+    addPairedDownloads,
+    armAutoMerge,
+    refreshDownloads,
+  } from "../stores/downloads";
   import { settings, loadSettings } from "../stores/settings";
   import { showToast } from "../stores/ui";
   import { isUrl } from "../utils/formatters";
@@ -69,9 +76,32 @@
   // user clicks Download or Skip, we pop it and the reactive
   // statement re-binds `current` to the next capture.
   $: current = $captureQueue[0] ?? null;
-  // Re-initialise form fields whenever a new capture arrives.
-  $: if (current) {
-    filename = current.suggestedFilename;
+  // Re-initialise form fields once per capture — keyed on the capture's
+  // nonce, NOT on `current`'s reference. The queue array is replaced on
+  // every store update, which re-invalidates `current` even when the
+  // capture is the same object; re-running the init then WIPED whatever
+  // the user had picked (the reported "category dropdown doesn't
+  // change" — the selection was reset between picking and reading it).
+  let initializedNonce: string | null = null;
+  // Filename-safe version of the page title: separators and reserved
+  // characters become spaces, whitespace collapses, length capped.
+  function sanitizeTitle(t: string): string {
+    return t
+      .replace(/[\\/:*?"<>|\x00-\x1f]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 120);
+  }
+  $: if (current && current.nonce !== initializedNonce) {
+    initializedNonce = current.nonce;
+    // Prefer the page's title for the filename (`<title>.mkv`) and keep
+    // the URL-derived name as the extension source / fallback.
+    const ext =
+      current.suggestedFilename.includes(".")
+        ? (current.suggestedFilename.split(".").pop() || "bin").toLowerCase()
+        : "bin";
+    const title = current.metaTitle ? sanitizeTitle(current.metaTitle) : "";
+    filename = title ? `${title}.${ext}` : current.suggestedFilename;
     category = autoSuggestCategory(current);
     speedLimit = "";
     checksumExpected = "";
@@ -84,6 +114,16 @@
     // can still toggle before clicking "Download".
     sendReferer = !!(current.referer && current.referer.length > 0);
     sendUserAgent = !!(current.userAgent && current.userAgent.length > 0);
+  }
+  // The category <option>s only exist once settings have loaded. When
+  // they arrive AFTER the form was initialised, re-apply the
+  // auto-suggestion once — otherwise the select stays stuck on the
+  // placeholder ("Default") even though the user's choice would have
+  // been valid. Runs at most once per capture.
+  let categoryAppliedFor: string | null = null;
+  $: if (current && $settings && categoryAppliedFor !== current.nonce) {
+    categoryAppliedFor = current.nonce;
+    if (!category) category = autoSuggestCategory(current);
   }
 
   // Compute the save path preview from the currently selected
@@ -162,9 +202,6 @@
       const limit = speedLimit.trim()
         ? Math.max(0, Math.round(Number(speedLimit) * 1024))
         : null;
-      const checksum = showChecksum && checksumExpected.trim()
-        ? { algorithm: checksumAlgo, expected: checksumExpected.trim() }
-        : null;
       // Build the per-download headers from the Referer /
       // User-Agent form fields. We only include a header if
       // the user has the matching toggle on AND the value
@@ -175,23 +212,58 @@
       const headers: Record<string, string> = {};
       if (sendReferer && referer.trim()) headers["Referer"] = referer.trim();
       if (sendUserAgent && userAgent.trim()) headers["User-Agent"] = userAgent.trim();
-      // `category === ""` means "use the default save dir" (the
-      // engine's `save_dir_for(None)`). We pass null rather than
-      // an empty string so the Rust side can pattern-match on
-      // `Option<String>`.
-      await addDownload({
-        url: current.url,
-        category: category || null,
-        filename: filename.trim(),
-        speedLimit: limit,
-        checksum,
-        headers: Object.keys(headers).length > 0 ? headers : null,
-      });
-      showToast({
-        kind: "success",
-        title: "Download added",
-        message: filename.trim(),
-      });
+      const hdrs = Object.keys(headers).length > 0 ? headers : null;
+
+      if (current.pairSecond) {
+        // Paired capture (DASH video + audio): ONE confirmation queues
+        // both halves with the same category / headers / speed limit,
+        // and the merge runs automatically when both finish. The
+        // filename field names the merged file; the checksum row does
+        // not apply (it would describe the halves, not the merged
+        // output), so it is ignored for pairs.
+        const mergedName = filename.trim();
+        const meta = {
+          title: current.metaTitle ?? null,
+          date: current.metaDate ?? null,
+          artist: current.metaArtist ?? null,
+        };
+        const { firstId, secondId } = await addPairedDownloads({
+          firstUrl: current.url,
+          secondUrl: current.pairSecond,
+          category: category || null,
+          speedLimit: limit,
+          headers: hdrs,
+          meta,
+        });
+        armAutoMerge(firstId, secondId, mergedName, meta);
+        showToast({
+          kind: "success",
+          title: "Video queued (2 parts)",
+          message: `${mergedName} — parts merge automatically when both finish (needs ffmpeg).`,
+          duration: 6000,
+        });
+      } else {
+        // `category === ""` means "use the default save dir" (the
+        // engine's `save_dir_for(None)`). We pass null rather than
+        // an empty string so the Rust side can pattern-match on
+        // `Option<String>`.
+        const checksum = showChecksum && checksumExpected.trim()
+          ? { algorithm: checksumAlgo, expected: checksumExpected.trim() }
+          : null;
+        await addDownload({
+          url: current.url,
+          category: category || null,
+          filename: filename.trim(),
+          speedLimit: limit,
+          checksum,
+          headers: hdrs,
+        });
+        showToast({
+          kind: "success",
+          title: "Download added",
+          message: filename.trim(),
+        });
+      }
       popCapture();
       // Refresh the list so the new row shows up immediately.
       await refreshDownloads();
@@ -232,7 +304,8 @@
     showToast({
       kind: "info",
       title: "New download ready",
-      message: current.suggestedFilename || current.url,
+      message:
+        current.metaTitle || current.suggestedFilename || current.url,
       duration: 5000,
     });
   }
@@ -273,7 +346,17 @@
       </div>
       <div>
         <h2 id="cd-title">{SOURCE_LABEL[current.source] ?? "Browser extension"}</h2>
-        <div class="src">{current.url}</div>
+        <div class="src" title={current.url}>{current.url}</div>
+        {#if current.pairSecond}
+          <div class="src" title="Second half of the video + audio pair">
+            + {current.pairSecond}
+          </div>
+          <div class="pair-hint">
+            Video + audio pair: both halves are queued from this one
+            confirmation and merged into a single playable file
+            automatically when they finish (needs ffmpeg).
+          </div>
+        {/if}
       </div>
       {#if $captureQueue.length > 1}
         <div class="more" title="Captures queued: {$captureQueue.length}">
@@ -284,12 +367,14 @@
 
     <div class="bd">
       <label class="field">
-        <span class="lbl">Filename</span>
+        <span class="lbl">
+          {current.pairSecond ? "Merged filename" : "Filename"}
+        </span>
         <input
           class="inp"
           type="text"
           bind:value={filename}
-          placeholder="filename"
+          placeholder={current.pairSecond ? "merged video filename" : "filename"}
           autocomplete="off"
           spellcheck="false"
         />
@@ -387,7 +472,10 @@
     position: fixed;
     inset: 0;
     background: rgba(8, 10, 14, 0.55);
-    backdrop-filter: blur(4px);
+    /* No `backdrop-filter` on purpose: WebKitGTK composites native
+     * <select> popups incorrectly over backdrop-blurred layers — the
+     * category dropdown rendered detached/unclickable. The dim alone
+     * reads fine. */
     z-index: var(--z-modal);
   }
   .modal {
@@ -441,6 +529,17 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     font-family: var(--font-mono);
+  }
+  .pair-hint {
+    margin-top: 4px;
+    font-size: 11px;
+    line-height: 1.45;
+    color: var(--color-text-muted);
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: 7px;
+    padding: 6px 9px;
+    max-width: 420px;
   }
   .more {
     margin-left: auto;
@@ -585,7 +684,7 @@
     font-weight: 600;
     font-family: inherit;
     cursor: pointer;
-    transition: background 0.12s, transform 0.04s;
+    transition: background 0.12s, filter 0.12s, transform 0.04s;
   }
   .btn:hover:not(:disabled) { background: var(--color-surface-active); }
   .btn:active:not(:disabled) { transform: translateY(1px); }
@@ -596,5 +695,13 @@
     color: #fff;
     border-color: transparent;
   }
-  .btn.primary:hover:not(:disabled) { filter: brightness(1.08); }
+  /* Must re-assert the accent background: the generic `.btn:hover`
+   * rule above has *higher* specificity (0,3,0) than `.btn.primary`
+   * (0,2,0), so on hover it swaps the accent for a translucent
+   * near-white surface while the text stays #fff — the button goes
+   * unreadable. This rule is (0,4,0) and wins. */
+  .btn.primary:hover:not(:disabled) {
+    background: var(--color-accent);
+    filter: brightness(1.08);
+  }
 </style>

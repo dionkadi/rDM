@@ -413,6 +413,12 @@ pub struct MergeResult {
 /// for `.m4s` (bilibili names both halves the same way). Asking the
 /// caller to know which is which would push a guess onto the UI.
 ///
+/// `output_name` optionally names the merged file (used by the paired
+/// capture flow, where the user typed a name in the capture dialog).
+/// The file is renamed next to the same directory, with a `(1)`-style
+/// suffix on collision. Without it the merged file keeps the remux's
+/// default name (first input's stem + container).
+///
 /// The merged file is verified to contain at least one video **and** one
 /// audio stream. A wrong pairing therefore fails with a clear message
 /// instead of leaving the user with a silent "success" and a
@@ -427,6 +433,8 @@ pub async fn merge_downloads(
     state: State<'_, DownloadManager>,
     first_id: String,
     second_id: String,
+    output_name: Option<String>,
+    metadata: Option<dm_engine::media::OutputMeta>,
 ) -> Result<MergeResult, String> {
     if first_id == second_id {
         return Err("pick two different downloads to merge".into());
@@ -455,26 +463,95 @@ pub async fn merge_downloads(
         }
     }
 
-    let outcome = dm_engine::media::remux(&first.save_path, &second.save_path)
+    let outcome = dm_engine::media::remux(&first.save_path, &second.save_path, metadata.as_ref())
         .await
         .map_err(|e| e.to_string())?;
+
+    // Optionally give the merged file the name the user chose (paired
+    // capture flow). The rename happens after the merge succeeded so a
+    // failure above never leaves a half-renamed artifact behind.
+    let mut output_path = std::path::PathBuf::from(&outcome.output_path);
+    if let Some(want) = output_name.as_deref() {
+        if let Some(target) = rename_merged(&output_path, want) {
+            std::fs::rename(&output_path, &target)
+                .map_err(|e| format!("could not rename the merged file: {e}"))?;
+            output_path = target;
+        }
+    }
 
     // The download's output is now the merged file, so point the row at
     // it. Done after the merge succeeded and no earlier: a failed merge
     // must leave the row describing the file that is actually on disk.
-    state.set_output_file(&first_id, std::path::Path::new(&outcome.output_path));
+    state.set_output_file(&first_id, &output_path);
 
     let (video_streams, audio_streams) = match outcome.streams {
         Some((v, a)) => (Some(v), Some(a)),
         None => (None, None),
     };
     Ok(MergeResult {
-        output_path: outcome.output_path,
+        output_path: output_path.to_string_lossy().to_string(),
         bytes: outcome.bytes,
         container: outcome.container,
         video_streams,
         audio_streams,
     })
+}
+
+/// Resolve the rename target for a merged file: next to the original,
+/// path separators stripped, the container extension appended when the
+/// requested name has none, and a `(n)` suffix on collision. Returns
+/// `None` when there is nothing to change (empty name or same path).
+fn rename_merged(output: &std::path::Path, want: &str) -> Option<std::path::PathBuf> {
+    let want = want.trim();
+    if want.is_empty() {
+        return None;
+    }
+    let clean: String = want
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '\0'..='\x1f' => '_',
+            _ => c,
+        })
+        .collect();
+    let dir = output.parent()?.to_path_buf();
+    // Append the container extension when the requested name has none,
+    // so "My Video" becomes "My Video.mp4" rather than an extensionless
+    // file players refuse to open.
+    let has_ext = std::path::Path::new(&clean)
+        .extension()
+        .map(|e| !e.is_empty())
+        .unwrap_or(false);
+    let base = if has_ext {
+        dir.join(&clean)
+    } else {
+        let container = output
+            .extension()
+            .map(|e| e.to_string_lossy().to_string())
+            .unwrap_or_else(|| "mp4".to_string());
+        dir.join(format!("{clean}.{container}"))
+    };
+    if base == output {
+        return None;
+    }
+    if !base.exists() {
+        return Some(base);
+    }
+    // Collision: "name (1).ext", "name (2).ext", …
+    let stem = base
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "merged".to_string());
+    let ext = base
+        .extension()
+        .map(|e| e.to_string_lossy().to_string())
+        .unwrap_or_default();
+    for n in 1..1000u32 {
+        let candidate = dir.join(format!("{stem} ({n}).{ext}"));
+        if !candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// Snapshot of the native-messaging host listener, used by the Settings →
@@ -529,6 +606,31 @@ pub fn probe_native_host(
 /// because that would bypass the user's recoverable-delete
 /// intent. The frontend should show a clear "trash failed"
 /// toast and offer a "Force delete" follow-up.
+/// Move arbitrary on-disk files to the OS trash.
+///
+/// Used by the paired-capture auto-merge: the merged file is attached to
+/// the first part's row, but that row's ORIGINAL `.m4s` part would
+/// otherwise linger in the save directory next to the result. Missing
+/// paths are skipped silently (a part that was already cleaned up is
+/// not an error).
+#[tauri::command]
+pub fn trash_paths(paths: Vec<String>) -> Result<(), String> {
+    let existing: Vec<std::path::PathBuf> = paths
+        .iter()
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.exists())
+        .collect();
+    if existing.is_empty() {
+        return Ok(());
+    }
+    trash::delete_all(&existing).map_err(|e| {
+        format!(
+            "failed to move to trash: {e} (files kept on disk; the user can retry or delete manually)"
+        )
+    })?;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn trash_download(
     state: State<'_, DownloadManager>,

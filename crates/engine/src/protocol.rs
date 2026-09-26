@@ -21,6 +21,11 @@ pub struct Probe {
 pub enum ProbeError {
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
+    /// The server answered the probe with a non-success status. This used
+    /// to be swallowed (the error page's headers were read as a successful
+    /// probe), which produced tiny "completed" downloads of HTML stubs.
+    #[error("HTTP {0}: the server refused the download request — if this is an anti-leech CDN, set Referer / User-Agent in Advanced")]
+    Status(u16),
 }
 
 /// Extract a filename from a `Content-Disposition` header or the URL path.
@@ -128,13 +133,27 @@ async fn log_http_error(stage: &str, _url: &str, err: &reqwest::Error) {
 
 /// Probe a URL with a `HEAD` request, falling back to a ranged `GET` when HEAD
 /// is not allowed. Determines size, range support, content type and filename.
-pub async fn probe(client: &Client, url: &str) -> Result<Probe, ProbeError> {
+///
+/// `extra_headers` / `auth` are the per-download credentials (Referer,
+/// User-Agent, Authorization, …). Anti-leech CDNs (bilibili's PCDN edge and
+/// friends) answer a probe that lacks them with `403` + a small HTML stub —
+/// the probe MUST present the same credentials the chunk workers will, or it
+/// describes a response the download would never receive.
+pub async fn probe(
+    client: &Client,
+    url: &str,
+    extra_headers: &std::collections::BTreeMap<String, String>,
+    auth: Option<&crate::model::AuthSpec>,
+) -> Result<Probe, ProbeError> {
     // We deliberately do **not** use `?` on the `.send().await` calls
     // so that, on failure, we can pull the response object out of
     // the `reqwest::Error` and dump the status, headers, and a body
     // preview to the log. Without this, the next "error decoding
     // response body" leaves no forensic trace.
-    let head = client.head(url).send().await;
+    let mut head_req = client.head(url);
+    crate::chunk::apply_extra_headers(&mut head_req, extra_headers);
+    head_req = crate::chunk::apply_auth(head_req, auth, url);
+    let head = head_req.send().await;
     let mut resp = match head {
         Ok(r) => r,
         Err(e) => {
@@ -145,8 +164,10 @@ pub async fn probe(client: &Client, url: &str) -> Result<Probe, ProbeError> {
     let status = resp.status();
     // Some servers reject HEAD; retry with a 0-byte range GET.
     if !status.is_success() {
-        let ranged = client
-            .get(url)
+        let mut ranged_req = client.get(url);
+        crate::chunk::apply_extra_headers(&mut ranged_req, extra_headers);
+        ranged_req = crate::chunk::apply_auth(ranged_req, auth, url);
+        let ranged = ranged_req
             .header(reqwest::header::RANGE, "bytes=0-0")
             .send()
             .await;
@@ -157,6 +178,15 @@ pub async fn probe(client: &Client, url: &str) -> Result<Probe, ProbeError> {
                 return Err(ProbeError::Http(e));
             }
         }
+    }
+    // **The final response's status is the server's final word.** Both the
+    // HEAD and the ranged-GET fallback must actually succeed before their
+    // headers may be read. Without this check, an anti-leech CDN's
+    // `403 + text/html + Content-Length: 150` stub was consumed as a
+    // successful probe: `total_size = 150`, one chunk, and the download
+    // "completed" with 150 bytes of the error page.
+    if !resp.status().is_success() {
+        return Err(ProbeError::Status(resp.status().as_u16()));
     }
 
     let content_length = resp
@@ -194,8 +224,18 @@ pub async fn probe(client: &Client, url: &str) -> Result<Probe, ProbeError> {
 
     let filename = suggest_filename(url, cd.as_deref(), "download.bin");
 
-    // Prefer the explicit length; fall back to the 206 content-range total.
-    let content_length = content_length.or(content_range);
+    // On a plain 200, prefer the explicit `Content-Length`; fall back to
+    // the 206 content-range total. **On a 206 the order MUST flip**: the
+    // `Content-Length` of a partial response is the *range's* size (1 byte
+    // for the `bytes=0-0` probe), not the resource size — only
+    // `Content-Range` knows the true total. Preferring Content-Length on a
+    // 206 planned 1-byte "completed" downloads whenever HEAD was rejected
+    // and the ranged probe succeeded.
+    let content_length = if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+        content_range.or(content_length)
+    } else {
+        content_length.or(content_range)
+    };
 
     // Log a single info line with the resolved metadata so the log
     // file tells the full story of every probed URL.
@@ -277,7 +317,13 @@ pub async fn build_plan(
     download: &mut Download,
     max_connections: usize,
 ) {
-    match probe(probe_client, &download.url).await {
+    match probe(
+        probe_client,
+        &download.url,
+        &download.headers,
+        download.auth.as_ref(),
+    )
+    .await {
         Ok(p) => {
             download.can_resume = p.accept_ranges;
             download.content_type = p.content_type.clone();

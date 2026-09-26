@@ -1042,7 +1042,6 @@
             total={visible.length}
             on:action={onAction}
             on:select={(e) => onRowSelect(e, visible.map((x) => x.id))}
-            on:reorder={(e) => onRowReorder(e, visible.map((x) => x.id))}
             on:reorder-keyboard={(e) => onRowReorder(e, visible.map((x) => x.id))}
           />
         </div>

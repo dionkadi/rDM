@@ -88,7 +88,7 @@ fn status_error(resp: reqwest::Response) -> ChunkError {
 /// are added verbatim. Header names are stored case-sensitively
 /// (reqwest's `HeaderMap` is case-insensitive on the wire, so
 /// `referer` and `Referer` both end up as the same header).
-fn apply_extra_headers(
+pub(crate) fn apply_extra_headers(
     req: &mut reqwest::RequestBuilder,
     extra: &std::collections::BTreeMap<String, String>,
 ) {
@@ -117,6 +117,38 @@ fn apply_extra_headers(
         // inner state.
         *req = std::mem::replace(req, reqwest::Client::new().get("http://localhost/")).header(name, value);
     }
+}
+
+/// Apply the per-download `Authorization` to a request builder. The
+/// probe must present the same credentials as the chunk workers — an
+/// auth-gated server must not answer the probe with different headers
+/// than the download will get. `Digest` downgrades to `Basic` (the
+/// engine has no challenge/response loop yet; see the `download_chunk`
+/// docs).
+pub(crate) fn apply_auth(
+    mut req: reqwest::RequestBuilder,
+    auth: Option<&crate::model::AuthSpec>,
+    url: &str,
+) -> reqwest::RequestBuilder {
+    if let Some(spec) = auth {
+        match spec {
+            crate::model::AuthSpec::Basic { username, password } => {
+                let token = base64_encode(format!("{username}:{password}").as_bytes());
+                req = req.header(reqwest::header::AUTHORIZATION, format!("Basic {token}"));
+            }
+            crate::model::AuthSpec::Bearer { token } => {
+                req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            crate::model::AuthSpec::Digest { username, password } => {
+                log::warn!(
+                    "digest auth not yet implemented; downgrading to Basic for {url} (user={username})"
+                );
+                let token = base64_encode(format!("{username}:{password}").as_bytes());
+                req = req.header(reqwest::header::AUTHORIZATION, format!("Basic {token}"));
+            }
+        }
+    }
+    req
 }
 
 /// Base64-encode a byte slice (standard alphabet, with `+` and `/`).
@@ -293,24 +325,7 @@ pub async fn download_chunk(
     // loop, which is non-trivial). For v1 we downgrade to `Basic`
     // and surface a clear error in the download's `error` field
     // if the server actually challenges us.
-    if let Some(spec) = auth {
-        match spec {
-            crate::model::AuthSpec::Basic { username, password } => {
-                let token = base64_encode(format!("{username}:{password}").as_bytes());
-                req = req.header(reqwest::header::AUTHORIZATION, format!("Basic {token}"));
-            }
-            crate::model::AuthSpec::Bearer { token } => {
-                req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
-            }
-            crate::model::AuthSpec::Digest { username, password } => {
-                log::warn!(
-                    "digest auth not yet implemented; downgrading to Basic for {url} (user={username})"
-                );
-                let token = base64_encode(format!("{username}:{password}").as_bytes());
-                req = req.header(reqwest::header::AUTHORIZATION, format!("Basic {token}"));
-            }
-        }
-    }
+    req = apply_auth(req, auth, url);
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {

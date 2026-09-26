@@ -192,6 +192,7 @@ fn main() {
             commands::open_file,
             commands::copy_text,
             commands::trash_download,
+            commands::trash_paths,
             commands::import_browser_cookies,
         ])
         .run(tauri::generate_context!())

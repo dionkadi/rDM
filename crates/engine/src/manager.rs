@@ -158,6 +158,51 @@ impl DownloadManager {
         let in_window = self.in_schedule_window();
         let active = self.inner.storage.load_active().unwrap_or_default();
         for mut d in active {
+            // Self-heal: a row whose FINAL file is already on disk at the
+            // full expected size is done, whatever its persisted status
+            // says (a merged pair row that errored on a later re-download
+            // attempt, a status mangled by a crash, …). Restoring it as
+            // Completed beats "Queued at 0 % with the file intact".
+            if let Some(total) = d.total_size {
+                if total > 0 && d.downloaded < total {
+                    if let Ok(meta) = std::fs::metadata(&d.save_path) {
+                        if meta.len() == total {
+                            d.downloaded = total;
+                            d.chunks = vec![crate::model::ChunkState {
+                                index: 0,
+                                start: 0,
+                                end: total - 1,
+                                downloaded: total,
+                            }];
+                            d.status = DownloadStatus::Completed;
+                            d.error = None;
+                            if d.finished_at.is_none() {
+                                d.finished_at = Some(chrono::Utc::now());
+                            }
+                            d.can_resume = false;
+                            let _ = self.inner.storage.save_download(&d);
+                            let healed_id = d.id.clone();
+                            log::info!(
+                                "self-healed {healed_id} on startup: final file complete ({} B)",
+                                total
+                            );
+                            self.inner
+                                .tasks
+                                .lock()
+                                .unwrap()
+                                .insert(d.id.clone(), TaskEntry {
+                                    state: Arc::new(TaskState {
+                                        id: d.id.clone(),
+                                        download: Arc::new(std::sync::Mutex::new(d)),
+                                        control: crate::control::DownloadControl::new(),
+                                    }),
+                                    running: AtomicBool::new(false),
+                                });
+                            continue;
+                        }
+                    }
+                }
+            }
             let was_queued = matches!(
                 d.status,
                 DownloadStatus::Queued | DownloadStatus::Connecting | DownloadStatus::Downloading
@@ -367,9 +412,23 @@ impl DownloadManager {
     }
 
     pub fn resume(&self, id: &str) {
-        if let Some(e) = self.inner.tasks.lock().unwrap().get(id) {
-            e.state.control.resume();
+        {
+            let tasks = self.inner.tasks.lock().unwrap();
+            let Some(e) = tasks.get(id) else {
+                return;
+            };
             let mut d = e.state.download.lock().unwrap();
+            // A completed row is FINAL. Resuming it re-downloaded the
+            // row's ORIGINAL part URL — for a merged pair row that
+            // overwrote the merged file and ended in `error` (the part
+            // URL's CDN signature often 403s on the second pass) —
+            // which then surfaced as "Queued at 0 %" after a restart
+            // while the merged file sat intact on disk.
+            if d.status == DownloadStatus::Completed {
+                log::info!("resume ignored: {id} is already completed");
+                return;
+            }
+            e.state.control.resume();
             if d.status == DownloadStatus::Paused {
                 d.status = DownloadStatus::Queued;
                 // Same rationale as `pause`: starting a fresh attempt
@@ -467,6 +526,25 @@ impl DownloadManager {
             d.save_path = path.to_path_buf();
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 d.filename = name.to_string();
+            }
+            // The output describes a DIFFERENT file than the part the row
+            // downloaded (a merged video+audio result): make the row
+            // self-consistent or the UI shows `downloaded > total` (a
+            // merged 258 MB file against the 86 MB part total reads as
+            // 300 % progress). One completed chunk spanning the whole
+            // output keeps the row coherent.
+            if let Ok(size) = std::fs::metadata(path).map(|m| m.len()) {
+                if size > 0 {
+                    d.total_size = Some(size);
+                    d.downloaded = size;
+                    d.chunks = vec![crate::model::ChunkState {
+                        index: 0,
+                        start: 0,
+                        end: size - 1,
+                        downloaded: size,
+                    }];
+                    d.can_resume = false;
+                }
             }
             let _ = self.inner.storage.save_download(&d);
             d.clone()

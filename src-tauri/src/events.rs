@@ -34,6 +34,13 @@ pub struct CapturedUrl {
     pub source: String,
     /// The raw URL the user / browser handed us.
     pub url: String,
+    /// Second half of a video+audio pair (DASH: two `.m4s` streams that
+    /// belong to one video). `None` for ordinary single-URL captures.
+    ///
+    /// When set, the frontend shows ONE confirmation dialog for the
+    /// pair ("merged into one file when both finish") instead of two
+    /// unrelated dialogs — the IDM contract of one grab → one download.
+    pub pair_second: Option<String>,
     /// Filename extracted from the URL path / Content-Disposition
     /// (the engine's `protocol::suggest_filename` does this; the
     /// native host calls it on the Rust side so the result is
@@ -62,6 +69,14 @@ pub struct CapturedUrl {
     /// per-download headers is the path of least surprise.
     /// `None` when the native host didn't relay one.
     pub user_agent: Option<String>,
+    /// Page metadata harvested by the grab (title / upload date /
+    /// uploader from the source page). Used to pre-fill a meaningful
+    /// filename (`<title>.mkv`) and, for pairs, written into the
+    /// merged file's container tags. `None` when the page offered
+    /// nothing.
+    pub meta_title: Option<String>,
+    pub meta_date: Option<String>,
+    pub meta_artist: Option<String>,
     /// Monotonic ID so the frontend can dedupe in case the same URL
     /// comes in twice in quick succession (e.g. the user double-
     /// clicks).

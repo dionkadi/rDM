@@ -9,7 +9,288 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > ship breaking changes between minor versions. Once we hit 1.0.0 we
 > commit to the SemVer stability guarantees.
 
-## [Unreleased]
+## [0.5.0] - 2026-09-26
+
+### Fixed — completed task turning "Queued at 0 %" after a restart
+
+- **A completed task could come back as "Queued" at 0 % after an app
+  restart while the file sat intact on disk.** Chain: the merged row was
+  resumed/re-downloaded from its ORIGINAL part URL (the ▶ button
+  dispatched `resume` unconditionally — for a merged row that overwrites
+  the merged file and usually ends in `403` because the part URL's CDN
+  signature is stale), persisted as `error` with zeroed progress, and on
+  restart the error row loaded as active → `Queued`, with the on-disk
+  verification zeroing the progress (no `.part` file). Fixes:
+  - `resume()` ignores completed rows (a completed row is final);
+  - startup **self-heals** any active row whose final file is already on
+    disk at the full expected size — it is restored to Completed with
+    matching progress instead of being re-queued (your stuck
+    "美国女孩….mkv" row heals itself on the next start);
+  - `Storage::open` sets a 5 s SQLite **busy timeout** — two writers on
+    one database (second instance / crash-recovery) no longer fail
+    immediately and strand a resumed download as "Queued".
+
+### Fixed — drag & drop + capture notification
+
+- **Task cards are no longer draggable — the app is the drop target.** The
+  row was `draggable` for a reorder-by-drag feature, and its handlers
+  `preventDefault()`-ed every dragover while reading only their private
+  payload type: dragging the card hauled it around like a ghost AND
+  dropping a link from the browser onto a row was silently swallowed
+  (the app-level "drop a URL to download" handler never fired). Rows are
+  no longer draggable; external drops now bubble to the app handler and
+  add the download, with the existing drop overlay as the affordance.
+  Reordering stays on the keyboard (Alt+↑/↓).
+- **The "New download captured" notification uses the page title**
+  (system-wide and the in-app toast) instead of the raw stream id.
+
+### Fixed — task name + title suffix
+
+- **The single task now shows its final name from the start.** The
+  visible pair row displayed the engine's part filename
+  (`41xxx-1-100022.m4s`) until the merge renamed it; the display now
+  carries the name typed in the capture dialog (`<title>.mkv`) from
+  confirm to finish, with combined progress — and while one half is
+  still downloading the task no longer flips to "Completed" and back.
+- **The `_哔哩哔哩_bilibili` suffix is trimmed from harvested titles.**
+  The og/title metas repeat bilibili's decorated document title; only
+  TRAILING decoration is stripped (a title mentioning bilibili
+  mid-sentence keeps it), so the file is `…取景地？.mkv` and the
+  container's `title` tag matches. The metadata harvest now sticks to
+  what content scripts can actually see (DOM title + meta tags — page
+  JS globals like `__INITIAL_STATE__` are invisible from the isolated
+  world), and the uploader meta was added.
+- Notification timing for pairs: the halves' completions are silent;
+  one "Download Complete — <title> is ready" fires when the merge
+  succeeds.
+
+### Added — page metadata + meaningful filenames
+
+- **The merged file now carries the page's metadata, and the filename is
+  the video's title.** The grab harvests the source page's title, upload
+  date and uploader (Bilibili's structured page state, with og:/itemprop
+  metas as fallback) and rides them through the capture payload to the
+  app. The CaptureDialog pre-fills `<title>.<ext>` (sanitized) instead
+  of the raw stream id, and `merge_downloads` applies
+  `-metadata title/date/artist` to the merged file — ffprobe-verified.
+- The Rust `remux` gained an optional `OutputMeta` parameter; the merge
+  command accepts `metadata` from the paired-capture flow (persisted
+  with the pair so an app restart mid-download keeps it).
+
+### Fixed — one task, sane progress, working category picker
+
+- **A confirmed pair is now ONE task in the list from start to finish.**
+  The two engine rows still exist underneath (both halves download in
+  parallel), but the second half is hidden and its progress folds into
+  the visible row (downloaded/total are the sum) — no more "two tasks
+  that become one after merging". Control actions (pause / resume /
+  cancel / remove / trash, single and bulk) fan out to the hidden half,
+  a hidden-half failure surfaces on the visible task, and the pair
+  state is persisted so restarting the app mid-download keeps the
+  single-task view and the auto-merge arming.
+- **Progress no longer runs past 100 % after a merge.** `set_output_file`
+  left the row's `total_size`/chunks describing the old part while the
+  file on disk was the merged result — the UI read 258–300 %. It now
+  makes the row self-consistent: total = downloaded = merged file size,
+  one completed chunk.
+- **"Download complete" notification spam fixed.** The engine emits a
+  completed status more than once per row (task `Completed`, then the
+  merged file's retargeting `StatusChanged`) and the frontend notified
+  on *every* emission. Notifications are now once per row (and never
+  for the hidden halves).
+- **The CaptureDialog category dropdown keeps the user's choice.** The
+  form re-initialiser ran on every `captureQueue` invalidation (the
+  array is replaced on each store update even when the capture is the
+  same object), resetting the selection between picking and confirming;
+  it is now keyed on the capture nonce. The category options also
+  re-apply once settings finish loading, and the dialog backdrop no
+  longer uses `backdrop-filter` (WebKitGTK composites native `<select>`
+  popups incorrectly over blurred layers — the dropdown could render
+  detached/unclickable).
+
+### Fixed — wrong stream + leftover parts
+
+- **The grab picked a 14-second promo clip instead of the 33-minute
+  video the user was watching.** Stream selection keyed on "newest
+  observed segment request", and a hover preview / promo clip's segments
+  are fetched *most recently* — two requests out-shouted the watched
+  video's hundreds. Selection is now **request-count based**: the cid
+  whose segments dominate the resource log (raw request count, ties to
+  the newest) is the episode the user is actually watching; previews and
+  preloads cannot out-shout it. The heuristic and the play-info
+  enhancer share the same selection.
+- **The video part's `.m4s` lingered in the save directory after the
+  auto-merge.** The merge retargets the first row at the merged file,
+  but its ORIGINAL part file stayed on disk (only the second part was
+  cleaned up). The auto-merge now also moves the first part's original
+  file to the OS trash (`trash_paths` command), leaving exactly one
+  file — the merged one — for a confirmed pair.
+
+### Fixed — the pair collapsed to a lone half
+
+- **The popup said "2 URLs sent", DM queued one — whichever half came
+  first.** The extension's pair flag was ignored downstream:
+  `media::plan` paired two `.m4s` only when they shared **origin and
+  directory**, but bilibili's playurl hands the video and audio from
+  *different mirrors* — the check failed, the plan degraded to
+  `Single { first_url }`, and the other half was silently dropped.
+  Fixes across the whole chain:
+  - the extension stamps grab batches with `pair: true` when it grouped
+    the URLs as one logical download (by content id);
+  - the app honours the flag: a flagged two-URL batch becomes one
+    paired capture regardless of mirrors (`plan_captures`);
+  - `media::plan` additionally pairs two DASH streams that share a cid
+    (`{cid}-1-{codec}.m4s`) even across mirrors, and refuses to pair
+    streams of different cids (two episodes);
+  - the Firefox native host forwards a grab batch **as one payload**
+    (with the `pair` flag and page credentials) instead of one message
+    per URL, which also un-paired cross-mirror grabs.
+  End state for a confirmed pair is unchanged and is what the user
+  asked for: two temporary part rows → automatic merge → **one file
+  with both video and audio**, leftover part moved to the OS trash.
+
+### Fixed — the lone video half again
+
+- **A grab late in a video's lifetime again offered a lone video half**
+  (correct episode, but no audio). The playurl *request* had fallen out
+  of the resource buffer — the audio half buffers completely early in a
+  video, so only video ranges keep flowing — and the enhancer's only
+  source was gone, silently. Now:
+  - the enhancer first reads **`window.__playinfo__`** — the playurl
+    payload bilibili embeds in every watch page. No network, and it can
+    never fall out of a buffer;
+  - buffer playurl requests remain a secondary source (up to five,
+    newest first);
+  - a dash response that carries video but **no audio track** (Bilibili
+    previews) is skipped with a reason instead of silently ending the
+    enhancement;
+  - when no source produces a pair, the grab note now **says why** —
+    e.g. `(play info: play-info fetch failed)` or `(play info: play
+    info has no audio track for stream …)` — instead of leaving a
+    half-offer unexplained.
+
+### Fixed — one episode at a time
+
+- **The grab could pick the wrong episode (and offer a video without its
+  audio).** Playlist/season pages accumulate several playurl responses in
+  the resource buffer (preloaded next parts, previously watched parts),
+  and the play-info enhancement trusted "the newest response" — which
+  can describe a *different* episode than the one the player is
+  streaming. Both sides now group observed streams by their embedded
+  content id (`{cid}-1-{codec}.m4s`):
+  - the heuristic pairs only bases belonging to the **newest-observed
+    cid** (the stream the player is actually fetching) — a cross-episode
+    pair is impossible;
+  - the enhancer fetches play-info responses newest-first (up to three)
+    and uses the first whose dash **contains that cid**, skipping
+    responses that lack an audio track (e.g. previews);
+  - the popup note names the chosen stream (`stream {cid}`) so a
+    mismatch with an already-downloaded half is visible before
+    confirming.
+
+### Added — the grab uses the page's play info
+
+- **The grab offers the complete video+audio pair even when the page's
+  network buffer doesn't.** A grab on a bilibili watch page offered the
+  audio half alone: the resource-timing buffer is finite (~250 entries,
+  a long session drops the newest media requests), so one stream's
+  requests simply weren't observable anymore. The content script now
+  recognizes the page's **playurl API request** in the buffer,
+  re-fetches it with the page's cookies, and reads the stream list from
+  its JSON — `dash.video[]` / `dash.audio[]` name BOTH halves explicitly,
+  signed, on a normal CDN. Observed halves are matched to their API
+  entries by path tail (the representation actually playing); an
+  unobserved half falls back to the API's best entry. P2P edge URLs
+  (`mcdn`/`pcdn`, including via `backupUrl`) are only used when nothing
+  else exists. Legacy non-DASH pages (`durl`) offer their direct file.
+  A failed/timeout play-info fetch falls back to the pure heuristics.
+- The resource-timing buffer is raised to 1024 entries at content-script
+  start, keeping the rest of a long session observable.
+- The grab now answers asynchronously only when a play-info enhancement
+  is possible; every other page keeps the synchronous path.
+
+### Fixed — the "150 B completed m4s" bug
+
+- **The download "completed" with a 150-byte file that contained nothing.**
+  Root cause chain, diagnosed against the real bilibili PCDN URL: the
+  download **probe** did not carry the per-download credentials (Referer /
+  User-Agent), so an anti-leech CDN answered it with `403 + text/html +
+  Content-Length: 150`; the probe then **read that error page's headers as
+  a successful probe** — it never checked the response status after its
+  HEAD→ranged-GET fallback — and planned `total_size = 150`. The chunk
+  worker (which *did* carry the Referer) requested `Range: bytes=0-149`,
+  got a legitimate `206` with the first 150 real bytes of the stream, and
+  the task renamed it done. Three fixes:
+  - the probe now sends the same per-download headers (Referer,
+    User-Agent) and auth as the chunk workers;
+  - a non-success probe response (403/401/404…) fails the download with
+    `HTTP <status>` instead of describing an error page;
+  - on a `206` probe response the total comes from `Content-Range`, never
+    from the partial `Content-Length` (which is the 1-byte probe range —
+    the same class of bug behind the earlier "1 B chunk" report).
+  Regression-tested with an anti-leech test server (403 without Referer)
+  and a HEAD-rejecting server (405, 206 probe): with Referer → full byte-
+  exact download; without → loud `HTTP 403` error, no file created.
+
+### Fixed — DASH URL reconstruction
+
+- **`400 Bad Request` (with a 1-byte "chunk") when downloading a grabbed
+  `.m4s`.** The grab stripped the *entire* query string from DASH stream
+  URLs to turn byte-range requests into whole-file URLs — but that
+  destroyed the URL's signing parameters (`upsign`, `deadline`, …), and
+  bilibili's PCDN edge (`mcdn`) rejected the anonymous request outright.
+  Now only the player's `range` parameter is removed and every other
+  query parameter survives, which is exactly how the full-file URL
+  relates to the observed range requests.
+- **P2P edge copies are demoted.** When the player fetches a stream from
+  an `mcdn`/`pcdn` node, that node often refuses whole-file requests.
+  If a normal-CDN copy of the same stream is also observable, the grab
+  prefers it; an unavoidable P2P pick is offered with a warning in the
+  popup note ("let the video play a bit and grab again").
+
+### Added — paired captures
+
+- **One grab, one download — the IDM contract.** "Grab page media" no
+  longer floods DM with every media-shaped request a page made. The
+  content script now curates the findings down to at most two URLs that
+  form **one logical download**: the two most recent distinct `.m4s`
+  stream bases (query stripped — the base serves the whole stream) for a
+  DASH page, otherwise the best direct media file, otherwise a manifest.
+  Loose `.ts` segments, duplicate byte-range requests and
+  extensionless URLs are never offered. The popup note says what was
+  selected and what was deliberately left out.
+- **Paired captures with automatic merge.** When a grab yields a DASH
+  pair, the app shows **one** confirmation dialog ("video + audio —
+  merged when both finish"); confirming queues both halves with the
+  same category / headers / speed limit, and the merge (`ffmpeg -c
+  copy`, the same verified remux as the manual Merge action) runs
+  automatically when both parts complete. The merged file takes the
+  name typed in the dialog (`merge_downloads` gained an optional
+  `output_name`), and the leftover second part moves to the OS trash.
+  A part that fails or is cancelled cancels the auto-merge with a
+  clear toast instead of merging half a video.
+- Fixed primary-button **hover wash-out** in `CaptureDialog` and
+  `AuthDialog`: the generic `.btn:hover` rule outranked `.btn.primary`
+  and swapped the accent for a translucent near-white surface while the
+  text stayed white — the "Download" button became unreadable on hover.
+
+### Changed — grab curation + rebuild discipline
+
+- Grab link heuristics no longer match `a[href*="manifest"]` — the
+  substring appears in ordinary page URLs and produced junk captures
+  (e.g. rows named "web"). Real manifests are matched by their
+  `.m3u8` / `.mpd` extension.
+- The grab is answered by the top frame only; an embed iframe can no
+  longer win the multi-frame response race with its own URL as the
+  page context (a second `player.html` leak path) or with an empty
+  result that masked the top frame's media. Same-origin iframe DOMs
+  are now scanned from the top frame instead.
+- `crates/native-host`: a grab batch (`{"urls":[…]}`) no longer also
+  forwards the message's `url` field — that field is the *page* the
+  grab ran on, and forwarding it sent DM the embed/watch page itself.
+  Batch captures are additionally grouped through `media::plan` so the
+  Firefox native-messaging path pairs DASH streams identically to the
+  WebSocket path.
 
 Browser-extension correctness pass. The extension had two
 interception paths and **neither was gated on DM being reachable**:
@@ -185,7 +466,7 @@ erased with nothing to replace it. Full audit:
   leaking a connection per click. Each socket's handlers are now bound
   to their own socket.
 
-### Fixed (app)
+### Fixed — app-side correctness
 
 - **The capture dialog's "Download" button was invisible.** It is
   `color:#fff` on `background: var(--color-accent)`, and the

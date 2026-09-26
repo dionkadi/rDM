@@ -25,6 +25,13 @@ impl Storage {
             std::fs::create_dir_all(parent).ok();
         }
         let conn = Connection::open(path)?;
+        // Two writers on one SQLite file (a second DM instance, or the
+        // resume-after-crash flow) used to fail *immediately* with
+        // SQLITE_BUSY whenever the other connection held a write lock —
+        // a resumed download then sat "Queued" forever. A busy timeout
+        // makes the writer WAIT for the lock instead (5 s is generous
+        // for the short row writes this app does).
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let s = Storage {
             inner: Arc::new(Mutex::new(conn)),
         };

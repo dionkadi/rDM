@@ -126,6 +126,39 @@ impl PartKind {
     }
 }
 
+/// File-level metadata for the merged output, taken from the source
+/// page (title / upload date / uploader). Applied via ffmpeg
+/// `-metadata` flags so the merged file carries a real title instead of
+/// "Packed by Bilibili XCoder".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct OutputMeta {
+    pub title: Option<String>,
+    pub date: Option<String>,
+    pub artist: Option<String>,
+}
+
+impl OutputMeta {
+    /// `-metadata key=value` flags for the fields that are present.
+    pub fn ffmpeg_args(&self) -> Vec<OsString> {
+        let mut args = Vec::new();
+        for (key, value) in [
+            ("title", &self.title),
+            ("date", &self.date),
+            ("artist", &self.artist),
+        ] {
+            if let Some(v) = value {
+                let v = v.replace(['\r', '\n', '\x00'], " ");
+                if v.trim().is_empty() {
+                    continue;
+                }
+                args.push(OsString::from("-metadata"));
+                args.push(OsString::from(format!("{key}={}", v.trim())));
+            }
+        }
+        args
+    }
+}
+
 /// What a set of captured URLs amounts to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
@@ -157,6 +190,34 @@ pub enum MediaPlan {
 /// Same scheme + host, and the same parent path. This is what stops us
 /// pairing `cdn-a/…/video.m4s` with `cdn-b/…/audio.m4s` from an unrelated
 /// player, or a video from one page with audio from another.
+/// `…/{cid}-1-{codec}.m4s` → `cid`. Streams sharing a cid are two halves
+/// of the same episode even when the CDN hands them from different
+/// mirrors (bilibili's playurl routinely does: video from one
+/// `upos-sz-*` mirror, audio from another) — the old same-origin check
+/// silently un-paired such grabs and the app downloaded a lone half.
+fn same_cid(a: &str, b: &str) -> bool {
+    match (cid_of_stream(a), cid_of_stream(b)) {
+        (Some(ca), Some(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
+/// Extract the content id from a bilibili-style DASH stream path:
+/// everything before the final `-1-<codec>` of the file stem.
+fn cid_of_stream(url: &str) -> Option<String> {
+    let without_query = url.split(['?', '#']).next().unwrap_or(url);
+    let tail = without_query.rsplit('/').next()?;
+    let stem = tail.strip_suffix(".m4s")?;
+    let mut parts = stem.rsplitn(3, '-');
+    let codec = parts.next()?;
+    let middle = parts.next()?;
+    let cid = parts.next()?;
+    if cid.is_empty() || middle != "1" || codec.parse::<u64>().is_err() {
+        return None;
+    }
+    Some(cid.to_string())
+}
+
 fn same_origin_and_dir(a: &str, b: &str) -> bool {
     fn split(url: &str) -> Option<(String, String)> {
         let parsed = url::Url::parse(url).ok()?;
@@ -218,7 +279,7 @@ pub fn plan(urls: &[String]) -> MediaPlan {
             second: a.clone(),
         };
     }
-    if dash.len() == 2 && same_origin_and_dir(&dash[0], &dash[1]) {
+    if dash.len() == 2 && (same_origin_and_dir(&dash[0], &dash[1]) || same_cid(&dash[0], &dash[1])) {
         return MediaPlan::Pair {
             first: dash[0].clone(),
             second: dash[1].clone(),
@@ -245,8 +306,13 @@ pub fn plan(urls: &[String]) -> MediaPlan {
 ///   with whatever codecs the site chose.
 /// * `-movflags +faststart` — the index ends up at the front, so the
 ///   file can be played while it is still being copied around.
-pub fn remux_args(video: &Path, audio: &Path, out: &Path) -> Vec<OsString> {
-    [
+pub fn remux_args(
+    video: &Path,
+    audio: &Path,
+    out: &Path,
+    meta: Option<&OutputMeta>,
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = [
         "-hide_banner",
         "-nostdin",
         "-y",
@@ -266,11 +332,15 @@ pub fn remux_args(video: &Path, audio: &Path, out: &Path) -> Vec<OsString> {
         "copy",
         "-movflags",
         "+faststart",
-        &out.to_string_lossy(),
     ]
     .into_iter()
     .map(OsString::from)
-    .collect()
+    .collect();
+    if let Some(m) = meta {
+        args.extend(m.ffmpeg_args());
+    }
+    args.push(OsString::from(out.to_string_lossy().to_string()));
+    args
 }
 
 /// A binary we found on `PATH`.
@@ -404,9 +474,10 @@ async fn run_ffmpeg(
     audio: &Path,
     out: &Path,
     container: &str,
+    meta: Option<&OutputMeta>,
 ) -> Result<Option<(usize, usize)>, MergeError> {
     let child = Command::new("ffmpeg")
-        .args(remux_args(video, audio, out))
+        .args(remux_args(video, audio, out, meta))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -481,7 +552,11 @@ fn output_path_for(first: &Path, second: &Path, stem: &str, container: &str) -> 
 /// the merged file, and only returns `Ok` once the result has been
 /// checked (see [`probe_stream_counts`]). A failed or unverified merge
 /// leaves the parts untouched and removes its own half-written output.
-pub async fn remux(first: &Path, second: &Path) -> Result<MergeOutcome, MergeError> {
+pub async fn remux(
+    first: &Path,
+    second: &Path,
+    meta: Option<&OutputMeta>,
+) -> Result<MergeOutcome, MergeError> {
     if !ffmpeg().await.available() {
         return Err(MergeError::FfmpegMissing);
     }
@@ -494,7 +569,7 @@ pub async fn remux(first: &Path, second: &Path) -> Result<MergeOutcome, MergeErr
     let mut last_error: Option<MergeError> = None;
     for container in ["mp4", "mkv"] {
         let out = output_path_for(first, second, &stem, container);
-        match run_ffmpeg(first, second, &out, container).await {
+        match run_ffmpeg(first, second, &out, container, meta).await {
             Ok(streams) => {
                 let bytes = tokio::fs::metadata(&out)
                     .await
@@ -600,6 +675,25 @@ mod tests {
             "https://a.test/two/y.m4s".to_string(),
         ];
         assert!(matches!(plan(&different_dirs), MediaPlan::Single { .. }));
+
+        // Same cid, different mirrors: bilibili's playurl hands the
+        // video and audio halves from different `upos-sz-*` hosts. The
+        // old same-origin-only rule un-paired such grabs and the app
+        // downloaded a lone half.
+        let different_mirrors = vec![
+            "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/75/24/41875472475/41875472475-1-100022.m4s?upsign=v".to_string(),
+            "https://upos-sz-mirrorkb.bilivideo.com/upgcxcode/75/24/41875472475/41875472475-1-30216.m4s?upsign=a".to_string(),
+        ];
+        assert!(matches!(plan(&different_mirrors), MediaPlan::Pair { .. }));
+
+        // Different cids on the same mirror are NOT a pair (two
+        // episodes) — the extension groups by cid before sending, this
+        // is the engine-side guard.
+        let different_cids = vec![
+            "https://upos.example.com/upgcxcode/1/2/41875472475/41875472475-1-30080.m4s".to_string(),
+            "https://upos.example.com/upgcxcode/1/2/42032629796/42032629796-1-30216.m4s".to_string(),
+        ];
+        assert!(matches!(plan(&different_cids), MediaPlan::Single { .. }));
     }
 
     #[test]
@@ -653,6 +747,7 @@ mod tests {
             Path::new("/tmp/a.m4s"),
             Path::new("/tmp/b.m4s"),
             Path::new("/tmp/out.mp4"),
+            None,
         );
         let args: Vec<String> = args
             .iter()
@@ -755,7 +850,7 @@ mod tests {
         let video = make_clip(dir.path(), "clip", true).await;
         let audio = make_clip(dir.path(), "clip", false).await;
 
-        let outcome = remux(&video, &audio).await.expect("merge should succeed");
+        let outcome = remux(&video, &audio, None).await.expect("merge should succeed");
 
         assert_eq!(outcome.container, "mp4");
         assert!(outcome.bytes > 0, "merged file is empty");
@@ -771,6 +866,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merged_output_carries_page_metadata() {
+        if !require_ffmpeg().await {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let video = make_clip(dir.path(), "clip", true).await;
+        let audio = make_clip(dir.path(), "clip", false).await;
+
+        let meta = OutputMeta {
+            title: Some("Some Video Title".to_string()),
+            date: Some("2024-05-01".to_string()),
+            artist: Some("Some Uploader".to_string()),
+        };
+        let outcome = remux(&video, &audio, Some(&meta))
+            .await
+            .expect("merge should succeed");
+
+        // Read the container tags back with ffprobe (skip when absent —
+        // the stream-count verification already proved the merge).
+        let probe = Command::new("ffprobe")
+            .args([
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_format",
+                &outcome.output_path,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .await
+            .expect("spawn ffprobe");
+        if !probe.status.success() {
+            eprintln!("skipping tag assertion: ffprobe is not installed");
+            return;
+        }
+        let parsed: serde_json::Value = serde_json::from_slice(&probe.stdout)
+            .expect("ffprobe json");
+        let tags = &parsed["format"]["tags"];
+        assert_eq!(
+            tags["title"].as_str(),
+            Some("Some Video Title"),
+            "the merged file must carry the page title"
+        );
+        assert_eq!(tags["date"].as_str(), Some("2024-05-01"));
+        assert_eq!(tags["artist"].as_str(), Some("Some Uploader"));
+    }
+
+    #[tokio::test]
     async fn refuses_to_merge_two_videos_instead_of_writing_a_silent_failure() {
         if !require_ffmpeg().await {
             return;
@@ -783,7 +929,7 @@ mod tests {
         // pairing (two video-only streams) must NOT produce a file that
         // looks fine. It has to be reported.
         let before = list_dir(dir.path());
-        let err = remux(&first, &second).await.expect_err("must not succeed");
+        let err = remux(&first, &second, None).await.expect_err("must not succeed");
         match err {
             MergeError::Unusable { missing } => assert_eq!(missing, "audio"),
             other => panic!("expected Unusable, got {other:?}"),

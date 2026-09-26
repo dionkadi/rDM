@@ -237,6 +237,45 @@ fn handle_ws_conn(
     }
 }
 
+/// Turn the URLs a grab batch carries into the capture events the UI
+/// should show — at most ONE dialog per grab (the IDM contract: one
+/// grab, one download).
+///
+/// The extension already curates the list down to the one thing the
+/// user is watching (see `collectMedia` in content.js), so what arrives
+/// here is at most two URLs. When the batch carries `pair: true`, the
+/// extension has already grouped the two halves by content id — honour
+/// that directly instead of [`dm_engine::media::plan`], whose
+/// same-origin check used to un-pair grabs whose halves came from
+/// different mirrors (bilibili does this routinely: video from one
+/// `upos-sz-*` host, audio from another) and reduced the grab to a lone
+/// half. Otherwise `media::plan` decides:
+///
+///   * `Pair`     → one event carrying both halves in `pair_second`;
+///   * `Single` / `Manifest` → one event for that URL;
+///   * `Empty`    → nothing (only fragments / unknowns remained; the
+///     extension's note already explains why nothing was offered).
+///
+/// Returns `(url, pair_second)` tuples.
+fn plan_captures(urls: &[String], pair_flag: bool) -> Vec<(String, Option<String>)> {
+    if pair_flag {
+        if urls.len() >= 2 {
+            return vec![(urls[0].clone(), Some(urls[1].clone()))];
+        }
+        if urls.len() == 1 {
+            return vec![(urls[0].clone(), None)];
+        }
+        return Vec::new();
+    }
+    match dm_engine::media::plan(urls) {
+        dm_engine::media::MediaPlan::Pair { first, second } => vec![(first, Some(second))],
+        dm_engine::media::MediaPlan::Single { url, .. } | dm_engine::media::MediaPlan::Manifest { url } => {
+            vec![(url, None)]
+        }
+        dm_engine::media::MediaPlan::Empty => Vec::new(),
+    }
+}
+
 /// Parse one captured-URL payload (the same shape for both
 /// the WS path and the legacy line-delimited path) and emit
 /// the appropriate `Captured` frontend event(s).
@@ -252,7 +291,8 @@ fn process_payload(
     //   {"url":"…"}
     //     – the legacy / direct-socket form (kept for back-compat);
     //   {"urls":["…","…"]}
-    //     – future / batch-capture; treated as separate events.
+    //     – grab batches; grouped into at most one capture each via
+    //       `media::plan` (a DASH pair becomes ONE dialog, not two).
     let kind = v
         .get("type")
         .and_then(|t| t.as_str())
@@ -263,30 +303,90 @@ fn process_payload(
         "grab" | "capture" => "browser-grab",
         _ => "native-host",
     };
+    let referer = v.get("referer").and_then(|r| r.as_str());
+    let ua = v.get("userAgent").and_then(|r| r.as_str());
+    let pair_flag = v.get("pair").and_then(|p| p.as_bool()).unwrap_or(false);
+    let meta = v.get("meta");
+    let meta_title = page_meta_field(meta, "title");
+    let meta_date = page_meta_field(meta, "date");
+    let meta_artist = page_meta_field(meta, "artist");
     if let Some(arr) = v.get("urls").and_then(|u| u.as_array()) {
-        for u in arr {
-            if let Some(s) = u.as_str() {
-                status.touch();
-                let referer = v.get("referer").and_then(|r| r.as_str());
-                let ua = v.get("userAgent").and_then(|r| r.as_str());
-                emit_captured(app, source, s, default_save_dir, referer, ua);
-            }
+        let urls: Vec<String> = arr
+            .iter()
+            .filter_map(|u| u.as_str())
+            .map(|s| s.to_string())
+            .collect();
+        for (url, pair_second) in plan_captures(&urls, pair_flag) {
+            status.touch();
+            emit_captured(
+                app,
+                source,
+                &url,
+                pair_second,
+                default_save_dir,
+                referer,
+                ua,
+                meta_title.clone(),
+                meta_date.clone(),
+                meta_artist.clone(),
+            );
         }
     } else if let Some(url) = v.get("url").and_then(|u| u.as_str()) {
         status.touch();
-        let referer = v.get("referer").and_then(|r| r.as_str());
-        let ua = v.get("userAgent").and_then(|r| r.as_str());
-        emit_captured(app, source, url, default_save_dir, referer, ua);
+        emit_captured(
+            app,
+            source,
+            url,
+            None,
+            default_save_dir,
+            referer,
+            ua,
+            meta_title,
+            meta_date,
+            meta_artist,
+        );
     }
 }
 
+/// Read a string field out of the batch's `meta` object (the page
+/// metadata the extension harvested). `None` for anything missing or
+/// non-string.
+fn page_meta_field(meta: Option<&serde_json::Value>, field: &str) -> Option<String> {
+    meta?
+        .get(field)?
+        .as_str()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// For a pair capture, the dialog's filename describes the MERGED file,
+/// not the `.m4s` halves — replace the segment extension with the
+/// container the remux produces.
+fn pair_suggested_filename(first_url: &str) -> String {
+    let raw = protocol::suggest_filename(first_url, None, "download.bin");
+    let with_ext = std::path::Path::new(&raw)
+        .with_extension("mkv")
+        .to_string_lossy()
+        .to_string();
+    if with_ext.is_empty() || with_ext == ".mkv" {
+        "video.mkv".to_string()
+    } else {
+        with_ext
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_captured(
     app: &AppHandle,
     source: &str,
     url: &str,
+    pair_second: Option<String>,
     default_save_dir: &str,
     referer: Option<&str>,
     user_agent: Option<&str>,
+    meta_title: Option<String>,
+    meta_date: Option<String>,
+    meta_artist: Option<String>,
 ) {
     // Best-effort filename extraction. The engine has a richer
     // `protocol::suggest_filename` that prefers `Content-Disposition`
@@ -296,12 +396,18 @@ fn emit_captured(
     // `add_download` Tauri command can refine it later if the
     // user clicks "Download" — the frontend can also re-suggest
     // a filename once the engine returns the real Content-Type.
-    let suggested_filename =
-        protocol::suggest_filename(url, None, "download.bin");
+    let suggested_filename = match &pair_second {
+        Some(_) => pair_suggested_filename(url),
+        None => protocol::suggest_filename(url, None, "download.bin"),
+    };
     let nonce = format!("{}-{}", Instant::now().elapsed().as_nanos(), url);
     let payload = CapturedUrl {
         source: source.to_string(),
         url: url.to_string(),
+        pair_second,
+        meta_title: meta_title.filter(|s| !s.is_empty()),
+        meta_date: meta_date.filter(|s| !s.is_empty()),
+        meta_artist: meta_artist.filter(|s| !s.is_empty()),
         suggested_filename,
         default_save_dir: default_save_dir.to_string(),
         // The browser extension can forward the source page's
@@ -321,5 +427,68 @@ fn emit_captured(
     let event: FrontendEvent = FrontendEvent::Captured(payload);
     if let Err(e) = app.emit(EVENT_CHANNEL, &event) {
         eprintln!("dm: failed to emit Captured event: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plan_captures;
+
+    /// A DASH grab batch (the two stream bases) becomes ONE capture
+    /// carrying both halves — one dialog, one logical download.
+    #[test]
+    fn dash_pair_becomes_a_single_paired_capture() {
+        let urls = vec![
+            "https://upos.example.test/12/34/56/123456-1-30280.m4s".to_string(),
+            "https://upos.example.test/12/34/56/123456-1-30232.m4s".to_string(),
+        ];
+        assert_eq!(
+            plan_captures(&urls, false),
+            vec![(urls[0].clone(), Some(urls[1].clone()))]
+        );
+    }
+
+    /// The extension groups halves by content id and flags the batch.
+    /// The flag must win over `media::plan`'s same-origin heuristic —
+    /// bilibili serves the two halves from different mirrors, and
+    /// trusting the heuristic reduced grabs to a lone half.
+    #[test]
+    fn pair_flag_pairs_across_mirrors() {
+        let urls = vec![
+            "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/75/24/41875472475/41875472475-1-100022.m4s?upsign=v".to_string(),
+            "https://upos-sz-mirrorkb.bilivideo.com/upgcxcode/75/24/41875472475/41875472475-1-30216.m4s?upsign=a".to_string(),
+        ];
+        assert_eq!(
+            plan_captures(&urls, true),
+            vec![(urls[0].clone(), Some(urls[1].clone()))]
+        );
+    }
+
+    /// A direct media file stays a single unpaired capture.
+    #[test]
+    fn single_file_stays_unpaired() {
+        let urls = vec!["https://cdn.example.test/clip.mp4".to_string()];
+        assert_eq!(plan_captures(&urls, false), vec![(urls[0].clone(), None)]);
+    }
+
+    /// Fragments and unknowns are not offered — the extension's note
+    /// explains the decision, DM's queue stays clean.
+    #[test]
+    fn fragments_and_unknowns_offer_nothing() {
+        assert!(
+            plan_captures(&["https://cdn.example.test/hls/0.ts".to_string()], false).is_empty()
+        );
+        assert!(plan_captures(&["https://cdn.example.test/page".to_string()], false).is_empty());
+        assert!(plan_captures(&[], false).is_empty());
+    }
+
+    /// A pair capture's suggested filename describes the merged file,
+    /// not the `.m4s` half it was derived from.
+    #[test]
+    fn pair_filename_names_the_merged_file() {
+        let name = super::pair_suggested_filename(
+            "https://upos.example.test/12/34/56/123456-1-30280.m4s",
+        );
+        assert_eq!(name, "123456-1-30280.mkv");
     }
 }
