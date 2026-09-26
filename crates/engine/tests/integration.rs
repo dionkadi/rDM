@@ -324,6 +324,94 @@ async fn checksum_mismatch_marks_error() {
     let _ = std::fs::remove_file(&tmp);
 }
 
+/// End-to-end: a download whose checksum matches the actual bytes must
+/// complete for EVERY supported algorithm (md5 / sha1 / sha256 / sha512).
+/// This pins the multi-algorithm support — the engine used to only
+/// verify sha256 and silently skip every other algorithm name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn checksum_match_completes_for_every_algorithm() {
+    // Expected digests of the exact `payload()` the test server serves,
+    // computed through the engine's own public digest helper.
+    let payload = payload();
+    let payload_file = std::env::temp_dir().join(format!("dm_it_chk_src_{}.bin", std::process::id()));
+    std::fs::write(&payload_file, &payload).unwrap();
+    let expected: &[(&str, String)] = &[
+        ("md5", dm_engine::task::file_digest(&payload_file, dm_engine::model::ChecksumAlgorithm::Md5).unwrap()),
+        ("sha1", dm_engine::task::file_digest(&payload_file, dm_engine::model::ChecksumAlgorithm::Sha1).unwrap()),
+        ("sha256", dm_engine::task::file_digest(&payload_file, dm_engine::model::ChecksumAlgorithm::Sha256).unwrap()),
+        ("sha512", dm_engine::task::file_digest(&payload_file, dm_engine::model::ChecksumAlgorithm::Sha512).unwrap()),
+    ];
+    let _ = std::fs::remove_file(&payload_file);
+
+    for (algo, digest) in expected {
+        let port = spawn_server(0, 0);
+        let tmp = std::env::temp_dir().join(format!(
+            "dm_it_chk_ok_{algo}_{}.bin",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        let storage = Storage::open_memory().expect("memory storage");
+        let mgr = DownloadManager::with_settings(storage, Settings::default());
+
+        let mut d = Download::new(format!("http://127.0.0.1:{port}/file.bin"));
+        d.id = format!("chk-ok-{algo}");
+        d.save_path = tmp.clone();
+        d.checksum = Some(dm_engine::model::ChecksumSpec {
+            algorithm: algo.to_string(),
+            expected: digest.clone(),
+        });
+        let id = d.id.clone();
+        mgr.add(d);
+
+        let d = wait_until_downloaded(&mgr, &id).await;
+        assert_eq!(
+            d.status,
+            DownloadStatus::Completed,
+            "{algo}: expected Completed, got {:?}: {:?}",
+            d.status,
+            d.error
+        );
+        // The file must have been promoted from `.part` to its final
+        // name after the (passing) verification.
+        assert!(tmp.exists(), "{algo}: final file exists after rename");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// An algorithm the engine does not know must fail the download with a
+/// clear message rather than silently skipping verification.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn checksum_unknown_algorithm_marks_error() {
+    let port = spawn_server(0, 0);
+    let tmp = std::env::temp_dir().join(format!("dm_it_chk_bad_{}.bin", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+
+    let storage = Storage::open_memory().expect("memory storage");
+    let mgr = DownloadManager::with_settings(storage, Settings::default());
+
+    let mut d = Download::new(format!("http://127.0.0.1:{port}/file.bin"));
+    d.id = "chk-bad".into();
+    d.save_path = tmp.clone();
+    d.checksum = Some(dm_engine::model::ChecksumSpec {
+        algorithm: "crc32".to_string(),
+        expected: "00000000".to_string(),
+    });
+    let id = d.id.clone();
+    mgr.add(d);
+
+    let d = wait_until_downloaded(&mgr, &id).await;
+    assert_eq!(d.status, DownloadStatus::Error, "unknown algorithm must error");
+    let msg = d.error.as_deref().unwrap_or("");
+    assert!(
+        msg.contains("unsupported checksum algorithm"),
+        "error should name the unsupported algorithm, got: {msg}"
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
 // ── Persistence regression tests ────────────────────────────────────
 //
 // The original bug: `downloaded` and per-chunk `downloaded` were only

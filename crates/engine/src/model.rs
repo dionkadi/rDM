@@ -68,13 +68,82 @@ impl ChunkState {
     }
 }
 
+/// Checksum algorithms the engine can verify after a transfer finishes.
+///
+/// Serialized on the wire (and inside the SQLite `checksum` JSON blob)
+/// as a lowercase string — `"md5"`, `"sha1"`, `"sha256"`, `"sha512"` —
+/// which is what the frontend's algorithm dropdown sends. The
+/// [`ChecksumAlgorithm::parse`] helper additionally accepts the common
+/// command-line-tool spellings (`sha256sum`, `sha-256`, …) so a digest
+/// pasted from a `.sha256` / `.md5` file works regardless of how it
+/// was labelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChecksumAlgorithm {
+    Md5,
+    Sha1,
+    Sha256,
+    Sha512,
+}
+
+impl ChecksumAlgorithm {
+    /// Every supported algorithm, in dropdown display order.
+    pub const ALL: [ChecksumAlgorithm; 4] = [
+        ChecksumAlgorithm::Md5,
+        ChecksumAlgorithm::Sha1,
+        ChecksumAlgorithm::Sha256,
+        ChecksumAlgorithm::Sha512,
+    ];
+
+    /// Canonical lowercase wire name (what the frontend sends and
+    /// what gets persisted in the `checksum` JSON blob).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChecksumAlgorithm::Md5 => "md5",
+            ChecksumAlgorithm::Sha1 => "sha1",
+            ChecksumAlgorithm::Sha256 => "sha256",
+            ChecksumAlgorithm::Sha512 => "sha512",
+        }
+    }
+
+    /// Parse a user- / API-supplied algorithm name. Case-insensitive
+    /// and tolerant of the `-`/`_` separators and the `*sum` suffix
+    /// used by the coreutils-style tools (`md5sum`, `sha256sum`, …).
+    /// Returns `None` for anything the engine cannot compute, so
+    /// callers can reject it with a clear error instead of silently
+    /// skipping verification.
+    pub fn parse(raw: &str) -> Option<ChecksumAlgorithm> {
+        // Normalize: lowercase, keep only ASCII alphanumerics — this
+        // collapses "SHA-256", "sha_256" and "sha256sum" onto the
+        // same key ("sha256sum" is handled explicitly below).
+        let normalized: String = raw
+            .trim()
+            .to_ascii_lowercase()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect();
+        match normalized.as_str() {
+            "md5" | "md5sum" => Some(ChecksumAlgorithm::Md5),
+            "sha1" | "sha1sum" => Some(ChecksumAlgorithm::Sha1),
+            "sha256" | "sha256sum" => Some(ChecksumAlgorithm::Sha256),
+            "sha512" | "sha512sum" => Some(ChecksumAlgorithm::Sha512),
+            _ => None,
+        }
+    }
+}
+
 /// Optional integrity check to run after the file is fully written.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChecksumSpec {
-    /// Algorithm name understood by the engine (currently `sha256`).
+    /// Algorithm name understood by the engine. Free-form on the
+    /// wire for backwards compatibility; the engine resolves it
+    /// through [`ChecksumAlgorithm::parse`] and rejects downloads
+    /// whose algorithm it cannot compute. Currently supported:
+    /// `md5`, `sha1`, `sha256`, `sha512` (plus the `sha256sum`-style
+    /// spellings — see [`ChecksumAlgorithm::parse`]).
     pub algorithm: String,
-    /// Expected hex digest (lowercase).
+    /// Expected hex digest (lowercase; comparison is case-insensitive).
     pub expected: String,
 }
 
