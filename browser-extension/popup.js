@@ -107,15 +107,19 @@ function headline(connected, kind) {
 /**
  * The one hint worth more than all the others: DM is up, and the
  * extension still can't reach it. The browser only ever reports
- * `close code 1006`, which is identical whether nothing is listening or
+ * `close code 1006`, which is identical whether nothing is listening,
  * whether a pre-0.4.2 DM build is listening (its listener only spoke
- * line-delimited JSON and swallows the upgrade request). The bundled
- * probe tells them apart in two seconds.
+ * line-delimited JSON and swallows the upgrade request), or whether the
+ * listener accepts the connection and drops it. The bundled probe tells
+ * them apart in two seconds; the app's own log says whether the port was
+ * ever bound.
  */
 const HOST_DOWN_HINT =
   "The browser only reports `close code 1006` for every way this can " +
   "fail, so the app being open doesn't rule it out. Run this to find " +
-  "out which it is: node browser-extension/scripts/check-host.mjs";
+  "out which it is: node browser-extension/scripts/check-host.mjs — and " +
+  "check the DM session log, which records whether the listener bound the " +
+  "port at all (%APPDATA%\\dm\\logs on Windows, ~/.local/share/dm/logs on Linux).";
 
 // Map a `chrome.runtime.lastError.message` to a one-line hint
 // pointing at the most likely fix. The messages below are exactly

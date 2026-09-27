@@ -40,16 +40,25 @@
     if (typeof window === "undefined") return;
     try {
       const probe = await api.probeNativeHost();
+      // A bind failure is the loudest of the "not listening" states and
+      // the only one the user can act on: the app is running, the port
+      // isn't ours, and the browser can only ever report "disconnected
+      // (code 1006)" for it — the same string it uses when DM is closed.
+      const bindError = probe.bindError ?? null;
       extensionStatus.update((s) => ({
         ...s,
-        kind: probe.bound ? "ok" : "offline",
-        label: probe.bound ? "Ready" : "Not listening",
+        kind: probe.bound ? "ok" : bindError ? "error" : "offline",
+        label: probe.bound
+          ? "Ready"
+          : bindError
+            ? "Port unavailable"
+            : "Not listening",
         port: probe.port,
         lastActivity:
           probe.lastEventUnix > 0
             ? new Date(probe.lastEventUnix * 1000).toLocaleString()
             : "Waiting for first capture…",
-        lastError: null,
+        lastError: bindError,
       }));
     } catch (e) {
       extensionStatus.update((s) => ({

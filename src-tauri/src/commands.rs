@@ -562,6 +562,11 @@ pub struct NativeHostProbe {
     pub bound: bool,
     pub port: u16,
     pub last_event_unix: u64,
+    /// Why the listener could not bind, when it couldn't. Without this the
+    /// UI could only say "Not listening" — which is the same string for "the
+    /// app just started", "another DM instance owns the port" and "Windows
+    /// reserved the port range", and those need different fixes.
+    pub bind_error: Option<String>,
 }
 
 #[tauri::command]
@@ -573,6 +578,7 @@ pub fn probe_native_host(
         bound,
         port: crate::native_host::DEFAULT_PORT,
         last_event_unix,
+        bind_error: state.bind_error(),
     }
 }
 

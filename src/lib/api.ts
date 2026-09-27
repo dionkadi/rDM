@@ -146,6 +146,12 @@ export interface NativeHostProbe {
  bound: boolean;
  port: number;
  lastEventUnix: number;
+ /**
+  * Present only when the listener could not bind the port: another DM
+  * instance owning it, or (on Windows) the port sitting inside a range
+  * Hyper-V/WSL reserved. Shown verbatim in Settings → Extensions.
+  */
+ bindError: string | null;
 }
 
 export function probeNativeHost(): Promise<NativeHostProbe> {

@@ -209,8 +209,9 @@ browser unless DM actually received the URL.**
 This is the most confusing failure mode, because the browser gives you
 almost nothing to go on. Every way the WebSocket can fail reports the
 same thing — `close code 1006` — whether nothing is listening, whether
-something is listening but never answers the upgrade, or whether the
-handshake itself is broken.
+something is listening but never answers the upgrade, whether it accepts
+the connection and immediately drops it, or whether the handshake itself
+is broken.
 
 Run the bundled probe. It does what a browser does (TCP connect, upgrade
 request, verify `Sec-WebSocket-Accept`, exercise a masked frame) and tells
@@ -224,15 +225,19 @@ node browser-extension/scripts/check-host.mjs
 
 | Probe says | What's wrong | Fix |
 | --- | --- | --- |
-| `NOTHING IS LISTENING on 127.0.0.1:9157` | The app isn't running, or it failed to bind the port (often a stale second instance) | Start DM. Check `ss -ltnp \| grep 9157`. Grep the session log for `listener bind failed`. |
+| `NOTHING IS LISTENING on 127.0.0.1:9157` | The app isn't running, or it failed to bind the port (often a stale second instance; on Windows also a port inside a range Hyper-V / WSL / Docker reserved) | Start DM. On Linux/macOS: `ss -ltnp \| grep 9157`. On Windows: `netstat -ano \| findstr :9157`, and `netsh int ipv4 show excludedportrange protocol=tcp`. Settings → Extensions shows a bind failure as **"Port unavailable"** with the OS error. |
 | `PORT 9157 IS OPEN BUT SILENT` | Something is listening but never answers the WebSocket upgrade — the signature of a **DM build older than 0.4.2**, whose listener only spoke line-delimited JSON | Update/rebuild the DM desktop app. The WebSocket listener landed in 0.4.2. |
-| `PORT 9157 IS OPEN BUT NOT A WebSocket ENDPOINT` | Some other program owns the port | Find it with `ss -ltnp \| grep 9157` |
+| `PORT 9157 ACCEPTS AND THEN HANGS UP` | The connection is accepted and closed without a byte of HTTP: the listener could not read the upgrade request. This is what a **non-blocking accepted socket** does — and on Windows, Winsock hands those out whenever the listener is non-blocking, while POSIX does not | Rebuild the DM app (0.5.x+ puts accepted sockets back into blocking mode). Confirm with `grep "dropping an accepted connection"` in the session log — `%APPDATA%\dm\logs` on Windows. |
+| `PORT 9157 IS OPEN BUT NOT A WebSocket ENDPOINT` | Some other program owns the port | Find it with `ss -ltnp \| grep 9157` (Linux/macOS) or `netstat -ano \| findstr :9157` (Windows) |
 | `HANDSHAKE ANSWERED BUT WRONG` | The server's `Sec-WebSocket-Accept` is wrong, so browsers reject the connection | That's a bug in `src-tauri/src/ws.rs` — please report it |
-| `OK — 127.0.0.1:9157 is a working WebSocket server` | The app side is fine | It's the extension side. Read the popup's message: if it says **"Extension background isn't running"** you installed the repo folder instead of the released `.zip` (Chrome ignores `background.scripts` under MV3, so there is no background at all). |
+| `OK — 127.0.0.1:9157 is a working WebSocket server` | The app side is fine | It's the extension side. Read the popup's message: if it says **"Extension background isn't running"** you installed the repo folder instead of the released `.zip` (Chrome ignores `background.scripts` under MV3, so there is no background at all). If it says `disconnected (code 1006)`, reload the extension on `chrome://extensions` — an MV3 service worker does not pick up file changes on disk. |
 
 If the app side checks out and you want to test the extension *without*
 the GUI, `src-tauri/probe-listener/` runs the real listener as a plain
-terminal program on port 9158:
+terminal program on port 9158. `--winsock` reproduces the Windows
+inheritance above, and `--winsock --no-blocking-reset` reproduces the
+failure itself (the probe then says `ACCEPTS AND THEN HANGS UP`) on any
+platform:
 
 ```bash
 cd src-tauri/probe-listener && cargo run
@@ -248,7 +253,7 @@ pointing at the most likely cause.
 
 | Popup error | What it means | Fix |
 | --- | --- | --- |
-| `disconnected (code 1006)` | Nothing completed a WebSocket handshake on `127.0.0.1:9157` | Run `node browser-extension/scripts/check-host.mjs` — it distinguishes the four causes above. While it's disconnected, media links are left to the browser. |
+| `disconnected (code 1006)` | Nothing completed a WebSocket handshake on `127.0.0.1:9157` | Run `node browser-extension/scripts/check-host.mjs` — it distinguishes the five causes above. While it's disconnected, media links are left to the browser. |
 | `Could not establish connection. Receiving end does not exist.` | The extension has **no background service worker**, so the popup can't even ask it for status. Almost always: you loaded the repo's `browser-extension/` folder in Chrome | Load a Chromium build: the released `dm-grabber-<version>.zip`, or `./scripts/dev-unpacked.sh` for a working-tree build. Then Reload on `chrome://extensions`. Note the DM app may be perfectly fine — confirm with `node scripts/check-host.mjs`. |
 | `WebSocket ctor failed` | The browser refused to open a WebSocket at all | Reload the extension. This is *not* caused by `host_permissions` — extension pages aren't gated by host permissions for WebSockets. Check for a restrictive `content_security_policy`. |
 | `connectNative is not a function` (Firefox) | The extension was built without the `nativeMessaging` permission | Install the released `.xpi`, or add `"nativeMessaging"` to `permissions` in the Firefox `manifest.json` and reload. |

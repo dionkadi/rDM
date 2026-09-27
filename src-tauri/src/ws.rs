@@ -23,7 +23,8 @@
 //! beyond the per-frame payload Vec. The browser doesn't
 //! need anything fancier.
 
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 
 use base64::Engine as _;
 use sha1::{Digest, Sha1};
@@ -33,6 +34,60 @@ use sha1::{Digest, Sha1};
 /// SHA-1-hashing to derive the `Sec-WebSocket-Accept`
 /// response header. RFC 6455 §1.3.
 const WS_MAGIC_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+/// Put a freshly-accepted connection into the state every read in
+/// this module assumes: **blocking**, behind a `BufReader`.
+///
+/// This is not a no-op on Windows. It is the fix for *"the Chrome
+/// extension can't connect on Windows"* — the browser reports
+/// `disconnected (code 1006)`, which is the same message for every
+/// way a WebSocket can fail, so the cause has to be read off the
+/// server side:
+///
+/// * The listener in `crate::native_host` runs its `accept()` loop on
+///   a **non-blocking** `TcpListener` (so it can also retire cleanly
+///   and update its status). POSIX `accept()` returns a *blocking*
+///   socket no matter what the listener is — so on Linux/macOS the
+///   inheritance below never showed up.
+/// * Winsock is different: the socket `accept()` returns **inherits
+///   the listener's non-blocking mode** ("The newly created socket
+///   … has the same properties as socket s", MSDN `accept`,
+///   `winsock2.h`). So on Windows every accepted connection arrived
+///   non-blocking, and the very first read — the one that decides
+///   "WebSocket or legacy line-JSON?" — returned `WSAEWOULDBLOCK`
+///   instead of the browser's `GET / HTTP/1.1`:
+///     - [`peek_is_websocket`] sees an error, answers `false`, and the
+///       connection is handed to the line-delimited-JSON reader;
+///     - that reader's first `read_line` errors, `unwrap_or(0)` makes
+///       it look like EOF, and the connection is dropped before the
+///       upgrade request is ever parsed.
+///
+///   The browser sees a TCP connection that closes without a byte of
+///   HTTP in reply → **close code 1006**. Meanwhile the app looks
+///   healthy and logs nothing.
+///
+/// Setting the mode explicitly makes the requirement part of the code
+/// instead of an accident of the platform. `Err` means the connection
+/// cannot be served at all, so callers must drop it — loudly.
+pub fn accept_ready(stream: TcpStream) -> io::Result<BufReader<TcpStream>> {
+    stream.set_nonblocking(false)?;
+    Ok(BufReader::new(stream))
+}
+
+/// Decide whether a raw connection is a browser HTTP request or the
+/// legacy `dm-native-host` line-delimited JSON, from its first byte:
+/// `G`/`g` (`GET`) → HTTP; `{` (a JSON object) → line-JSON.
+///
+/// `BufRead::fill_buf` buffers without consuming, so the bytes stay
+/// available to the reader handed to [`handshake`]. An error here is
+/// not a WebSocket: either the peer is gone, or (on Windows, if the
+/// socket was left non-blocking) the read could not complete yet.
+pub fn peek_is_websocket<R: BufRead>(reader: &mut R) -> bool {
+    match reader.fill_buf() {
+        Ok(buf) => matches!(buf.first(), Some(b'G') | Some(b'g')),
+        Err(_) => false,
+    }
+}
 
 /// Outcome of peeking the first bytes of a new connection.
 #[derive(Debug)]
@@ -598,5 +653,131 @@ mod tests {
             payload,
             r#"{"url":"https://example.com/file.zip","type":"download"}"#.to_string()
         );
+    }
+
+    // ─── Windows: the non-blocking accepted socket ─────────────
+    //
+    // The one platform-dependent assumption in this module.
+    // `TcpListener::set_nonblocking(true)` — which the real listener
+    // needs for its accept loop — makes Winsock hand *non-blocking*
+    // sockets to `accept()`, while POSIX hands back blocking ones.
+    // Linux CI cannot observe the inheritance itself, so these tests
+    // apply the Windows state by hand and assert both halves of the
+    // contract: without the reset the connection is unusable (the
+    // reported "Chrome says 1006 on Windows" bug), and `accept_ready`
+    // restores it.
+
+    #[test]
+    fn peek_is_websocket_classifies_the_first_byte() {
+        let mut get = Cursor::new(b"GET / HTTP/1.1\r\n".to_vec());
+        assert!(peek_is_websocket(&mut get));
+        // Header names are case-insensitive and so is the method's.
+        let mut lower = Cursor::new(b"get / HTTP/1.1\r\n".to_vec());
+        assert!(peek_is_websocket(&mut lower));
+        // The legacy dm-native-host binary sends a JSON object.
+        let mut legacy = Cursor::new(br#"{"url":"https://example.test/a.zip"}"#.to_vec());
+        assert!(!peek_is_websocket(&mut legacy));
+        // Empty read: the peer is already gone.
+        let mut nothing = Cursor::new(Vec::new());
+        assert!(!peek_is_websocket(&mut nothing));
+    }
+
+    /// The bug and the fix on one real socket. Windows' `accept()`
+    /// state is reproduced explicitly, so this test is meaningful on
+    /// every platform — and fails if the `set_nonblocking(false)` in
+    /// `accept_ready` goes away.
+    #[test]
+    fn a_nonblocking_accept_drops_the_connection_and_accept_ready_saves_it() {
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::mpsc;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // The client stays silent until the server has finished
+        // probing, so "no bytes pending" is guaranteed rather than
+        // raced for.
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            go_rx.recv().unwrap();
+            stream.write_all(CHROME_LIKE_REQUEST).unwrap();
+
+            // Wait for the 101 before sending the frame. `handshake`
+            // reads whatever has already arrived and discards
+            // everything past the header block, so pipelining the frame
+            // behind the request could lose it.
+            let mut seen = Vec::new();
+            let mut tmp = [0u8; 128];
+            while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut tmp).unwrap();
+                assert!(n > 0, "the server hung up during the handshake");
+                seen.extend_from_slice(&tmp[..n]);
+            }
+            assert!(
+                std::str::from_utf8(&seen).unwrap().starts_with("HTTP/1.1 101"),
+                "got: {}",
+                String::from_utf8_lossy(&seen)
+            );
+
+            let payload = br#"{"url":"https://example.test/file.zip"}"#;
+            let mask = [0x11, 0x22, 0x33, 0x44];
+            let mut frame = vec![0x81, 0x80 | payload.len() as u8];
+            frame.extend_from_slice(&mask);
+            for (i, b) in payload.iter().enumerate() {
+                frame.push(b ^ mask[i & 3]);
+            }
+            stream.write_all(&frame).unwrap();
+            // Handed back so the connection outlives the server's
+            // reads: dropping it here would FIN the socket mid-test.
+            stream
+        });
+
+        // Server side, in the state Windows leaves behind: a
+        // `TcpListener` that is non-blocking makes the accepted socket
+        // non-blocking too.
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let mut reader = BufReader::new(stream);
+
+        // (1) Non-blocking with nothing buffered yet = the bug. The
+        // dispatch answers "not a WebSocket", so the connection goes
+        // to the line-JSON reader, whose first read fails and whose
+        // `unwrap_or(0)` read that failure as EOF. The browser's
+        // `GET / HTTP/1.1` is never answered and the socket is
+        // dropped — close code 1006, with nothing in the log.
+        assert!(
+            !peek_is_websocket(&mut reader),
+            "a non-blocking socket must reproduce the mis-dispatch"
+        );
+        let mut line = String::new();
+        assert!(
+            reader.read_line(&mut line).is_err() || line.is_empty(),
+            "and the line-JSON reader must mistake the failure for EOF"
+        );
+
+        // (2) ...and the fix: put it back into blocking mode, then run
+        // a full browser-shaped exchange on the same connection.
+        let mut reader = accept_ready(reader.into_inner()).unwrap();
+        go_tx.send(()).unwrap();
+        assert!(
+            peek_is_websocket(&mut reader),
+            "accept_ready must restore blocking reads"
+        );
+        let mut writer = reader.get_ref().try_clone().unwrap();
+        assert!(matches!(
+            handshake(&mut reader, &mut writer).unwrap(),
+            HandshakeOutcome::WebSocket
+        ));
+        assert_eq!(
+            read_text_frame(&mut reader).unwrap().unwrap(),
+            r#"{"url":"https://example.test/file.zip"}"#
+        );
+        // And the server-to-client half (the `{"ok":true}` ack path).
+        write_text_frame(&mut writer, r#"{"ok":true}"#).unwrap();
+
+        // Keeps the client's socket alive until here.
+        let _client_stream = client.join().unwrap();
     }
 }

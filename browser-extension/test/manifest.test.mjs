@@ -219,7 +219,7 @@ test("the tooling runs when invoked through a symlinked path", (t) => {
     );
     assert.match(
       probe,
-      /all 4 probe cases classified correctly/,
+      /all 5 probe cases classified correctly/,
       "probe through a symlink silently did nothing",
     );
   } finally {

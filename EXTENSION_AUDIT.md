@@ -543,3 +543,86 @@ leaked `nativeMessaging`, and the no-op'd main check.
 
 
 
+
+---
+
+## 9. Follow-up: "it works on Linux, Chrome can't connect on Windows"
+
+Reported as `Browser said: disconnected (code 1006)` on Windows, with the
+app running and the popup able to talk to its own background service
+worker — i.e. §8's resolution did **not** apply this time (that case
+reports `Could not establish connection. Receiving end does not exist.`).
+`code 1006` is still the only thing the browser will say, so the
+differentiator had to come from the server side.
+
+### Root cause: Winsock inherits the listener's non-blocking mode
+
+`native_host::start_native_host_listener` runs its `accept()` loop on a
+non-blocking `TcpListener` (so the loop can update its status and retire
+cleanly). Everything after that assumed the accepted socket was
+**blocking**, and on Linux/macOS it was: POSIX `accept()` returns a
+blocking socket no matter what the listener is.
+
+Winsock does not. The socket `accept()` returns **inherits the listener's
+non-blocking mode** ("The newly created socket … has the same properties
+as socket s", MSDN `accept`). So on Windows — and only on Windows — every
+connection arrived non-blocking, and the first read failed with
+`WSAEWOULDBLOCK` before the browser's `GET / HTTP/1.1` was parsed:
+
+* the first-byte peek (`fill_buf`) errored → the dispatch answered "not a
+  WebSocket" → the connection was handed to the **line-delimited JSON**
+  reader;
+* that reader's first `read_line` errored, and `unwrap_or(0)` read the
+  failure as **EOF** → the connection was dropped before the upgrade
+  request was ever answered.
+
+The browser sees a TCP connection that closes without a byte of HTTP:
+`close code 1006`. The app looked healthy and logged nothing.
+
+### Evidence
+
+The Windows state is now reproducible on any platform, which is what makes
+this verifiable rather than plausible — `probe-listener --winsock
+--no-blocking-reset` applies the inheritance and skips the reset:
+
+```
+PORT 9158 ACCEPTS AND THEN HANGS UP        <- probe verdict: `closed`
+legacy: line-JSON path                     <- mis-dispatch
+legacy: read failed: Resource temporarily unavailable (os error 11)   <- WSAEWOULDBLOCK's POSIX twin
+```
+
+and with the integration-worthy flag (`--winsock`, i.e. the fixed code):
+
+```
+OK — 127.0.0.1:9159 is a working WebSocket server   (frame layer: close-frame)
+ws: client connected / ws: clean close
+```
+
+`ws::tests::a_nonblocking_accept_drops_the_connection_and_accept_ready_saves_it`
+asserts both halves on one real socket (the mis-dispatch and the read
+failure, then a full handshake + masked frame after the reset), so the fix
+cannot be removed silently.
+
+### Fixes
+
+| Defect | Fix | File |
+| --- | --- | --- |
+| Accepted sockets inherited the listener's non-blocking mode (Windows-only, every connection dropped) | `ws::accept_ready()` sets the mode explicitly; the app's listener and the probe harness both use it, and a connection that can't be put right is dropped **loudly** | `src-tauri/src/ws.rs`, `native_host.rs` |
+| A read error in the line-JSON path was `unwrap_or(0)`-ed into "EOF" — the reason the failure was silent | the error is logged and the loop breaks on it | `native_host.rs` |
+| The peek ran inside the accept loop, so a client that connected and sent nothing stalled every other connection | one thread per connection does the reset **and** the peek | `native_host.rs` |
+| A failed `bind()` was terminal, and printed with `eprintln!` — invisible in a Windows release build (no console, no log line). Every one of `refused`/`closed`/`no-response` looks identical from Chrome | `bind_with_retry` (first failure at ERROR, then DEBUG) + the reason recorded in `NativeHostStatus` and surfaced through `probe_native_host` as "Port unavailable" | `native_host.rs`, `commands.rs`, `api.ts`, `SettingsTabs.svelte` |
+| The probe could not tell "accepted and dropped" from "listening and silent" — the new bug's signature would have been reported as a pre-0.4.2 build | new `closed` verdict, a self-test case for it, and mutation `probe confuse a dropped connection with a silent listener` | `scripts/check-host.mjs`, `test/*` |
+
+### Still unverified
+
+* **Nothing here ran on Windows.** The Winsock behaviour is documented and
+  the failure it produces is reproduced exactly (`closed`, EWOULDBLOCK on
+  the first read), but the fix itself has only been exercised through the
+  simulated inheritance.
+* **Chrome's Local Network Access policy for extensions** remains the
+  candidate if the probe says `ok` while the popup still says `1006` on
+  the user's machine — the same open question §8 left. The popup now says
+  so, and points at the app's log, rather than guessing.
+* If the probe says `refused`, the bind retry will now report *why* — but
+  a port reserved by Hyper-V/WSL/Docker still needs the user to read
+  `netsh int ipv4 show excludedportrange protocol=tcp` and move DM's port.

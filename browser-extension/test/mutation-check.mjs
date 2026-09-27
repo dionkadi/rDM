@@ -177,6 +177,20 @@ const MUTATIONS = [
     test: "test/content.test.mjs",
     pattern: "grab: one grab, one download",
   },
+  {
+    // The probe's newest distinction, and the one that names the
+    // Windows failure: a listener that accepts the connection and
+    // then hangs up. Collapsing it back into `no-response` restores
+    // exactly the ambiguity this exists to remove — that connection is
+    // dropped because the request could not be *read*, not because it
+    // was read and ignored, and the two need different fixes.
+    name: "probe  confuse a dropped connection with a silent listener",
+    file: "scripts/check-host.mjs",
+    find: '        finish({ kind: "closed" });',
+    replace: '        finish({ kind: "no-response", eof: true });',
+    test: "test/manifest.test.mjs",
+    pattern: "the tooling runs when invoked through a symlinked path",
+  },
 ];
 
 const results = [];

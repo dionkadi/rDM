@@ -34,7 +34,7 @@ use crate::ws;
 use std::io::{BufRead, BufReader};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -44,12 +44,27 @@ use tauri::{AppHandle, Emitter};
 /// `crates/native-host/src/main.rs::DEFAULT_PORT`.
 pub const DEFAULT_PORT: u16 = 9157;
 
+/// How long to wait before re-attempting `bind()` after a failure.
+///
+/// A stale DM instance, or a port sitting inside a reserved range (see
+/// [`bind_failure_hint`]), can hold the port for a while. The listener used
+/// to give up **permanently** on the first failure — and on a Windows
+/// release build that failure was invisible twice over: there is no console
+/// (`windows_subsystem = "windows"`), and it was printed with `eprintln!`,
+/// which bypasses the file logger. A user saw only "the extension can't
+/// connect" forever, with nothing anywhere explaining why.
+const BIND_RETRY_DELAY: Duration = Duration::from_secs(3);
+
 /// Shared state the frontend can poll via `probe_native_host` to see whether
 /// the listener is up and when it last saw traffic.
 #[derive(Clone)]
 pub struct NativeHostStatus {
     pub bound: Arc<AtomicBool>,
     pub last_event_unix: Arc<AtomicU64>,
+    /// Last `bind()` failure, or `None` once the listener is up. Surfaced
+    /// through `probe_native_host` so Settings → Extensions can say *why*
+    /// the port is not listening instead of just "Not listening".
+    bind_error: Arc<Mutex<Option<String>>>,
 }
 
 impl Default for NativeHostStatus {
@@ -57,6 +72,7 @@ impl Default for NativeHostStatus {
         NativeHostStatus {
             bound: Arc::new(AtomicBool::new(false)),
             last_event_unix: Arc::new(AtomicU64::new(0)),
+            bind_error: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -68,6 +84,24 @@ impl NativeHostStatus {
             self.last_event_unix.load(Ordering::Relaxed),
         )
     }
+
+    /// The current bind failure, if the listener is not up.
+    pub fn bind_error(&self) -> Option<String> {
+        self.bind_error.lock().ok().and_then(|e| e.clone())
+    }
+
+    fn set_bind_error(&self, err: impl Into<String>) {
+        if let Ok(mut slot) = self.bind_error.lock() {
+            *slot = Some(err.into());
+        }
+    }
+
+    fn clear_bind_error(&self) {
+        if let Ok(mut slot) = self.bind_error.lock() {
+            *slot = None;
+        }
+    }
+
     fn touch(&self) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -77,8 +111,52 @@ impl NativeHostStatus {
     }
 }
 
-/// Bind the listener on a background OS thread. Returns immediately; if the
-/// port is unavailable the thread logs and exits without affecting the app.
+/// Platform-specific second half of the bind-failure log line. A reserved
+/// port range is a Windows-only failure mode (Hyper-V / WSL / Docker reserve
+/// blocks of the ephemeral range), and it looks exactly like "DM isn't
+/// running" from inside a browser, so it is worth naming in the log.
+fn bind_failure_hint() -> &'static str {
+    if cfg!(target_os = "windows") {
+        " — on Windows this is usually a reserved port range \
+         (`netsh int ipv4 show excludedportrange protocol=tcp`) or a second \
+         DM instance"
+    } else {
+        " — usually a second DM instance (`ss -ltnp | grep :9157`)"
+    }
+}
+
+/// `bind()` the listener, retrying until it succeeds.
+///
+/// Runs on the listener thread; returns only once the port is ours, so the
+/// caller can treat a returned listener as "bound".
+fn bind_with_retry(port: u16, status: &NativeHostStatus) -> TcpListener {
+    let mut attempt: u32 = 0;
+    loop {
+        match TcpListener::bind(("127.0.0.1", port)) {
+            Ok(listener) => return listener,
+            Err(e) => {
+                status.set_bind_error(e.to_string());
+                if attempt == 0 {
+                    // ERROR once (the user needs this in the log), then
+                    // DEBUG — a port we can never have must not fill the
+                    // log file every three seconds.
+                    log::error!(
+                        "dm: cannot bind the browser-extension listener on \
+                         127.0.0.1:{port}: {e}{} — retrying every {}s",
+                        bind_failure_hint(),
+                        BIND_RETRY_DELAY.as_secs()
+                    );
+                } else {
+                    log::debug!("dm: bind retry #{attempt} on port {port} failed: {e}");
+                }
+                attempt = attempt.saturating_add(1);
+                thread::sleep(BIND_RETRY_DELAY);
+            }
+        }
+    }
+}
+
+/// Bind the listener on a background OS thread. Returns immediately.
 ///
 /// `app` is the Tauri `AppHandle` used to emit `Captured` events to the
 /// frontend. `default_save_dir` is read once at startup (the user's default
@@ -91,54 +169,66 @@ pub fn start_native_host_listener(
     status: NativeHostStatus,
 ) {
     thread::spawn(move || {
-        let listener = match TcpListener::bind(("127.0.0.1", port)) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("dm: native-host listener bind failed on {port}: {e}");
-                return;
-            }
-        };
-        // Make accept() non-blocking so we can update `bound` promptly and
-        // exit cleanly if the user later closes the app.
-        listener.set_nonblocking(true).ok();
+        let listener = bind_with_retry(port, &status);
+        // Make accept() non-blocking so the loop can also observe a
+        // shutdown / re-check cheaply. **This is the line that makes
+        // Windows different:** on Winsock the socket `accept()` returns
+        // inherits this flag, so every accepted connection arrives
+        // non-blocking and must be put back by `ws::accept_ready`. See
+        // that function for the full story — it is the "Chrome reports
+        // 1006 on Windows" bug.
+        if let Err(e) = listener.set_nonblocking(true) {
+            log::warn!("dm: could not set the extension listener non-blocking: {e}");
+        }
         status.bound.store(true, Ordering::Relaxed);
-        eprintln!("dm: native-host listener on 127.0.0.1:{port}");
+        status.clear_bind_error();
+        log::info!("dm: native-host listener on 127.0.0.1:{port}");
         loop {
             match listener.accept() {
-                Ok((s, _)) => {
+                Ok((stream, _)) => {
                     let app = app.clone();
                     let st = status.clone();
                     let dir = default_save_dir.clone();
-                    // Peek the first byte to decide whether this
-                    // is a WebSocket upgrade request. We wrap the
-                    // raw socket in a BufReader first because the
-                    // handshake path needs `BufRead`, and BufRead's
-                    // `peek` is the cheap buffered way to look at
-                    // incoming bytes without consuming them. A `GET`
-                    // request starts with `G`; the legacy
-                    // `dm-native-host` binary sends a raw JSON
-                    // object (`{`).
-                    let mut reader = BufReader::new(s);
-                    let is_ws = match reader.fill_buf() {
-                        Ok(buf) => buf.first().copied() == Some(b'G')
-                            || buf.first().copied() == Some(b'g'),
-                        Err(_) => false,
-                    };
-                    // `fill_buf` advances the internal cursor but
-                    // not the underlying socket, so the bytes
-                    // remain available to the reader we hand off.
-                    if is_ws {
-                        thread::spawn(move || handle_ws_conn(reader, app, dir, st));
-                    } else {
-                        thread::spawn(move || handle_conn(reader, app, dir, st));
-                    }
+                    // One thread per connection, and **the whole
+                    // connection setup happens in it**. The mode reset and
+                    // the peek used to run inside the accept loop, which
+                    // meant a client that connected and sent nothing
+                    // blocked every other connection — and, on Windows,
+                    // made the peek itself unreliable.
+                    thread::spawn(move || {
+                        // Blocking mode is what every read below assumes;
+                        // Winsock does not default to it for accepted
+                        // sockets. A connection we cannot put right is one
+                        // we cannot serve, so drop it loudly rather than
+                        // silently (that silence was the bug).
+                        let mut reader = match ws::accept_ready(stream) {
+                            Ok(reader) => reader,
+                            Err(e) => {
+                                log::error!(
+                                    "dm: dropping an accepted connection that \
+                                     could not be made blocking: {e}"
+                                );
+                                return;
+                            }
+                        };
+                        // A browser sends `GET / HTTP/1.1`; the legacy
+                        // `dm-native-host` binary sends a raw JSON object
+                        // (`{`). `fill_buf` peeks without consuming, so the
+                        // bytes stay available to whichever reader runs.
+                        if ws::peek_is_websocket(&mut reader) {
+                            handle_ws_conn(reader, app, dir, st);
+                        } else {
+                            handle_conn(reader, app, dir, st);
+                        }
+                    });
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // Idle; sleep briefly then re-check.
                     thread::sleep(Duration::from_millis(250));
                 }
-                Err(_) => {
+                Err(e) => {
                     // Transient error: brief backoff, then keep accepting.
+                    log::warn!("dm: accept() failed on port {port}: {e}");
                     thread::sleep(Duration::from_millis(500));
                 }
             }
@@ -159,8 +249,18 @@ fn handle_conn(
     let mut line = String::new();
     loop {
         line.clear();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            break;
+        match reader.read_line(&mut line) {
+            // Clean EOF: the client is done.
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => {
+                // `unwrap_or(0)` used to collapse every read error into
+                // "EOF", so a connection that was mis-dispatched here —
+                // most notoriously a WebSocket left non-blocking by
+                // Winsock — closed without a trace.
+                log::warn!("dm: line-JSON connection dropped: {e}");
+                break;
+            }
         }
         let line = line.trim();
         if line.is_empty() {

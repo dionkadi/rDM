@@ -4,7 +4,8 @@
 // can't, the browser only ever tells us "closed with code 1006" — which
 // is the *same* message whether nothing is listening, whether an old
 // pre-0.4.2 DM build is listening (it spoke only line-delimited JSON and
-// will silently swallow the upgrade request), or whether the handshake
+// will silently swallow the upgrade request), whether the listener
+// accepts the connection and then drops it, or whether the handshake
 // itself is broken. That ambiguity is why "the app is running but the
 // extension won't connect" is hard to pin down.
 //
@@ -64,8 +65,17 @@ export function maskedCloseFrame() {
  *
  * @returns {Promise<{kind: string, statusLine?: string, accept?: string,
  *   expected?: string, frameLayer?: string, message?: string}>}
- *   kind: refused | unreachable | no-response | http-error | bad-accept
- *       | ok | error
+ *   kind: refused | unreachable | no-response | closed | http-error
+ *       | bad-accept | ok | error
+ *
+ * `no-response` and `closed` are deliberately separate. Both look
+ * identical from a browser (`close code 1006`), but they have different
+ * causes: `no-response` is something that reads the request and stays
+ * silent (the pre-0.4.2 line-JSON listener), while `closed` is a server
+ * that accepts the connection and then hangs up without a byte of HTTP —
+ * the signature of a listener that mis-dispatched the request or could
+ * not read from the socket, which is what the Windows/Winsock
+ * non-blocking `accept()` bug did to every connection.
  */
 export function probe(port, { host = "127.0.0.1", timeoutMs = 3000 } = {}) {
   return new Promise((resolve) => {
@@ -155,7 +165,8 @@ export function probe(port, { host = "127.0.0.1", timeoutMs = 3000 } = {}) {
 
     socket.on("end", () => {
       if (!sawHandshake) {
-        finish({ kind: "no-response", eof: true });
+        // The server hung up without answering: accepted and dropped.
+        finish({ kind: "closed" });
       } else {
         finish({ kind: "ok", statusLine: "HTTP/1.1 101 Switching Protocols", frameLayer: "eof" });
       }
@@ -166,7 +177,7 @@ export function probe(port, { host = "127.0.0.1", timeoutMs = 3000 } = {}) {
         finish(
           sawHandshake
             ? { kind: "ok", statusLine: "HTTP/1.1 101 Switching Protocols", frameLayer: "closed" }
-            : { kind: "no-response", eof: true },
+            : { kind: "closed" },
         );
       }
     });
@@ -220,6 +231,17 @@ function legacyJsonListener(socket) {
   });
 }
 
+/**
+ * The Windows/Winsock signature: the connection is accepted and then
+ * dropped without any answer at all. `probe-listener --winsock
+ * --no-blocking-reset` produces exactly this.
+ */
+function dropListener(socket) {
+  socket.on("data", () => {
+    socket.destroy();
+  });
+}
+
 async function selfTest() {
   const results = [];
   const noListener = await startServer(() => {});
@@ -227,12 +249,14 @@ async function selfTest() {
   noListener.server.close();
 
   const legacy = await startServer(legacyJsonListener);
+  const dropper = await startServer(dropListener);
   const good = await startServer(wsServer());
   const bad = await startServer(wsServer({ wrongAccept: true }));
 
   const cases = [
     ["refused", await probe(deadPort, { timeoutMs: 1000 }), "refused"],
     ["no-response", await probe(legacy.port, { timeoutMs: 800 }), "no-response"],
+    ["closed", await probe(dropper.port, { timeoutMs: 1500 }), "closed"],
     ["ok", await probe(good.port, { timeoutMs: 1500 }), "ok"],
     ["bad-accept", await probe(bad.port, { timeoutMs: 1500 }), "bad-accept"],
   ];
@@ -247,6 +271,7 @@ async function selfTest() {
   }
 
   legacy.server.close();
+  dropper.server.close();
   good.server.close();
   bad.server.close();
 
@@ -261,6 +286,16 @@ async function selfTest() {
 
 function report(port, verdict) {
   const banner = (t) => `\n${t}\n${"─".repeat(t.length)}\n`;
+  const win = process.platform === "win32";
+  const whoHasThePort = win
+    ? "  netstat -ano | findstr :" + port
+    : "  ss -ltnp | grep " + port;
+  const reservedRanges = win
+    ? "\n  Windows also reserves blocks of ports for Hyper-V / WSL / Docker.\n" +
+      "  If your port falls in one, bind() can never succeed:\n" +
+      "    netsh int ipv4 show excludedportrange protocol=tcp\n"
+    : "";
+  const logDir = win ? "%APPDATA%\\dm\\logs" : "$XDG_DATA_HOME/dm/logs (or ~/.local/share/dm/logs)";
   switch (verdict.kind) {
     case "ok":
       console.log(banner(`OK — 127.0.0.1:${port} is a working WebSocket server`));
@@ -273,8 +308,10 @@ function report(port, verdict) {
           "    service worker. You almost certainly loaded the repo folder in\n" +
           "    Chrome instead of the released .zip. Chrome ignores\n" +
           "    background.scripts under MV3, so nothing runs.\n" +
-          "  * a red \"disconnected (code 1006)\" that comes and goes -> tell us\n" +
-          "    and include the extension version from chrome://extensions.",
+          "  * a red \"disconnected (code 1006)\" that comes and goes -> reload\n" +
+          "    the extension on chrome://extensions (an MV3 service worker does\n" +
+          "    not pick up file changes on disk), then tell us and include the\n" +
+          "    extension version and your browser version.",
       );
       return 0;
     case "refused":
@@ -284,12 +321,33 @@ function report(port, verdict) {
           "or it failed to bind the port. Check, in this order:\n" +
           "  1. Is the DM window actually open?\n" +
           "  2. Look for a second/stale DM instance holding the port:\n" +
-          "       ss -ltnp | grep 9157\n" +
-          "  3. The app logs a bind failure at startup. On Linux the session\n" +
-          "     log is under $XDG_DATA_HOME (or ~/.local/share) in the DM\n" +
-          "     data directory; grep it for \"listener bind failed\".",
+          `${whoHasThePort}\n` +
+          reservedRanges +
+          `  3. The app logs a bind failure at startup (Settings → Extensions\n` +
+          `     shows it as "Port unavailable"); the session log is under\n` +
+          `     ${logDir}. Grep it for "cannot bind".`,
       );
       return 2;
+    case "closed":
+      console.log(banner(`PORT ${port} ACCEPTS AND THEN HANGS UP`));
+      console.log(
+        "Something is listening: the TCP connection succeeds, and then the\n" +
+          "connection is closed without a single byte of HTTP. That is the\n" +
+          "signature of a listener that mis-dispatched the browser's request\n" +
+          "— classically, an accepted socket left in non-blocking mode (which\n" +
+          "is what a non-blocking listener gives you on Windows: Winsock\n" +
+          "inherits the flag, POSIX does not), so the very first read fails\n" +
+          "and is mistaken for \"the client said nothing\".\n\n" +
+          "A browser sees exactly this as close code 1006.\n\n" +
+          "Fix: rebuild the DM app — `ws::accept_ready` puts accepted sockets\n" +
+          "back into blocking mode (0.5.x and later). Confirm the app is the\n" +
+          "one on the port and check its log:\n" +
+          `  ${logDir}  (grep for "dropping an accepted connection")\n\n` +
+          "To reproduce it off Windows:\n" +
+          "  cd src-tauri/probe-listener && cargo run -- --winsock --no-blocking-reset\n" +
+          "  node browser-extension/scripts/check-host.mjs 9158   # -> closed",
+      );
+      return 3;
     case "no-response":
       console.log(banner(`PORT ${port} IS OPEN BUT SILENT`));
       console.log(
@@ -310,7 +368,7 @@ function report(port, verdict) {
       console.log(
         `It answered: ${verdict.statusLine}\n\n` +
           "Something else is on this port, or the listener is serving plain\n" +
-          "HTTP. Check what owns it: ss -ltnp | grep " + port,
+          `HTTP. Check what owns it:\n${whoHasThePort}`,
       );
       return 3;
     case "bad-accept":

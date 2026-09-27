@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > ship breaking changes between minor versions. Once we hit 1.0.0 we
 > commit to the SemVer stability guarantees.
 
+## [Unreleased]
+
+### Fixed — Chrome extension could not connect on Windows (`disconnected (code 1006)`)
+
+- **On Windows, every connection from the Chromium extension was accepted
+  and then dropped.** The listener's `accept()` loop runs on a
+  non-blocking `TcpListener`; POSIX hands back a *blocking* socket anyway,
+  but **Winsock makes the accepted socket inherit the non-blocking mode**
+  ("The newly created socket … has the same properties as socket s"). So
+  on Windows the first read returned `WSAEWOULDBLOCK`, the connection was
+  mis-dispatched to the legacy line-JSON reader, and that reader's
+  `unwrap_or(0)` read the failure as EOF — the browser's
+  `GET / HTTP/1.1` was never answered and Chrome reported `close code
+  1006`, with nothing in the log. Linux and macOS were never affected,
+  which is why it survived to a release.
+  - `ws::accept_ready()` now puts accepted connections into blocking mode
+    explicitly (both the app and the probe harness use it), and the
+    first-byte peek moved into the per-connection thread so a client that
+    connects and sends nothing can no longer stall the accept loop.
+  - A read error in the line-JSON path is logged instead of being treated
+    as EOF, which is what made the failure silent.
+- **A failed `bind()` was terminal and invisible.** It was `eprintln!`-ed
+  — and a Windows release build has no console, while `eprintln!` also
+  bypasses the file logger — so a port that could never be bound looked
+  exactly like "DM isn't running". The listener now retries every 3 s
+  (first failure at ERROR, later ones at DEBUG) and records the reason:
+  Settings → Extensions shows it as **"Port unavailable"** with the OS
+  message. On Windows a reserved port range is the usual cause
+  (`netsh int ipv4 show excludedportrange protocol=tcp`).
+- **`check-host.mjs` gained a `closed` verdict**: "accepted the connection
+  and hung up without a byte of HTTP" is now distinguished from
+  "listening but silent" (the pre-0.4.2 line-JSON listener). They are
+  identical to a browser and need different fixes. The self-test covers
+  the new case, and the mutation suite fails if the two are collapsed.
+- `probe-listener` can reproduce the Windows condition on any platform:
+  `cargo run -- --winsock --no-blocking-reset` (broken) vs `--winsock`
+  (fixed). It also no longer carries a copy of the app's dispatch logic —
+  both call `ws::accept_ready` / `ws::peek_is_websocket`.
+
 ## [0.5.0] - 2026-09-26
 
 ### Fixed — completed task turning "Queued at 0 %" after a restart
