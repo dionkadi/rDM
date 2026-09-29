@@ -183,6 +183,17 @@ export function createWebSocketFake() {
  *                                        invalidated (orphaned) runtime
  * @param {Array}  [options.tabs]         [{id, hasContentScript}]
  * @param {boolean}[options.wsSupported]  false ⇒ `new WebSocket` throws
+ * @param {boolean}[options.noBackground] the SW never started — the
+ *                                        Chromium-with-only-`background.scripts`
+ *                                        case, which is *why* the default
+ *                                        manifest below is Firefox-shaped
+ * @param {boolean}[options.holdBackgroundInitially] model the MV3 cold start:
+ *                                        `runtime.sendMessage` fails with
+ *                                        "Receiving end does not exist." until
+ *                                        `releaseBackground()`, i.e. the worker
+ *                                        is being launched and has not reached
+ *                                        its top-level `onMessage` registration
+ * @param {object} [options.manifest]     what `runtime.getManifest()` returns
  */
 export function createChromeMock(options = {}) {
   const opts = {
@@ -191,6 +202,19 @@ export function createChromeMock(options = {}) {
     wsSupported: true,
     ...options,
   };
+
+  // The manifest Chrome actually loaded. `noBackground` implies the
+  // Firefox template, because that is *why* such an extension has no
+  // service worker: Chrome ignores `background.scripts` under MV3.
+  const manifest = opts.manifest ?? {
+    manifest_version: 3,
+    name: "DM Download Grabber",
+    version: "0.5.0",
+    background: opts.noBackground
+      ? { scripts: ["background.js"] }
+      : { service_worker: "background.js" },
+  };
+  let backgroundHeld = !!opts.holdBackgroundInitially;
 
   const logs = { warn: [], info: [], error: [], log: [] };
   const listeners = {
@@ -268,6 +292,10 @@ export function createChromeMock(options = {}) {
       get lastError() {
         return lastError;
       },
+      getManifest() {
+        // A fresh copy each call, like the browser's.
+        return JSON.parse(JSON.stringify(manifest));
+      },
       onMessage: { addListener: (fn) => listeners.onMessage.push(fn) },
       onInstalled: { addListener: (fn) => listeners.onInstalled.push(fn) },
       onStartup: { addListener: (fn) => listeners.onStartup.push(fn) },
@@ -277,6 +305,16 @@ export function createChromeMock(options = {}) {
         // a Chromium MV3 extension whose manifest declares only
         // `background.scripts`, which Chrome ignores.
         if (opts.noBackground) {
+          setLastError(
+            "Could not establish connection. Receiving end does not exist.",
+          );
+          if (cb) cb(undefined);
+          return undefined;
+        }
+        // Model the MV3 cold start: the service worker is being
+        // launched right now and has not reached its top-level
+        // `onMessage` registration, so this message finds no receiver.
+        if (backgroundHeld) {
           setLastError(
             "Could not establish connection. Receiving end does not exist.",
           );
@@ -490,6 +528,15 @@ export function createChromeMock(options = {}) {
       if (releaseStorageGate) releaseStorageGate();
     },
     isStorageHeld: () => storageHeld,
+    /** Model a service worker that is still booting: hold messages until
+     * `releaseBackground()`. */
+    holdBackground() {
+      backgroundHeld = true;
+    },
+    releaseBackground() {
+      backgroundHeld = false;
+    },
+    isBackgroundHeld: () => backgroundHeld,
   };
 
   return ctl;

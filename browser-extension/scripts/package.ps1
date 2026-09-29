@@ -4,6 +4,13 @@
 # Chrome-vs-Firefox manifest rewrite. CI uses the bash variant on
 # Ubuntu; this one is for local packaging on Windows.
 #
+# The manifest rewrite itself is **not** re-implemented here: both
+# scripts call scripts/make-chrome-manifest.mjs, so the two targets
+# cannot drift apart. (They did: this file kept the template's SVG
+# icons for Chrome, which Chrome does not support, so the local Windows
+# build shipped with a generic toolbar icon and an error entry on
+# chrome://extensions while the CI zip did not.)
+#
 # The payload is identical, but the manifest.json at the root is
 # rewritten to match the target's MV3 background-page model:
 #   * Chrome / Edge / Brave / Arc — `background.service_worker`
@@ -98,25 +105,21 @@ try {
     }
 
     # Generate the Chrome-shaped manifest in place of the staged one.
-    # Chrome MV3 strictly rejects `background.scripts`. We rewrite
-    # to `background.service_worker: "background.js"`, drop the
-    # `browser_specific_settings.gecko` block (Chrome ignores it
-    # but logs a warning; better to omit entirely), and drop
-    # `nativeMessaging` (only the Firefox transport uses it, and the
-    # Chromium path talks to DM over WebSocket — keeping it would
-    # enlarge the install prompt for nothing).
-    $Chrome = [ordered]@{}
-    foreach ($prop in $SrcContent.PSObject.Properties) {
-        if ($prop.Name -eq 'background') {
-            $Chrome[$prop.Name] = [ordered]@{ service_worker = "background.js" }
-        } elseif ($prop.Name -eq 'permissions') {
-            $Chrome[$prop.Name] = @($prop.Value | Where-Object { $_ -ne 'nativeMessaging' })
-        } elseif ($prop.Name -ne 'browser_specific_settings') {
-            $Chrome[$prop.Name] = $prop.Value
-        }
+    #
+    # This **delegates to scripts/make-chrome-manifest.mjs**, the single
+    # implementation shared by package.sh and dev-unpacked.sh. It used to
+    # be re-implemented here in PowerShell, and the copy drifted: the
+    # Chrome build kept the template's **SVG** icons, which Chrome does
+    # not support at all (the extension loads with a generic toolbar tile
+    # and a "Could not load icon" error on chrome://extensions). The
+    # transform rewrites the icons to PNG and refuses to name any asset
+    # the staged payload does not contain, so this call is also the
+    # missing-file check. Node is already required by this repo.
+    $MakeChrome = Join-Path $ScriptDir "make-chrome-manifest.mjs"
+    & node $MakeChrome $ManifestPath $ManifestPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "make-chrome-manifest.mjs failed with exit code $LASTEXITCODE"
     }
-    $ChromeJson = $Chrome | ConvertTo-Json -Depth 10
-    Set-Content -Path $ManifestPath -Value $ChromeJson -Encoding UTF8
 
     # Pack the .zip (Chrome / Edge / Brave / Arc).
     Push-Location $Tmp
@@ -161,6 +164,19 @@ try {
         }
         if ($ZipObj.browser_specific_settings.gecko) {
             throw ".zip manifest must NOT have browser_specific_settings.gecko (Chrome logs a warning)"
+        }
+        # Chrome has no SVG icon support: pointing `icons` at the
+        # template's .svg leaves the extension with a generic letter tile
+        # in the toolbar and an error entry on chrome://extensions. The
+        # transform rewrites them; assert it happened.
+        $zipIcons = @($ZipObj.icons.PSObject.Properties | ForEach-Object { $_.Value }) +
+                    @($ZipObj.action.default_icon.PSObject.Properties | ForEach-Object { $_.Value })
+        if ($zipIcons.Count -eq 0) {
+            throw ".zip manifest declares no icons"
+        }
+        $svgIcons = @($zipIcons | Where-Object { $_ -like "*.svg" })
+        if ($svgIcons.Count -gt 0) {
+            throw ".zip manifest points at SVG icons, which Chrome does not support: $($svgIcons -join ', ')"
         }
         if ($ZipObj.permissions -contains 'nativeMessaging') {
             throw ".zip manifest must NOT request nativeMessaging (Chromium uses the WebSocket transport)"

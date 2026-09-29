@@ -626,3 +626,92 @@ cannot be removed silently.
 * If the probe says `refused`, the bind retry will now report *why* — but
   a port reserved by Hyper-V/WSL/Docker still needs the user to read
   `netsh int ipv4 show excludedportrange protocol=tcp` and move DM's port.
+
+---
+
+## 10. Follow-up: "it doesn't work" — `probe returned no result`
+
+Reported with the popup's own words: `Browser said: probe returned no
+result: {"ok": false, "error": "Could not establish connection.
+Receiving end does not exist."}`. That is the **Test host connection**
+button, and it arrived one message after §9's fix, so the first question
+was whether §9 had been wrong. It had not — but the report still named a
+real defect, because that string is ambiguous and the popup resolved the
+ambiguity the expensive way.
+
+### The defect: a button less patient than the poll next to it
+
+`popup.js` has always known that an MV3 service worker is terminated after
+~30 s idle and is *launched* by the next message, so the first message
+after a pause can arrive before the worker has registered its top-level
+`onMessage` listener. Chrome answers `Could not establish connection.
+Receiving end does not exist.`, and `refresh()` retries it on a
+80/200/400 ms backoff.
+
+`test` and `grab` did not: both called `sendMessage` once. So
+
+* the status pill was right, and
+* **the button whose entire purpose is a definitive answer was the one
+  that lied** — and it lied in the direction that costs the user the most
+  time, because the same string also means "this extension has no
+  background at all", for which the popup's advice is "reinstall the
+  extension". A user with a worker that was still booting was told to
+  reinstall it.
+
+The Test button also printed the raw `JSON.stringify(res)` in place of the
+error, and unlike `refresh()` it had no budget to wait out at all.
+
+### Fixes
+
+| Defect | Fix | File |
+| --- | --- | --- |
+| Test/Grab sent one un-retried message, so a cold worker produced a false "no background" verdict | `sendWithColdStartRetry()`, shared by both buttons, on its own budget (`COLD_START_ACTION_BACKOFF_MS`, ~2.7 s). The status poll keeps 680 ms so it still finishes inside its 1.5 s interval | `popup.js` |
+| "No service worker" and "a service worker that isn't answering" rendered identically | `backgroundContext()` reads `chrome.runtime.getManifest().background`: no `service_worker` → "Extension background isn't running" + the install advice; one declared → "The extension's background isn't answering" + `chrome://extensions` → Errors / the service worker console. `"unknown"` when the API is absent — never assert a cause we cannot see | `popup.js` |
+| The error block showed `probe returned no result: {json}` | the error string itself, which is what `failureKind` reads and what a user can paste into a bug report | `popup.js` |
+| Chrome build shipped the Firefox template's **SVG** icons (see below) | the Chrome transform rewrites `icons` + `action.default_icon` to committed PNGs and fails if one is absent | `scripts/make-chrome-manifest.mjs`, `icons/` |
+
+### Second defect found while auditing the Chrome install path
+
+The Chrome build pointed `icons` and `action.default_icon` at
+`icons/icon.svg`. Chrome's manifest docs are explicit — "SVG files are not
+supported for any icons declared in the manifest" — and, uniquely badly,
+Chrome does **not** refuse the load over it: the extension runs with a
+generic letter tile in the toolbar plus a `Could not load icon` entry in
+`chrome://extensions`' error list. That is the screen a user opens when
+something is broken, so the one visible artifact of the bug is a
+misleading error on the diagnostic screen. Rasterised the same SVG to
+`icon-{16,32,48,128}.png`, committed them, rewrote both icon places in the
+Chrome transform, made its CLI fail on a missing referenced asset, and
+taught `verify-package.sh` to assert the zip's icons are raster *and*
+present in the archive. The Firefox `.xpi` keeps the SVG (Firefox supports
+it).
+
+### Verification
+
+* **90 extension tests + 22 mutations, all green.** The two new tests are
+  `the Test button waits out a cold service worker` (asserts the button is
+  still reading "Testing…" while the worker boots, then that the real
+  result lands) and `a service worker that exists but never answers is not
+  called a missing install`. Mutations `test let the Test button race a
+  cold service worker`, `diag call a booting service worker a missing
+  install` and `ship send Chrome the Firefox template's SVG icon` each
+  make their test fail, so none of the three is decoration.
+* The harness gained `holdBackgroundInitially` / `holdBackground()` /
+  `releaseBackground()` (mirroring the existing storage gate) to model a
+  worker that is still booting, and `runtime.getManifest()` with a
+  manifest that matches the scenario — `noBackground` now implies the
+  Firefox-shaped manifest, since that is *why* such an install has no
+  worker.
+* `./scripts/dev-unpacked.sh` and `../scripts/verify-package.sh 0.5.0` were
+  run end to end: the Chrome zip's manifest declares PNG icons, all four
+  are in the archive, the `.xpi` is unchanged.
+
+### Still open
+
+* Whether §9's Winsock fix resolves the original Windows report is still
+  unverified on Windows (no Windows host here) — and note that these two
+  reports are consistent with **both** being true at once: the extension
+  side genuinely had no reachable background in this round, while the
+  listener side had the accept bug in the last one. The popup now names
+  which of the two a user is looking at, which is what makes that
+  separable without a Windows machine.

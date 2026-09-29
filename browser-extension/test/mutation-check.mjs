@@ -107,6 +107,29 @@ const MUTATIONS = [
     pattern: "a stale socket's close event cannot knock out the live socket",
   },
   {
+    // package.ps1 re-implemented the Chrome manifest rewrite, and the
+    // copy drifted (SVG icons in a Chrome build). It must call the one
+    // implementation.
+    name: "ship  re-implement the Chrome manifest inside package.ps1",
+    file: "scripts/package.ps1",
+    find: "    & node $MakeChrome $ManifestPath $ManifestPath",
+    replace:
+      '    $Chrome = [ordered]@{ background = [ordered]@{ service_worker = "background.js" } }\n' +
+      "    Set-Content -Path $ManifestPath -Value ($Chrome | ConvertTo-Json -Depth 10) -Encoding UTF8",
+    test: "test/manifest.test.mjs",
+    pattern: "the Windows packaging path uses the shared Chrome transform",
+  },
+  {
+    // Chrome does not support SVG icons: the extension loads with no
+    // icon of its own and an error entry on chrome://extensions.
+    name: "ship  send Chrome the Firefox template's SVG icon",
+    file: "scripts/make-chrome-manifest.mjs",
+    find: "  if (declaredIcons.some(isSvgPath)) {",
+    replace: "  if (false) {",
+    test: "test/manifest.test.mjs",
+    pattern: "raster icons, not the Firefox template's SVG",
+  },
+  {
     name: "diag  blame the DM host when the background is missing",
     file: "popup.js",
     find: '    return "background";',
@@ -190,6 +213,28 @@ const MUTATIONS = [
     replace: '        finish({ kind: "no-response", eof: true });',
     test: "test/manifest.test.mjs",
     pattern: "the tooling runs when invoked through a symlinked path",
+  },
+  {
+    // The status poll retried the MV3 cold-start race; the buttons did
+    // not, so the control whose whole job is a definitive answer answered
+    // "your background isn't running" about a worker that was booting.
+    name: "test  let the Test button race a cold service worker",
+    file: "popup.js",
+    find: 'const res = await sendWithColdStartRetry({ type: "probe" });',
+    replace: 'const res = await sendMessage({ type: "probe" });',
+    test: "test/integration.test.mjs",
+    pattern: "the Test button waits out a cold service worker",
+  },
+  {
+    // "Receiving end does not exist" is one string for two problems. If
+    // the popup stops reading the manifest to tell them apart, it sends
+    // users of a booting (or crashed) worker off to reinstall.
+    name: "diag  call a booting service worker a missing install",
+    file: "popup.js",
+    find: '      ? "✗ The extension\'s background isn\'t answering."',
+    replace: '      ? "✗ Extension background isn\'t running."',
+    test: "test/integration.test.mjs",
+    pattern: "a service worker that exists but never answers",
   },
 ];
 

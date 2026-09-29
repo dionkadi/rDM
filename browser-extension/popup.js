@@ -97,9 +97,47 @@ function failureKind(state) {
   return "host";
 }
 
+/**
+ * What the *loaded* manifest says about a background context.
+ *
+ * `failureKind` can only read `chrome.runtime.lastError`, and "Receiving
+ * end does not exist" is the **same string** for two unrelated problems:
+ *
+ *   * **no service worker at all** — a Chromium install whose manifest
+ *     declares `background.scripts`, which Chrome ignores under MV3; and
+ *   * **a service worker that is not answering** — still booting (the
+ *     reason every send is retried now) or crashed before it registered
+ *     its `onMessage` listener.
+ *
+ * They need opposite fixes ("reinstall the extension" vs "read the
+ * error"), so read the one fact that separates them from the browser
+ * itself. `"unknown"` when the API isn't there: never claim a cause we
+ * cannot see.
+ */
+function backgroundContext() {
+  try {
+    const m =
+      typeof chrome.runtime.getManifest === "function"
+        ? chrome.runtime.getManifest()
+        : null;
+    if (!m || !m.background) return "unknown";
+    return typeof m.background.service_worker === "string"
+      ? "service-worker"
+      : "none";
+  } catch (_e) {
+    return "unknown";
+  }
+}
+
 function headline(connected, kind) {
   if (connected) return "✓ DM host connected";
-  if (kind === "background") return "✗ Extension background isn't running.";
+  if (kind === "background") {
+    // "isn't running" is only the truth when there is no service worker
+    // in the manifest for Chrome to run.
+    return backgroundContext() === "service-worker"
+      ? "✗ The extension's background isn't answering."
+      : "✗ Extension background isn't running.";
+  }
   if (kind === "blocked") return "✗ The browser blocked the connection to DM.";
   return "✗ DM host not running.";
 }
@@ -129,12 +167,49 @@ const HOST_DOWN_HINT =
 function hintForError(msg, kind) {
   const m = (msg || "").toLowerCase();
   if (kind === "background") {
+    // The manifest says there *is* a service worker, so this is not an
+    // install-shape problem and "install the released .zip" would send
+    // the user round in circles. Either it was still starting when the
+    // message arrived (the retry budget is ~0.7 s and has been spent), or
+    // it threw while evaluating and never registered a listener.
+    if (backgroundContext() === "service-worker") {
+      return [
+        { tag: "b", text: "The extension's " },
+        { tag: "code", text: "background.js" },
+        {
+          tag: "b",
+          text:
+            " is not answering, and its manifest does declare a service " +
+            "worker — so nothing here reached DM and the app's own state " +
+            "is irrelevant. Open ",
+        },
+        { tag: "code", text: "chrome://extensions" },
+        { tag: "b", text: ", turn on Developer mode, and on the DM " },
+        { tag: "b", text: "Grabber card: click " },
+        { tag: "code", text: "Errors" },
+        {
+          tag: "b",
+          text:
+            " if it is offered — that prints the exception from the " +
+            "worker's startup — and click the ",
+        },
+        { tag: "code", text: "service worker" },
+        { tag: "b", text: " link to read its console. Then " },
+        { tag: "code", text: "Reload" },
+        {
+          tag: "b",
+          text: ". (If it was simply a slow start, the popup has already " +
+            "retried; click Test host connection again.)",
+        },
+      ];
+    }
     return [
       { tag: "b", text: "The extension's service worker never started, so " },
       { tag: "b", text: "nothing" },
       {
         tag: "b",
-        text: " can reach DM — the host may well be running fine. This is " +
+        text:
+          " can reach DM — the host may well be running fine. This is " +
           "what happens when the extension is loaded from the source folder " +
           "in Chrome: Chrome ignores ",
       },
@@ -376,6 +451,16 @@ function sendMessage(msg) {
 const COLD_START_BACKOFF_MS = [80, 200, 400];
 const MAX_COLD_START_RETRIES = COLD_START_BACKOFF_MS.length;
 
+/**
+ * The budget for a click the user is actively waiting on ("Test host
+ * connection", "Grab page media"). The status poll has to finish inside
+ * its own 1.5 s interval, but an explicit click does not — and a cold
+ * MV3 boot on a slow machine (Windows, cold profile, busy disk) routinely
+ * takes longer than the 680 ms the status poll allows. The user is better
+ * served by two seconds of "Testing…" than by a confident wrong answer.
+ */
+const COLD_START_ACTION_BACKOFF_MS = [80, 200, 400, 800, 1200];
+
 let probeInFlight = false;
 
 function isColdStartError(msg) {
@@ -477,6 +562,42 @@ async function refresh() {
   }
 }
 
+/**
+ * Send any message to the background, with the cold-start retry.
+ *
+ * `refresh()` has always retried, but the **action buttons did not**:
+ * "Test host connection" and "Grab page media" used a bare
+ * `sendMessage`. An MV3 service worker is terminated after ~30 s idle and
+ * is *launched* by the next message — so the first click after a pause
+ * routinely races the SW's top-level `onMessage` registration, and the
+ * bare call resolved to `{ok: false, error: "Could not establish
+ * connection. Receiving end does not exist."}`.
+ *
+ * That is the worst possible place for it. The status pill retries, so it
+ * is right; the button whose entire job is to give a definitive answer
+ * was the one that lied, and it lied *loudly*: the message is
+ * indistinguishable from "this extension has no background at all", so
+ * the popup blamed the install and told the user to reinstall — for a
+ * service worker that was simply still booting. Retrying here makes the
+ * two cases separable, which is what lets `failureKind` stay honest.
+ */
+async function sendWithColdStartRetry(msg) {
+  let res = await sendMessage(msg);
+  let attempts = 0;
+  while (
+    res &&
+    res.ok === false &&
+    isColdStartError(res.error) &&
+    attempts < COLD_START_ACTION_BACKOFF_MS.length
+  ) {
+    const wait = COLD_START_ACTION_BACKOFF_MS[attempts];
+    attempts++;
+    await new Promise((resolve) => setTimeout(resolve, wait));
+    res = await sendMessage(msg);
+  }
+  return res;
+}
+
 refresh();
 setInterval(refresh, 1500);
 
@@ -497,7 +618,7 @@ if (grabBtn) {
         render();
         return;
       }
-      const res = await sendMessage({ type: "grab", tabId: tab.id });
+      const res = await sendWithColdStartRetry({ type: "grab", tabId: tab.id });
       if (!res || !res.ok) {
         setNote(
           "err",
@@ -556,7 +677,7 @@ if (testBtn) {
     const label = testBtn.textContent;
     testBtn.textContent = "Testing…";
     try {
-      const res = await sendMessage({ type: "probe" });
+      const res = await sendWithColdStartRetry({ type: "probe" });
       if (res && res.probe) {
         const ok = !!res.probe.ok;
         lastState = {
@@ -569,10 +690,13 @@ if (testBtn) {
         };
         syncOptions(lastState.settings);
       } else {
+        // The plain error string, not a JSON dump of it: `failureKind`
+        // reads this text to decide which layer to blame, and the user
+        // may paste it into a bug report.
         lastState = {
           connected: false,
           lastError:
-            "probe returned no result: " + JSON.stringify(res),
+            (res && res.error) || "no response from the background",
         };
       }
       render();

@@ -303,6 +303,63 @@ test("a missing background is not blamed on the DM host", async () => {
   assert.match(textOf(els["err-detail"]), /background\.scripts/, "and says why");
 });
 
+test("REQUIREMENT: the Test button waits out a cold service worker", async () => {
+  // The status poll has always retried the MV3 cold-start race; the
+  // buttons never did. "Test host connection" — the one control whose
+  // entire job is to give a definitive answer — sent a single message, so
+  // against a worker that was still booting it produced
+  //
+  //     Could not establish connection. Receiving end does not exist.
+  //
+  // That string is indistinguishable from "this extension has no
+  // background at all", so the popup blamed the install and told the user
+  // to reinstall — about a worker that came up moments later.
+  const { clock, ctl, els } = bootAll({
+    popup: true,
+    chrome: { holdBackgroundInitially: true },
+  });
+  await clock.advance(1500); // the status poll has spent its budget by now
+
+  els.test.dispatch("click");
+  await clock.advance(300);
+
+  assert.equal(
+    els.test.textContent,
+    "Testing…",
+    "the button must still be waiting, not answering about a booting worker",
+  );
+
+  // The worker finishes booting.
+  ctl.releaseBackground();
+  await clock.advance(700);
+  ctl.ws.latest().simulateOpen();
+  await clock.advance(2000);
+
+  assert.match(textOf(els.status), /DM host connected/, textOf(els.status));
+  assert.equal(textOf(els["err-detail"]).trim(), "");
+});
+
+test("a service worker that exists but never answers is not called a missing install", async () => {
+  // The same error string, the opposite cause: the manifest *does*
+  // declare a service worker, so "install the released .zip" is wrong
+  // advice — it never answers because it is still booting or threw while
+  // evaluating. Name the layer, and point at the console that says why.
+  const { clock, els } = bootAll({
+    popup: true,
+    chrome: { holdBackgroundInitially: true },
+  });
+  await clock.advance(6000); // every retry budget spent
+
+  assert.match(
+    textOf(els.status),
+    /isn't answering/,
+    textOf(els.status),
+  );
+  const detail = textOf(els["err-detail"]);
+  assert.match(detail, /chrome:\/\/extensions/, detail);
+  assert.doesNotMatch(detail, /Install the released/, detail);
+});
+
 test("a host that refuses the connection points at the probe", async () => {
   // `close code 1006` is the only thing the browser ever reports, and it
   // cannot distinguish "not running" from "running but never answered

@@ -11,6 +11,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — "Test host connection" blamed a booting service worker
+
+- **The popup's Test button (and "Grab page media") reported a cold MV3
+  service worker as "the extension has no background — reinstall it."**
+  `chrome.runtime.sendMessage` answers `Could not establish connection.
+  Receiving end does not exist.` while a service worker is still being
+  launched, and that string is byte-for-byte identical to the one a
+  Chromium install with no service worker at all produces. The status
+  poll has always retried it; the two buttons sent a single message, so
+  the control whose entire purpose is a definitive answer was the one
+  that lied — and it recommended reinstalling, about a worker that came
+  up moments later. Both buttons now share `sendWithColdStartRetry`, with
+  a longer budget than the poll (~2.7 s; the poll stays at 680 ms so it
+  still fits inside its 1.5 s interval).
+- **The two causes are no longer collapsed into one message.** The popup
+  reads `chrome.runtime.getManifest().background`: with no
+  `service_worker` it says the background isn't running and points at the
+  install; with one it says the background isn't *answering* and points at
+  `chrome://extensions` → Errors / the service worker console. A JSON dump
+  (`probe returned no result: {"ok":false,…}`) is no longer shown in place
+  of the error string.
+
+### Fixed — Chrome had no icon of its own
+
+- **The Chrome build shipped the Firefox template's SVG icon.** Chrome
+  does not support SVG in `icons` ("SVG files are not supported for any
+  icons declared in the manifest"). It does not refuse the load either —
+  so the extension ran with a generic letter tile in the toolbar and a
+  "Could not load icon" entry in `chrome://extensions`' error list, on the
+  very screen a user opens when something is wrong. The Chrome transform
+  now rewrites `icons` **and** `action.default_icon` to
+  `icons/icon-{16,32,48,128}.png` (rasterised from the same SVG and
+  committed), fails loudly if any referenced asset is missing, and
+  `verify-package.sh` asserts the zip's icons are raster and present. The
+  Firefox `.xpi` keeps the SVG.
+
 ### Fixed — Chrome extension could not connect on Windows (`disconnected (code 1006)`)
 
 - **On Windows, every connection from the Chromium extension was accepted

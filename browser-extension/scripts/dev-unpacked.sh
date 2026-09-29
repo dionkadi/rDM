@@ -64,12 +64,33 @@ node -e '
     console.error("error: staged manifest requests nativeMessaging (Firefox-only)");
     process.exit(1);
   }
+  // Icons must be raster for Chrome: an .svg in `icons` leaves the
+  // extension with no icon of its own (and an error entry on
+  // chrome://extensions), which is not a loud failure.
+  const iconPaths = [
+    ...Object.values(m.icons || {}),
+    ...Object.values(m.action?.default_icon || {}),
+  ];
+  if (iconPaths.length === 0) {
+    console.error("error: staged manifest declares no icons");
+    process.exit(1);
+  }
+  const svg = iconPaths.filter((p) => /\.svg$/i.test(p));
+  if (svg.length > 0) {
+    console.error(
+      "error: staged Chrome manifest points at SVG icons (" +
+        svg.join(", ") +
+        ") — Chrome does not support them."
+    );
+    process.exit(1);
+  }
 ' "$OUT_DIR/manifest.json"
 
 # Also prove the entry points are actually there — a manifest pointing
 # at a file that was never staged is the next-most-common way to end up
 # with a silently inert extension.
-for file in background.js content.js popup.js popup.html manifest.json; do
+for file in background.js content.js popup.js popup.html manifest.json \
+            icons/icon-16.png icons/icon-32.png icons/icon-48.png icons/icon-128.png; do
   if [[ ! -f "$OUT_DIR/$file" ]]; then
     echo "error: $file is missing from $OUT_DIR" >&2
     exit 1

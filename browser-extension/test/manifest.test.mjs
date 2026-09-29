@@ -13,7 +13,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { EXT_DIR } from "./harness.mjs";
-import { toChromeManifest } from "../scripts/make-chrome-manifest.mjs";
+import {
+  referencedAssets,
+  toChromeManifest,
+} from "../scripts/make-chrome-manifest.mjs";
 
 const REPO_ROOT = path.dirname(EXT_DIR);
 const read = (file) => fs.readFileSync(path.join(EXT_DIR, file), "utf8");
@@ -166,6 +169,68 @@ test("the Chrome transform produces a loadable Chromium manifest", () => {
   );
 });
 
+test("the Chrome build ships raster icons, not the Firefox template's SVG", () => {
+  // "SVG files are not supported for any icons declared in the manifest"
+  // (Chrome's docs). The template points at the SVG, which Firefox is
+  // happy with; Chrome silently ends up with no icon of its own — a
+  // generic letter tile in the toolbar and a "Could not load icon" entry
+  // in chrome://extensions, the very screen a user opens when something
+  // is wrong. Rewrite both icon places, and only to files that exist.
+  assert.ok(
+    Object.values(manifest.icons || {}).some((p) => p.endsWith(".svg")),
+    "precondition: the Firefox template's icons are SVG",
+  );
+  const out = toChromeManifest(manifest);
+
+  for (const [size, rel] of Object.entries(out.icons)) {
+    assert.ok(
+      rel.endsWith(".png"),
+      `icons.${size} must be a raster icon for Chrome, got ${rel}`,
+    );
+    assert.ok(
+      fs.existsSync(path.join(EXT_DIR, rel)),
+      `${rel} is declared by the Chrome manifest but not in the repo`,
+    );
+  }
+  assert.deepEqual(
+    Object.keys(out.icons).sort((a, b) => Number(a) - Number(b)),
+    ["16", "32", "48", "128"],
+  );
+  assert.deepEqual(
+    out.action.default_icon,
+    out.icons,
+    "the toolbar icon must be rewritten too, not just the package icon",
+  );
+});
+
+test("the Firefox template keeps its SVG icon", () => {
+  // Firefox does support SVG icons. The rewrite belongs to the Chrome
+  // transform, not to the source manifest.
+  assert.ok(
+    Object.values(manifest.icons || {}).every((p) => p.endsWith(".svg")),
+    "the Firefox template should not be rewritten in place",
+  );
+  assert.ok(
+    Object.values(manifest.action.default_icon || {}).every((p) =>
+      p.endsWith(".svg"),
+    ),
+  );
+});
+
+test("the Chrome transform refuses to name an icon that isn't there", () => {
+  // `referencedAssets` is what the CLI uses to fail loudly instead of
+  // shipping a manifest that names missing files.
+  const out = toChromeManifest(manifest);
+  const referenced = referencedAssets(out);
+  assert.ok(referenced.includes("background.js"));
+  assert.ok(referenced.includes("popup.html"));
+  assert.ok(referenced.includes("icons/icon-128.png"));
+  const missing = referenced.filter(
+    (rel) => !fs.existsSync(path.join(EXT_DIR, rel)),
+  );
+  assert.deepEqual(missing, [], "the repo must contain everything it ships");
+});
+
 test("the transform refuses an already-Chrome-shaped source", () => {
   // Otherwise the .xpi silently ends up with no service worker, which is
   // a worse failure than an error here.
@@ -174,6 +239,33 @@ test("the transform refuses an already-Chrome-shaped source", () => {
     /already Chrome-shaped/,
   );
   assert.throws(() => toChromeManifest({ ...manifest, background: {} }), /must be an array/);
+});
+
+test("the Windows packaging path uses the shared Chrome transform, not a copy", () => {
+  // package.ps1 used to re-implement the manifest rewrite in PowerShell.
+  // The copy drifted: the Chrome build kept the template's SVG icons,
+  // which Chrome does not support, so a locally built Windows .zip
+  // shipped with a generic toolbar icon and an error entry on
+  // chrome://extensions while the CI-built one did not. One
+  // implementation, called by every packaging path.
+  const sh = read("scripts/package.sh");
+  const ps1 = read("scripts/package.ps1");
+  for (const [name, text] of [
+    ["package.sh", sh],
+    ["package.ps1", ps1],
+  ]) {
+    assert.match(text, /make-chrome-manifest\.mjs/, `${name} must use the shared transform`);
+  }
+  assert.match(
+    ps1,
+    /& node \$MakeChrome \$ManifestPath \$ManifestPath/,
+    "package.ps1 must invoke the transform",
+  );
+  assert.doesNotMatch(
+    ps1,
+    /service_worker = "background\.js"/,
+    "package.ps1 must not build the Chrome manifest itself",
+  );
 });
 
 test("the tooling runs when invoked through a symlinked path", (t) => {
