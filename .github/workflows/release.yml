@@ -128,6 +128,21 @@ jobs:
       - name: Build frontend (type check + bundle)
         run: npm run check && npm run build
 
+      - name: Release notes from CHANGELOG.md
+        id: notes
+        # `shell: bash` because this job matrix includes Windows, where
+        # the default PowerShell would not understand the heredoc below.
+        shell: bash
+        run: |
+          # Fail fast if the parser or the file shape regressed, rather
+          # than shipping generic notes.
+          node scripts/changelog-section.mjs --self-test
+          {
+            echo "body<<RELEASE_NOTES_EOF"
+            node scripts/changelog-section.mjs "${GITHUB_REF_NAME}"
+            echo "RELEASE_NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Run Tauri build & publish to release
         uses: tauri-apps/tauri-action@v0
         env:
@@ -140,33 +155,35 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "DM ${{ github.ref_name }}"
+          # The changelog section for this tag, followed by the static
+          # install guide. Keeping the notes first means a visitor sees
+          # what changed before the platform table.
           releaseBody: |
             ## DM ${{ github.ref_name }}
 
+            ${{ steps.notes.outputs.body }}
+
+            ---
+
+            ## Install
+
             Desktop installers for Linux, Windows, and macOS, plus the
             browser extension packages for Chrome/Edge/Brave/Arc and Firefox.
-
-            ### Install
 
             | Platform | Installer | Notes |
             | --- | --- | --- |
             | Linux | `.deb` | `sudo dpkg -i DM_*_amd64.deb` |
             | | `.rpm` | `sudo dnf install -y ./DM-*_amd64.rpm` |
             | | `.AppImage` | `chmod +x DM_*_AppImage && ./DM_*_AppImage` |
-            | Windows | `.msi` / `.exe` | Run the installer; SmartScreen will
-            | | | warn on first launch (unsigned) |
-            | macOS | `.dmg` / `.app` | Drag to Applications. First
-            | | | launch: right-click → Open to bypass Gatekeeper (unsigned) |
+            | Windows | `.msi` / `.exe` | Run the installer; SmartScreen will warn on first launch (unsigned) |
+            | macOS | `.dmg` / `.app` | Drag to Applications. First launch: right-click → Open to bypass Gatekeeper (unsigned) |
 
-            ### Browser extension
+            ## Browser extension
 
             | Browser | File | Install |
             | --- | --- | --- |
-            | Chrome / Edge / Brave / Arc |
-            | | `dm-grabber-${{ github.ref_name }}.zip` |
-            | | | `chrome://extensions` → Developer mode → Load unpacked |
-            | Firefox | `dm-grabber-${{ github.ref_name }}.xpi` |
-            | | | Drag .xpi onto Firefox, or about:addons → Install From File |
+            | Chrome / Edge / Brave / Arc | `dm-grabber-${{ github.ref_name }}.zip` | `chrome://extensions` → Developer mode → Load unpacked |
+            | Firefox | `dm-grabber-${{ github.ref_name }}.xpi` | Drag the `.xpi` onto Firefox, or about:addons → Install From File |
 
             See `browser-extension/INSTALL.md` for the native-messaging
             host setup, which is required before "Send to DM" will work.

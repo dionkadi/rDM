@@ -297,6 +297,18 @@ npm run tauri build
 # Native-messaging host standalone
 cargo run -p dm-native-host
 
+**Releasing.** `scripts/release.sh 0.6.0` bumps every manifest in lockstep
+(`package.json` + lock, `tauri.conf.json`, the three workspace `Cargo.toml`s,
+the extension manifest) and `--no-tag` leaves the commit to you; without it
+the script also commits and tags. The GitHub release body is **not** written
+by hand: `release.yml` runs `scripts/changelog-section.mjs <tag>`, which pulls
+the matching `## [x.y.z]` section out of `CHANGELOG.md` and puts it above the
+install guide. Consequences worth knowing: a tag whose version has no
+changelog section **fails the release** (by design — generic notes hide what
+shipped), the script self-tests in CI and again before every release, and the
+heading may be `## [0.6.0] - date`, `## [0.6.0] — date` or `## 0.6.0` but the
+version must match the tag with or without a leading `v`.
+
 # Release binary (Cargo workspace unifies target dirs):
 ls target/release/dm-tauri     # ~23 MB stripped, dynamically linked to webkit2gtk-4.1
 
