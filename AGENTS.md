@@ -62,12 +62,16 @@ DM/
 │   │   │   ├── control.rs     # DownloadControl: AtomicBool pause/cancel + tokio Notify
 │   │   │   ├── protocol.rs    # HEAD/range probe, filename extraction, chunk planning, Content-Range parsing
 │   │   │   ├── chunk.rs       # download_chunk(): one range GET, throttled, honours pause/cancel
+│   │   │   ├── hls.rs         # HLS playlist parsing (master/media, variants, byterange,
+│   │   │   │                  #   EXT-X-MAP, EXT-X-KEY) — pure, unit-tested
 │   │   │   ├── task.rs        # build_client/build_probe_client (raw bytes, custom UA, no
-│   │   │   │                  #   transparent decompression). run_download() pipeline.
+│   │   │   │                  #   transparent decompression). run_download() pipeline,
+│   │   │   │                  #   plus run_hls_download() (segment walk + optional remux).
 │   │   │   ├── storage.rs     # SQLite (rusqlite bundled). Tables: downloads, history,
 │   │   │   │                  #   categories, settings. delete_download() for hard-removes.
 │   │   │   └── config.rs      # default_categories() + load_or_default()
 │   │   └── tests/integration.rs  # Spawns a local HTTP server, drives DownloadManager end-to-end
+│   │       tests/hls.rs          # Same, for a master/media playlist: bytes, live, AES, remux
 │   └── native-host/           # Standalone bin: dm-native-host (Chrome native-messaging shim)
 │       └── src/main.rs        # read/write 4-byte-LE-prefixed frames, extract_media_urls, forward_url
 ├── browser-extension/         # MV3 (manifest_version: 3) extension
@@ -283,6 +287,7 @@ npm run check        # svelte-check, must be 0 errors / 0 warnings
 # Engine unit + integration tests
 cargo test -p dm-engine
 # + the multi-thread integration suite in crates/engine/tests/integration.rs
+# + crates/engine/tests/hls.rs (playlist → segments → concat → remux)
 
 # Full Tauri build
 ./build-with-shim.sh           # Linux (Fedora 40+ etc.): prepends .pkgconfig-shim to PKG_CONFIG_PATH
@@ -331,6 +336,25 @@ ls target/release/dm-tauri     # ~23 MB stripped, dynamically linked to webkit2g
 - **`.pi/` is gitignored** — it's Plannotator/agent harness scratch. Don't commit from it.
 - **`.taurignore` (project root) keeps the Tauri CLI's walker from EMFILE-panicking**: the Tauri CLI uses the `ignore` crate (`ignore::WalkBuilder`) to walk the project tree for `tauri dev` file watching and for source-file discovery during `tauri build`. The walker does **not** apply `max_open(1)` back-pressure, so on a project whose `target/` and `node_modules/` together hold tens of thousands of files (this repo's `target/release` alone is 20k+ files), it can exhaust the per-process FD limit and panic with `Too many open files (os error 24)` at `crates/tauri-cli/src/interface/rust.rs` (the `Result::unwrap()` on the walker iterator). The Tauri CLI is a precompiled native Node addon (`node_modules/@tauri-apps/cli-linux-x64-gnu/cli.linux-x64-gnu.node`) so we cannot patch the walker. The supported fix is a project-root `.taurignore` (gitignore-compatible syntax) that excludes `target/`, `**/target/`, `node_modules/`, `dist/` (Tauri reads `dist/` via the `frontendDist` config, not by walking), `coredump/`, `images/`, `notes/`, `.pi/`, and editor metadata. The CLI looks for `.taurignore` in every directory it walks and applies the patterns in addition to its built-in defaults.
 
+## HLS downloads (`crates/engine/src/hls.rs` + `task::run_hls_download`)
+
+A `.m3u8` URL is a **playlist**, not a file. Downloading it verbatim is the reported bug: the queue got a ~300-byte text file (`#EXTM3U … segment_000.ts`) and the row said "Completed". The split is deliberate:
+
+* `hls.rs` — pure parsing: master vs media playlists, `#EXT-X-STREAM-INF` variants, `#EXTINF`, `#EXT-X-BYTERANGE` (implicit offsets resolved), `#EXT-X-MAP` (fMP4), `#EXT-X-KEY`, `#EXT-X-ENDLIST`. Unit tests only, no network.
+* `task::run_hls_download` — fetches the manifest, follows **one** master hop to the highest-bandwidth variant, then streams every segment into `<save_path>.part` in order, honouring the limiter, pause/cancel and progress events.
+
+Scope is enforced, not guessed:
+
+* **Live** (no `#EXT-X-ENDLIST`) is refused with a reason — it is an endless stream, not a file.
+* **AES-128** (`#EXT-X-KEY` ≠ `NONE`) is refused — writing ciphertext to a `.ts` would be a corrupt "success".
+* **A master with a separate audio rendition** (`#EXT-X-MEDIA:TYPE=AUDIO` + `URI`) is refused — the variant is video-only, and a silent file is worse than an error.
+
+**Naming:** `Download::normalize_media()` runs in `DownloadManager::add()` and in the Tauri `add_download`, so every entry point agrees before the row is shown: `.m3u8` → `.ts`. fMP4 playlists (`#EXT-X-MAP`) are renamed to `.mp4` at download time, because concatenating init + fragments *is* an MP4. When ffmpeg is available the `.ts` is remuxed (`-c copy`, `aac_adtstoasc` first and a retry without it for non-AAC audio) and the row is retargeted to the `.mp4`; the `.ts` is kept as the source, same contract as the pair merge. No ffmpeg ⇒ a complete, playable `.ts` and a log line, never a failed download.
+
+**Resume is per segment**, not per byte: `Download.chunks` cannot express "the first 5 segments of this playlist", so a sidecar `<save_path>.part.hls.json` records `{url, first, count, next, bytes}` after every completed segment. It is only honoured when the playlist URL, the first segment URI and the segment count still match (an edited playlist must not splice), and it is discarded if it claims more bytes than the `.part` holds. Deleting the sidecar forces a clean re-download.
+
+Tests live in `tests/hls.rs`: a master+media server proves the concatenated bytes equal the segments (and never the playlist text, and that the 1080p variant won), live/encrypted are refused with their reasons, and a real ffmpeg-generated TS proves the remux + row retarget (skipped with a printed note when ffmpeg is absent).
+
 ## Media merging (`crates/engine/src/media.rs`)
 
 Sites that serve video over **MPEG-DASH** (bilibili and friends) split it into **two independent streams** — video and audio — so "one URL = the video" is simply false for them: downloading one half gives you a picture with no sound, or sound with no picture. `media.rs` is the answer, in two halves:
@@ -346,7 +370,7 @@ Sites that serve video over **MPEG-DASH** (bilibili and friends) split it into *
 
 Other things that will bite you if you change them:
 
-* **`.ts` (HLS segments) are never paired.** They are consecutive pieces of *one* stream, so "merging" two of them concatenates video onto video. A manifest (`m3u8`/`mpd`) is reported as a manifest rather than offered as a video, because DM cannot expand one yet — see TODO.md.
+* **`.ts` (HLS segments) are never paired.** They are consecutive pieces of *one* stream, so "merging" two of them concatenates video onto video. A `.m3u8` is expanded by the HLS path above; a `.mpd` is still offered as the manifest file itself (see TODO.md).
 * **The output name avoids the inputs.** A `.mp4` video part merged to `.mp4` would target the very file it is reading, so on collision the name becomes `<stem>.merged.<ext>` — skipping the container instead would silently downgrade an mp4 merge to mkv.
 * **`.mp4` first, `.mkv` on failure.** MKV accepts codecs that MP4 does not, so the fallback turns an avoidable failure into a working file.
 * **`kill_on_drop(true)`** is what makes the 15-minute timeout safe: on timeout the future holding the child is dropped, and that flag turns it into a kill.

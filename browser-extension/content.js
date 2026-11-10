@@ -925,9 +925,13 @@ function collectMedia(hints) {
           : "media file",
       );
     } else if (candidates[0].kind === "manifest") {
+      // DM expands an HLS playlist itself (segments + optional remux);
+      // a DASH manifest is still only the XML table of contents.
       parts.push(
-        "HLS/DASH manifest — DM downloads the playlist file itself; " +
-          "expanding it into segments is not supported yet",
+        /\.m3u8(\?|#|$)/i.test(urls[0])
+          ? "HLS playlist — DM downloads its segments and remuxes them into one file"
+          : "DASH manifest — DM downloads the manifest file itself; " +
+              "expanding it into segments is not supported yet",
       );
     } else {
       parts.push("single DASH segment (no complete file found on the page)");

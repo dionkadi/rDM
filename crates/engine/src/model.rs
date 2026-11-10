@@ -227,6 +227,59 @@ impl Download {
         }
     }
 
+    /// Detect an HLS manifest and make the output name the *media* file
+    /// rather than the playlist.
+    ///
+    /// A `.m3u8` URL is a table of contents: downloading it verbatim
+    /// writes a few hundred bytes of text under the user's filename —
+    /// the reported "it only downloaded the playlist" bug. `retarget`
+    /// runs here as well as at download time because every entry point
+    /// (Tauri command, browser capture, resume from SQLite) must agree
+    /// on the filename *before* the row is shown.
+    pub fn normalize_media(&mut self) {
+        if self.media.is_none() && crate::hls::is_hls_url(&self.url) {
+            self.media = Some(MediaKind::Hls);
+        }
+        if self.media == Some(MediaKind::Hls) {
+            self.retarget_extension("ts");
+            // HLS progress is tracked per segment (`HlsProgress`
+            // sidecar), not as byte ranges, so the generic chunk resume
+            // maths does not apply.
+            self.can_resume = false;
+        }
+    }
+
+    /// Replace the filename's extension, keeping `save_path` in sync.
+    ///
+    /// Used by the HLS path twice: `.m3u8` → `.ts` when the row is
+    /// created, and `.ts` → `.mp4` for fMP4 playlists (where the
+    /// concatenated output really is an MP4).
+    pub fn retarget_extension(&mut self, extension: &str) {
+        let suffix = format!(".{extension}");
+        if self.filename.to_ascii_lowercase().ends_with(&suffix) {
+            return;
+        }
+        let stem = std::path::Path::new(self.filename.trim())
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let stem = if stem.is_empty() {
+            "download".to_string()
+        } else {
+            stem
+        };
+        self.filename = format!("{stem}{suffix}");
+        match self.save_path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                self.save_path = parent.join(&self.filename);
+            }
+            // A bare filename (no directory yet): keep it in the same
+            // "current directory" the path already implied.
+            Some(_) => self.save_path = std::path::PathBuf::from(&self.filename),
+            None => {}
+        }
+    }
+
     /// Completion fraction in `[0.0, 1.0]`; `0.0` when size unknown.
     pub fn fraction(&self) -> f64 {
         match self.total_size {

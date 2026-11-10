@@ -493,7 +493,7 @@ test("grab: a manifest is offered only when nothing better exists", async () => 
   });
   const res = await grab(ctl);
   assert.deepEqual(plain(res.urls), ["https://cdn.example.test/stream.m3u8"]);
-  assert.match(res.note, /manifest/);
+  assert.match(res.note, /HLS playlist|manifest/);
 });
 
 test("grab: the same stream requested several times is offered once", async () => {

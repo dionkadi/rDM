@@ -9,7 +9,7 @@ maturity; within each tier by impact-per-effort.
 1. [x] Bulk select + bulk actions
 2. [x] Drag-to-reorder + persistent priority
 3. [x] Cookie import + per-download auth
-4. [~] HLS / DASH support *(video+audio remux done; manifest/segment handling outstanding — see Tier 2)*
+4. [~] HLS / DASH support *(HLS end-to-end: playlist → segments → concat → remux; DASH manifest still outstanding — see Tier 2)*
 5. [x] Mirror failover
 
 ---
@@ -38,7 +38,8 @@ These are the ones users will hit the first day and notice as missing.
 
 ## Tier 2 — Good vs. great
 
-- [~] **HLS / DASH / segmented stream download** — manifest fetch, variant selection, segment download with retry, `.ts` / `.mp4` concat (optional `ffmpeg` remux), per-segment resume. *(Top 5 #4 — **partly done**: `MediaKind` marker on `Download`; `crates/engine/src/media.rs` now groups a video+audio pair and remuxes it with `ffmpeg -c copy` (verified by real-ffmpeg tests), wired to the "Merge" bulk action. **Still missing**: manifest parsing (`m3u8`/`mpd`), variant/representation selection, segment download with retry, `.ts` concatenation, per-segment resume, and automatic pairing at capture time so it is one click instead of "select the two rows".)*
+- [~] **HLS / DASH / segmented stream download** — manifest fetch, variant selection, segment download with retry, `.ts` / `.mp4` concat (optional `ffmpeg` remux), per-segment resume. *(Top 5 #4 — **HLS done**: `crates/engine/src/hls.rs` parses master/media playlists (variants, `EXT-X-BYTERANGE`, `EXT-X-MAP`, `EXT-X-KEY`), `task::run_hls_download` walks the segments into one `.ts`, remuxes to `.mp4` when ffmpeg is present and retargets the row; per-segment resume via a `.part.hls.json` sidecar; live, AES-128 and separate-audio masters are refused with a reason. A grabbed `.m3u8` is renamed `.ts` at add time, so the playlist text is never the payload. **Still missing**: DASH (`.mpd`) expansion, AES-128 decryption, HLS masters with a separate audio rendition.)*
+
 - [x] **Mirror failover** — `mirrors: Vec<String>` on `Download`, try primary, fall back on 4xx/5xx/timeout, mark active mirror, "switch mirror" action. *(Top 5 #5 — engine: mirrors field + set_download_mirrors Tauri command; chunk-level retry through mirrors is follow-up)*
 - [ ] **yt-dlp integration** (optional, identity-defining) — resolve direct media URL from page, gate behind Settings → Advanced toggle, "locate binary" file picker.
 - [ ] **Post-processing hooks** — extract archives (`unrar` / `unzip` / `sevenz-rust`), move to category, run user-defined script (timeout, captured stdout/stderr), optional `clamscan` integration. Persist post-processing state so a crash mid-extract doesn't restart the whole 30 GB archive.

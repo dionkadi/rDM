@@ -81,6 +81,11 @@ pub fn add_download(
     d.speed_limit = speed_limit;
     d.checksum = checksum;
     d.status = DownloadStatus::Queued;
+    // An `.m3u8` URL is a playlist: name the output `.ts` (the segments
+    // are concatenated) instead of saving the playlist text under the
+    // user's filename. The engine repeats this in `add()`, so the row
+    // and the returned value can never disagree.
+    d.normalize_media();
 
     state.add(d.clone());
     // Headers and auth are in-memory only (see the

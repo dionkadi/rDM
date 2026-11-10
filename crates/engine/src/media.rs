@@ -179,9 +179,10 @@ pub enum MediaPlan {
         /// Second stream.
         second: String,
     },
-    /// A manifest. DM can download the playlist file itself but cannot
-    /// expand it yet, so this is reported honestly rather than offered
-    /// as if it were a video.
+    /// A manifest. An HLS playlist is expanded by the engine's HLS path
+    /// (`hls.rs` + `task::run_hls_download`): its segments are fetched
+    /// and concatenated. A DASH `.mpd` is still downloaded as the
+    /// manifest file itself, which is why this variant exists.
     Manifest { url: String },
 }
 
@@ -235,9 +236,10 @@ fn same_origin_and_dir(a: &str, b: &str) -> bool {
 /// Preference order, and why:
 ///
 /// 1. **A manifest** wins when present, because it is the only URL that
-///    describes the *whole* video. DM cannot expand one yet — the caller
-///    says so rather than downloading a playlist file and calling it a
-///    video.
+///    describes the *whole* video. For an HLS playlist that is literal:
+///    the engine expands it into segments and remuxes the result. For a
+///    DASH `.mpd` DM still downloads the manifest file itself, and the
+///    caller says so.
 /// 2. **One video + one audio** of known kinds: an unambiguous pair.
 /// 3. **Two DASH streams** (`.m4s`) from the same directory: the
 ///    bilibili case. The two are very likely the video and audio halves

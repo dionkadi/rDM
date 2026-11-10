@@ -16,6 +16,7 @@ pub mod chunk;
 pub mod config;
 pub mod cookies;
 pub mod control;
+pub mod hls;
 pub mod limiter;
 pub mod manager;
 pub mod media;

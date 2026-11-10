@@ -5,12 +5,18 @@ use crate::chunk::download_chunk;
 use crate::control::SharedControl;
 use crate::limiter::CombinedLimiter;
 use crate::manager::{DownloadEvent, RunContext};
-use crate::model::{ChunkState, Download, DownloadStatus};
+use crate::model::{AuthSpec, ChunkState, Download, DownloadStatus, MediaKind};
 use crate::protocol::{build_plan, plan_chunks};
+use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::io::SeekFrom;
 use std::path::Path;
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::process::Command;
 use tokio::sync::mpsc;
 
 /// Shared mutable state for one download.
@@ -224,6 +230,20 @@ pub async fn run_download(ctx: Arc<RunContext>, state: Arc<TaskState>) {
     // on misconfigured mirrors that advertise `Content-Encoding: gzip`
     // but send a non-gzipped (or empty) body. See `build_probe_client`.
     let probe_client = build_probe_client(effective_proxy.as_deref());
+
+    // An HLS download is a playlist, not a file, so the probe/chunk
+    // pipeline below does not apply: fetch the manifest, walk its
+    // segments, concatenate. Same slot, same limiter, same events.
+    if state.download.lock().unwrap().media == Some(MediaKind::Hls) {
+        run_hls_download(
+            ctx.clone(),
+            state.clone(),
+            effective_proxy.clone(),
+            id.clone(),
+        )
+        .await;
+        return;
+    }
 
     // Plan on a local clone so the (std) mutex guard is never held across an await.
     let needs_plan = {
@@ -590,6 +610,698 @@ pub async fn run_download(ctx: Arc<RunContext>, state: Arc<TaskState>) {
     }
 }
 
+// ─── HLS ────────────────────────────────────────────────────────
+//
+// A `.m3u8` grab used to download the playlist itself — a few hundred
+// bytes of text saved under the user's filename. The playlist is a
+// table of contents, so the download only becomes media once the
+// segments are fetched in order and concatenated. Everything below
+// does that with the same client, limiter, pause/cancel flags and event
+// stream as the chunk path; the parsing lives in `hls.rs`.
+
+/// Backoff between segment attempts. Three retries is what "a 404 on a
+/// CDN edge that has the segment one node over" needs, without turning
+/// a genuinely dead playlist into a multi-minute hang.
+const HLS_RETRY_DELAYS_MS: [u64; 3] = [500, 1500, 4000];
+
+/// Progress emission throttle, matching the chunk aggregator's 150 ms.
+const HLS_EMIT_INTERVAL: Duration = Duration::from_millis(150);
+
+/// Cap on a single HLS remux, mirroring `media::REMUX_TIMEOUT`.
+const HLS_REMUX_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// Which segments are already in the `.part` file.
+///
+/// `Download.chunks` cannot express this: HLS progress is "N segments of
+/// this playlist", not a byte range, so resuming from a byte offset
+/// would splice the wrong segment into the file. The sidecar is written
+/// after each completed segment and deleted on success.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct HlsProgress {
+    url: String,
+    /// First segment URI — a playlist that changed invalidates the
+    /// offsets, so resume restarts rather than splicing two edits.
+    first: String,
+    count: usize,
+    next: usize,
+    bytes: u64,
+}
+
+fn hls_sidecar(part: &Path) -> std::path::PathBuf {
+    let mut name = part.as_os_str().to_os_string();
+    name.push(".hls.json");
+    std::path::PathBuf::from(name)
+}
+
+/// A sidecar may only be trusted for the exact playlist it describes:
+/// same URL, same first segment, same length. A re-encoded or edited
+/// playlist must restart instead of splicing two edits together.
+fn hls_resume_matches(
+    progress: &HlsProgress,
+    url: &str,
+    media: &crate::hls::MediaPlaylist,
+) -> bool {
+    progress.url == url
+        && progress.first == media.segments[0].uri
+        && progress.count == media.segments.len()
+        && progress.next <= media.segments.len()
+}
+
+fn hls_request(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &BTreeMap<String, String>,
+    auth: Option<&AuthSpec>,
+) -> reqwest::RequestBuilder {
+    let mut req = client.get(url);
+    crate::chunk::apply_extra_headers(&mut req, headers);
+    crate::chunk::apply_auth(req, auth, url)
+}
+
+async fn hls_fetch_text(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &BTreeMap<String, String>,
+    auth: Option<&AuthSpec>,
+) -> Result<String, String> {
+    let resp = hls_request(client, url, headers, auth)
+        .send()
+        .await
+        .map_err(|e| format!("could not fetch the playlist: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("the playlist returned HTTP {status}"));
+    }
+    resp.text()
+        .await
+        .map_err(|e| format!("could not read the playlist: {e}"))
+}
+
+/// Terminal state for the HLS path. Mirrors the finalize block of
+/// `run_download` (removed ⇒ say nothing, cancel ⇒ Canceled, else Error).
+fn hls_fail(ctx: &RunContext, state: &TaskState, id: &str, message: String) {
+    if state.control.is_removed() {
+        ctx.scheduler.release_download_state(id);
+        return;
+    }
+    let mut d = state.download.lock().unwrap();
+    d.status = DownloadStatus::Error;
+    d.error = Some(message.clone());
+    let _ = ctx.storage.mark_error(id, &message);
+    ctx.emit(DownloadEvent::Error(d.clone()));
+    drop(d);
+    ctx.scheduler.release_download_state(id);
+}
+
+fn hls_canceled(ctx: &RunContext, state: &TaskState, id: &str) {
+    if state.control.is_removed() {
+        ctx.scheduler.release_download_state(id);
+        return;
+    }
+    let mut d = state.download.lock().unwrap();
+    d.status = DownloadStatus::Canceled;
+    let _ = ctx.storage.save_download(&d);
+    ctx.emit(DownloadEvent::StatusChanged(d.clone()));
+    drop(d);
+    ctx.scheduler.release_download_state(id);
+}
+
+enum SegmentError {
+    Canceled,
+    /// Worth another attempt: connection error, 5xx, 408, 429.
+    Retry(String),
+    /// Retrying cannot help: 4xx, local write failure.
+    Fatal(String),
+}
+
+/// Stream one URI into the open `.part` file, honouring the limiter and
+/// the cancel flag. Returns the bytes written.
+#[allow(clippy::too_many_arguments)]
+async fn hls_copy_into(
+    client: &reqwest::Client,
+    url: &str,
+    range: Option<(u64, u64)>,
+    headers: &BTreeMap<String, String>,
+    auth: Option<&AuthSpec>,
+    limiter: &CombinedLimiter,
+    control: &SharedControl,
+    file: &mut tokio::fs::File,
+) -> Result<u64, SegmentError> {
+    let mut req = hls_request(client, url, headers, auth);
+    if let Some((length, offset)) = range {
+        req = req.header(
+            reqwest::header::RANGE,
+            format!("bytes={}-{}", offset, offset.saturating_add(length).saturating_sub(1)),
+        );
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| SegmentError::Retry(format!("{e}")))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let message = format!("HTTP {status} for {url}");
+        let retryable = status.is_server_error()
+            || status.as_u16() == 408
+            || status.as_u16() == 429;
+        return Err(if retryable {
+            SegmentError::Retry(message)
+        } else {
+            SegmentError::Fatal(message)
+        });
+    }
+    // A 200 answers a ranged request with the *whole* file: appending it
+    // would splice the wrong bytes into the output.
+    if range.is_some() && status.as_u16() != 206 {
+        return Err(SegmentError::Fatal(format!(
+            "the server ignored the byte range (HTTP {status}); this playlist's \
+             segments are slices of one file"
+        )));
+    }
+
+    let mut stream = resp.bytes_stream();
+    let mut written = 0u64;
+    while let Some(chunk) = stream.next().await {
+        if control.is_canceled() {
+            return Err(SegmentError::Canceled);
+        }
+        let bytes = chunk.map_err(|e| SegmentError::Retry(format!("{e}")))?;
+        limiter.acquire(bytes.len() as u64).await;
+        file.write_all(&bytes)
+            .await
+            .map_err(|e| SegmentError::Fatal(format!("could not write the file: {e}")))?;
+        written += bytes.len() as u64;
+    }
+    Ok(written)
+}
+
+/// `hls_copy_into` with a stall cap: a CDN edge that accepts the
+/// connection and then goes silent must not hang the download forever.
+#[allow(clippy::too_many_arguments)]
+async fn hls_copy_segment(
+    client: &reqwest::Client,
+    url: &str,
+    range: Option<(u64, u64)>,
+    headers: &BTreeMap<String, String>,
+    auth: Option<&AuthSpec>,
+    limiter: &CombinedLimiter,
+    control: &SharedControl,
+    file: &mut tokio::fs::File,
+) -> Result<u64, SegmentError> {
+    match tokio::time::timeout(
+        Duration::from_secs(CHUNK_STALL_SECS),
+        hls_copy_into(client, url, range, headers, auth, limiter, control, file),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(SegmentError::Retry(format!(
+            "no data for {}s",
+            CHUNK_STALL_SECS
+        ))),
+    }
+}
+
+/// `ffmpeg -c copy` an MPEG-TS file into MP4. Returns the MP4 path.
+///
+/// The ADTS→ASC bitstream filter is what makes AAC audio from TS valid
+/// in MP4, but it fails on non-AAC audio, so a second attempt runs
+/// without it. Both attempts remove their own partial output.
+async fn hls_remux_to_mp4(ts: &Path) -> Result<std::path::PathBuf, String> {
+    if crate::media::which("ffmpeg").is_none() {
+        return Err("ffmpeg is not installed".into());
+    }
+    let mp4 = ts.with_extension("mp4");
+    for with_bsf in [true, false] {
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(["-hide_banner", "-nostdin", "-y", "-i"])
+            .arg(ts)
+            .args(["-c", "copy"]);
+        if with_bsf {
+            cmd.args(["-bsf:a", "aac_adtstoasc"]);
+        }
+        cmd.args(["-movflags", "+faststart"])
+            .arg(&mp4)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let ok = matches!(
+            tokio::time::timeout(HLS_REMUX_TIMEOUT, cmd.status()).await,
+            Ok(Ok(status)) if status.success()
+        );
+        if ok {
+            if tokio::fs::metadata(&mp4)
+                .await
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+            {
+                return Ok(mp4);
+            }
+        }
+        let _ = tokio::fs::remove_file(&mp4).await;
+    }
+    Err("ffmpeg could not remux the stream to MP4".into())
+}
+
+/// Download an HLS playlist by concatenating its segments.
+///
+/// Runs on the same slot the caller already acquired. Output is a single
+/// `.ts` (or `.mp4` for fMP4 playlists); when ffmpeg is available the TS
+/// is remuxed to MP4 and the row is retargeted to it, with the TS kept
+/// as the source (same contract as the DASH pair merge).
+async fn run_hls_download(
+    ctx: Arc<RunContext>,
+    state: Arc<TaskState>,
+    proxy: Option<String>,
+    id: String,
+) {
+    let control = Arc::clone(&state.control);
+    let (url, headers, auth, per_download_limit) = {
+        let d = state.download.lock().unwrap();
+        (
+            d.url.clone(),
+            d.headers.clone(),
+            d.auth.clone(),
+            d.speed_limit.unwrap_or(0),
+        )
+    };
+    let client = build_client(proxy.as_deref());
+    let limiter = Arc::new(CombinedLimiter::new(
+        ctx.global_limiter.rate(),
+        per_download_limit,
+    ));
+
+    // ---- 1. Read the playlist (following one master hop) ----
+    let text = match hls_fetch_text(&client, &url, &headers, auth.as_ref()).await {
+        Ok(text) => text,
+        Err(e) => return hls_fail(&ctx, &state, &id, e),
+    };
+    let base = match url::Url::parse(&url) {
+        Ok(base) => base,
+        Err(e) => return hls_fail(&ctx, &state, &id, format!("invalid playlist URL: {e}")),
+    };
+    let mut playlist = match crate::hls::parse(&text, &base) {
+        Ok(playlist) => playlist,
+        Err(e) => return hls_fail(&ctx, &state, &id, e.to_string()),
+    };
+    if let crate::hls::Playlist::Master {
+        variants,
+        separate_audio,
+    } = &playlist
+    {
+        if *separate_audio {
+            return hls_fail(
+                &ctx,
+                &state,
+                &id,
+                "this HLS master keeps audio in a separate rendition; DM cannot merge \
+                 the two yet, so downloading the video variant alone would give a silent file"
+                    .into(),
+            );
+        }
+        let Some(best) = crate::hls::best_variant(variants) else {
+            return hls_fail(&ctx, &state, &id, "the playlist lists no variants".into());
+        };
+        let variant_url = best.uri.clone();
+        let variant_text = match hls_fetch_text(&client, &variant_url, &headers, auth.as_ref()).await {
+            Ok(text) => text,
+            Err(e) => return hls_fail(&ctx, &state, &id, e),
+        };
+        let variant_base = match url::Url::parse(&variant_url) {
+            Ok(base) => base,
+            Err(e) => return hls_fail(&ctx, &state, &id, format!("invalid variant URL: {e}")),
+        };
+        playlist = match crate::hls::parse(&variant_text, &variant_base) {
+            Ok(playlist) => playlist,
+            Err(e) => return hls_fail(&ctx, &state, &id, e.to_string()),
+        };
+    }
+    let crate::hls::Playlist::Media(media) = playlist else {
+        return hls_fail(
+            &ctx,
+            &state,
+            &id,
+            "the playlist points at another playlist; nested masters are not supported".into(),
+        );
+    };
+    if !media.ended {
+        return hls_fail(
+            &ctx,
+            &state,
+            &id,
+            "this is a live HLS playlist (no #EXT-X-ENDLIST): there is no finished file \
+             to download, only an endless stream"
+                .into(),
+        );
+    }
+    if media.encrypted() {
+        let method = media
+            .key
+            .as_ref()
+            .map(|k| k.method.clone())
+            .unwrap_or_default();
+        return hls_fail(
+            &ctx,
+            &state,
+            &id,
+            format!(
+                "this HLS stream is encrypted ({method}); DM does not decrypt segments yet — \
+                 open the URL in a player that handles it, or install ffmpeg and download it \
+                 directly"
+            ),
+        );
+    }
+
+    // ---- 2. Output naming + resume point ----
+    // fMP4 playlists (`#EXT-X-MAP`) concatenate into a valid MP4; TS
+    // playlists stay `.ts` until the optional remux.
+    let container = if media.init.is_some() { "mp4" } else { "ts" };
+    {
+        let mut d = state.download.lock().unwrap();
+        d.retarget_extension(container);
+    }
+    let (save_path, part_path) = {
+        let d = state.download.lock().unwrap();
+        (d.save_path.clone(), d.part_path())
+    };
+    let sidecar = hls_sidecar(&part_path);
+
+    let resume = match tokio::fs::read(&sidecar).await {
+        Ok(raw) => serde_json::from_slice::<HlsProgress>(&raw)
+            .ok()
+            .filter(|p| hls_resume_matches(p, &url, &media)),
+        Err(_) => None,
+    };
+
+    let mut file = match tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&part_path)
+        .await
+    {
+        Ok(file) => file,
+        Err(e) => {
+            return hls_fail(
+                &ctx,
+                &state,
+                &id,
+                format!("could not create {}: {e}", part_path.display()),
+            )
+        }
+    };
+    let (start_index, downloaded) = match &resume {
+        Some(p) => (p.next, p.bytes),
+        None => (0, 0),
+    };
+    // A sidecar claiming more than the file holds (truncated `.part`,
+    // external cleanup) would otherwise be "resumed" by extending the
+    // file with zeros. Start over instead.
+    let on_disk = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+    let (start_index, mut downloaded) = if downloaded > on_disk {
+        log::warn!(
+            "hls resume discarded id={id}: sidecar claims {downloaded} B, file holds {on_disk} B"
+        );
+        (0, 0u64)
+    } else {
+        (start_index, downloaded)
+    };
+    if let Err(e) = file.set_len(downloaded).await {
+        return hls_fail(&ctx, &state, &id, format!("could not prepare the output: {e}"));
+    }
+    if let Err(e) = file.seek(SeekFrom::End(0)).await {
+        return hls_fail(&ctx, &state, &id, format!("could not seek the output: {e}"));
+    }
+    if start_index > 0 {
+        log::info!(
+            "hls resume id={id} segment={start_index}/{} bytes={downloaded}",
+            media.segments.len()
+        );
+    }
+
+    // The init segment is part of the file, and only valid at offset 0.
+    if start_index == 0 {
+        if let Some(init) = media.init.clone() {
+            let mut attempt: usize = 0;
+            loop {
+                match hls_copy_segment(
+                    &client, &init, None, &headers, auth.as_ref(), &limiter, &control, &mut file,
+                )
+                .await
+                {
+                    Ok(n) => {
+                        downloaded += n;
+                        break;
+                    }
+                    Err(SegmentError::Canceled) => return hls_canceled(&ctx, &state, &id),
+                    Err(SegmentError::Fatal(e)) => return hls_fail(&ctx, &state, &id, e),
+                    Err(SegmentError::Retry(e)) if attempt < HLS_RETRY_DELAYS_MS.len() => {
+                        tokio::time::sleep(Duration::from_millis(
+                            HLS_RETRY_DELAYS_MS[attempt],
+                        ))
+                        .await;
+                        attempt += 1;
+                        log::warn!("hls init segment retry {attempt} id={id}: {e}");
+                        if let Err(err) = file.set_len(downloaded).await {
+                            return hls_fail(
+                                &ctx,
+                                &state,
+                                &id,
+                                format!("could not reset the output: {err}"),
+                            );
+                        }
+                        let _ = file.seek(SeekFrom::Start(downloaded)).await;
+                    }
+                    Err(SegmentError::Retry(e)) => {
+                        return hls_fail(
+                            &ctx,
+                            &state,
+                            &id,
+                            format!("the init segment failed after retries: {e}"),
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- 3. Segments ----
+    let mut media_done: f64 = media
+        .segments
+        .iter()
+        .take(start_index)
+        .map(|s| s.duration)
+        .sum();
+    let mut last_emit = Instant::now() - HLS_EMIT_INTERVAL;
+
+    for (index, segment) in media.segments.iter().enumerate().skip(start_index) {
+        if control.wait_while_paused().await {
+            return hls_canceled(&ctx, &state, &id);
+        }
+        let boundary = downloaded;
+        let mut attempt: usize = 0;
+        loop {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(
+                    HLS_RETRY_DELAYS_MS[attempt.saturating_sub(1)],
+                ))
+                .await;
+                if control.is_canceled() {
+                    return hls_canceled(&ctx, &state, &id);
+                }
+                // A failed attempt may have written a prefix: cut it
+                // back so a retry cannot splice two copies of a segment.
+                if let Err(e) = file.set_len(boundary).await {
+                    return hls_fail(
+                        &ctx,
+                        &state,
+                        &id,
+                        format!("could not reset the output: {e}"),
+                    );
+                }
+                if let Err(e) = file.seek(SeekFrom::Start(boundary)).await {
+                    return hls_fail(
+                        &ctx,
+                        &state,
+                        &id,
+                        format!("could not seek the output: {e}"),
+                    );
+                }
+            }
+            match hls_copy_segment(
+                &client,
+                &segment.uri,
+                segment.range,
+                &headers,
+                auth.as_ref(),
+                &limiter,
+                &control,
+                &mut file,
+            )
+            .await
+            {
+                Ok(n) => {
+                    downloaded = boundary + n;
+                    break;
+                }
+                Err(SegmentError::Canceled) => return hls_canceled(&ctx, &state, &id),
+                Err(SegmentError::Fatal(e)) => {
+                    return hls_fail(
+                        &ctx,
+                        &state,
+                        &id,
+                        format!("segment {} failed: {e}", index + 1),
+                    )
+                }
+                Err(SegmentError::Retry(e)) => {
+                    attempt += 1;
+                    if attempt > HLS_RETRY_DELAYS_MS.len() {
+                        return hls_fail(
+                            &ctx,
+                            &state,
+                            &id,
+                            format!(
+                                "segment {} of {} failed after {} attempts: {e}",
+                                index + 1,
+                                media.segments.len(),
+                                attempt
+                            ),
+                        );
+                    }
+                    log::warn!(
+                        "hls segment {}/{} retry {attempt} id={id}: {e}",
+                        index + 1,
+                        media.segments.len()
+                    );
+                }
+            }
+        }
+
+        media_done += segment.duration;
+        let estimate = if media.duration > 0.0 && media_done > 0.0 {
+            // Bytes-per-second of media so far × total duration. The
+            // row shows a real percentage instead of "unknown total"
+            // for the whole download; it is corrected on completion.
+            let est = (downloaded as f64 / media_done) * media.duration;
+            Some(est.max(downloaded as f64) as u64)
+        } else {
+            None
+        };
+        {
+            let mut d = state.download.lock().unwrap();
+            d.downloaded = downloaded;
+            if let Some(total) = estimate {
+                d.total_size = Some(total);
+            }
+        }
+        if last_emit.elapsed() >= HLS_EMIT_INTERVAL {
+            last_emit = Instant::now();
+            let d = state.download.lock().unwrap();
+            ctx.emit(DownloadEvent::Progress(d.clone()));
+        }
+        let progress = HlsProgress {
+            url: url.clone(),
+            first: media.segments[0].uri.clone(),
+            count: media.segments.len(),
+            next: index + 1,
+            bytes: downloaded,
+        };
+        if let Ok(json) = serde_json::to_vec(&progress) {
+            let _ = tokio::fs::write(&sidecar, json).await;
+        }
+    }
+
+    if let Err(e) = file.flush().await {
+        return hls_fail(&ctx, &state, &id, format!("could not flush the output: {e}"));
+    }
+    drop(file);
+
+    // ---- 4. Finalize ----
+    if state.control.is_removed() {
+        ctx.scheduler.release_download_state(&id);
+        return;
+    }
+    if let Err(e) = tokio::fs::rename(&part_path, &save_path).await {
+        return hls_fail(
+            &ctx,
+            &state,
+            &id,
+            format!(
+                "could not move {} to {}: {e}",
+                part_path.display(),
+                save_path.display()
+            ),
+        );
+    }
+    let _ = tokio::fs::remove_file(&sidecar).await;
+
+    // MPEG-TS plays everywhere worth playing it, but MP4 is what users
+    // expect from a download manager. Remuxing is a stream copy; when
+    // it fails the `.ts` is still a complete, playable file.
+    if container == "ts" {
+        match hls_remux_to_mp4(&save_path).await {
+            Ok(mp4) => {
+                let size = tokio::fs::metadata(&mp4)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(downloaded);
+                let mut d = state.download.lock().unwrap();
+                d.save_path = mp4.clone();
+                if let Some(name) = mp4.file_name().and_then(|n| n.to_str()) {
+                    d.filename = name.to_string();
+                }
+                d.total_size = Some(size);
+                d.downloaded = size;
+                d.chunks = vec![ChunkState {
+                    index: 0,
+                    start: 0,
+                    end: size.saturating_sub(1),
+                    downloaded: size,
+                }];
+                let _ = ctx.storage.save_download(&d);
+                log::info!("hls remuxed id={id} to {}", mp4.display());
+            }
+            Err(e) => {
+                log::warn!(
+                    "hls kept {} (remux unavailable: {e})",
+                    save_path.display()
+                );
+            }
+        }
+    }
+
+    {
+        let mut d = state.download.lock().unwrap();
+        if container == "ts" && d.save_path == save_path {
+            // No remux: the row keeps the `.ts` and its real size.
+            d.downloaded = downloaded;
+            d.total_size = Some(downloaded);
+            d.chunks = vec![ChunkState {
+                index: 0,
+                start: 0,
+                end: downloaded.saturating_sub(1),
+                downloaded,
+            }];
+        }
+        d.can_resume = false;
+        d.status = DownloadStatus::Completed;
+        d.finished_at = Some(chrono::Utc::now());
+        d.error = None;
+        let _ = ctx.storage.save_download(&d);
+        let _ = ctx.storage.add_history(
+            Some(&id),
+            &d.url,
+            &d.filename,
+            d.total_size,
+            &d.finished_at.unwrap().to_rfc3339(),
+            d.category.as_deref(),
+            None,
+        );
+        ctx.emit(DownloadEvent::Completed(d.clone()));
+    }
+    ctx.scheduler.release_download_state(&id);
+}
+
 /// Compute the SHA-256 hex digest of a file.
 pub fn sha256_of(path: &Path) -> Result<String, std::io::Error> {
     use std::io::Read;
@@ -798,4 +1510,52 @@ mod tests {
         let _ = std::net::TcpStream::connect(("127.0.0.1", port));
         std::thread::sleep(Duration::from_millis(50));
     }
+    #[test]
+    fn hls_resume_only_matches_the_playlist_it_describes() {
+        let base = url::Url::parse("https://cdn.test/hls/stream.m3u8").unwrap();
+        let media = match crate::hls::parse(
+            "#EXTM3U\n#EXTINF:6,\na.ts\n#EXTINF:6,\nb.ts\n#EXT-X-ENDLIST\n",
+            &base,
+        )
+        .expect("playlist")
+        {
+            crate::hls::Playlist::Media(media) => media,
+            _ => unreachable!(),
+        };
+        let good = HlsProgress {
+            url: "https://cdn.test/hls/stream.m3u8".into(),
+            first: "https://cdn.test/hls/a.ts".into(),
+            count: 2,
+            next: 1,
+            bytes: 123,
+        };
+        assert!(hls_resume_matches(&good, &good.url, &media));
+        assert!(
+            !hls_resume_matches(&good, "https://cdn.test/other.m3u8", &media),
+            "a different playlist must restart"
+        );
+        assert!(
+            !hls_resume_matches(
+                &HlsProgress {
+                    count: 3,
+                    ..good.clone()
+                },
+                "https://cdn.test/hls/stream.m3u8",
+                &media
+            ),
+            "an edited playlist (different segment count) must restart"
+        );
+        assert!(
+            !hls_resume_matches(
+                &HlsProgress {
+                    next: 3,
+                    ..good.clone()
+                },
+                "https://cdn.test/hls/stream.m3u8",
+                &media
+            ),
+            "a next index past the end is not a resume point"
+        );
+    }
+
 }

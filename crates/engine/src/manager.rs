@@ -158,6 +158,10 @@ impl DownloadManager {
         let in_window = self.in_schedule_window();
         let active = self.inner.storage.load_active().unwrap_or_default();
         for mut d in active {
+            // A row persisted before HLS support still names a `.m3u8`
+            // playlist; give it the same output name a fresh add would,
+            // or the resumed run would write segments into a `.m3u8`.
+            d.normalize_media();
             // Self-heal: a row whose FINAL file is already on disk at the
             // full expected size is done, whatever its persisted status
             // says (a merged pair row that errored on a later re-download
@@ -257,6 +261,10 @@ impl DownloadManager {
 
     /// Enqueue a new download (status should be `Queued`, `Paused` or `Scheduled`).
     pub fn add(&self, mut download: Download) {
+        // A `.m3u8` URL names a playlist, not the file: normalise the
+        // media marker and the output name here so every entry point
+        // (command, capture, resume) stores the same thing.
+        download.normalize_media();
         // Respect the schedule window: if it is currently closed, park the
         // download as `Scheduled` instead of starting it immediately.
         if matches!(
