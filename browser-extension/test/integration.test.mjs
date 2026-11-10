@@ -26,7 +26,7 @@ async function settle(clock, rounds = 12) {
   for (let i = 0; i < rounds; i++) await clock.advance(0);
 }
 
-function bootAll({ popup = false, chrome = {} } = {}) {
+function bootAll({ popup = false, chrome = {}, elements = {} } = {}) {
   const clock = createClock(START);
   const ctl = createChromeMock({
     storage: { dmInstallTime: INSTALLED_AT },
@@ -40,7 +40,7 @@ function bootAll({ popup = false, chrome = {} } = {}) {
   mp4.setAttribute("href", MP4);
 
   const doc = new FakeDocument({
-    querySelectorAllResults: { "a[href]": [zip, mp4] },
+    querySelectorAllResults: { "a[href]": [zip, mp4], ...elements },
   });
 
   const els = {};
@@ -202,6 +202,32 @@ test("the popup reports an empty page honestly", async () => {
   // The shared document does have two anchors, so this asserts the
   // positive path is not accidentally the always-taken path.
   assert.ok(!/No media found on this page/.test(textOf(els.status)));
+});
+
+test("a playing MSE page is reported as a player, not as 'no media'", async () => {
+  // The reported bug, end to end: the page has a <video>, it plays,
+  // and the popup still said "No media found on this page". The
+  // message now names what was actually found.
+  const el = new FakeElement("video");
+  el.setAttribute("src", "blob:https://site.example.test/1f2e");
+  const { clock, els } = bootAll({
+    popup: true,
+    elements: {
+      // Drop the shared page's mp4 anchor: the point is a page whose
+      // only media is the blob-backed player.
+      "a[href]": [],
+      "video, audio, source, picture source, track": [el],
+    },
+  });
+  await settle(clock);
+
+  els.grab.dispatch("click");
+  await settle(clock, 40);
+
+  const text = textOf(els.status);
+  assert.match(text, /blob:/, text);
+  assert.match(text, /press play/, text);
+  assert.ok(!/No media found on this page/.test(text), text);
 });
 
 test("P1-5: the takeover toggle round-trips and reaches the content script", async () => {

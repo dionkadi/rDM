@@ -98,7 +98,26 @@ test("the source manifest is a valid Firefox 109+ template", () => {
 test("declared permissions are the minimal set we expect", () => {
   assert.deepEqual(
     [...(manifest.permissions || [])].sort(),
-    ["downloads", "nativeMessaging", "storage", "tabs"],
+    ["downloads", "nativeMessaging", "storage", "tabs", "webRequest"],
+  );
+});
+
+test("the content script runs before the page's own load burst", () => {
+  // Resource timing keeps the *oldest* entries once its buffer is full,
+  // so a script injected at `document_idle` has already lost whatever
+  // the page requested during load. `document_start` is what lets the
+  // observer mirror entries before the buffer can fill.
+  assert.equal(manifest.content_scripts?.[0]?.run_at, "document_start");
+});
+
+test("media observation stays observational", () => {
+  // `webRequestBlocking` is restricted to policy installs in Chrome;
+  // needing it would silently disable the extension for normal users.
+  const bg = read("background.js");
+  assert.match(bg, /chrome\.webRequest\.onHeadersReceived/);
+  assert.ok(
+    !/webRequestBlocking|"blocking"/.test(bg),
+    "the extension must never ask for blocking webRequest",
   );
 });
 
@@ -162,7 +181,7 @@ test("the Chrome transform produces a loadable Chromium manifest", () => {
   assert.equal(out.action.default_popup, "popup.html");
   assert.deepEqual(
     [...out.permissions].sort(),
-    ["downloads", "storage", "tabs"],
+    ["downloads", "storage", "tabs", "webRequest"],
   );
 });
 

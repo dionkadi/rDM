@@ -199,9 +199,13 @@ export function createChromeMock(options = {}) {
     onStartup: [],
     onCreated: [],
     onChanged: [],
+    onHeadersReceived: [],
+    onTabRemoved: [],
+    onTabUpdated: [],
   };
 
   const storageData = { ...opts.storage };
+  const sessionData = {};
   const downloadsById = new Map();
   let downloadIdSeq = 0;
 
@@ -375,6 +379,8 @@ export function createChromeMock(options = {}) {
     },
 
     tabs: {
+      onRemoved: { addListener: (fn) => listeners.onTabRemoved.push(fn) },
+      onUpdated: { addListener: (fn) => listeners.onTabUpdated.push(fn) },
       query(queryInfo, cb) {
         clearLastError();
         calls.tabsQuery.push(queryInfo);
@@ -413,6 +419,14 @@ export function createChromeMock(options = {}) {
       },
     },
 
+    // Observational only — the extension must never need
+    // `webRequestBlocking` (Chrome restricts it to policy installs).
+    webRequest: {
+      onHeadersReceived: {
+        addListener: (fn) => listeners.onHeadersReceived.push(fn),
+      },
+    },
+
     storage: {
       local: {
         async get(key) {
@@ -430,6 +444,22 @@ export function createChromeMock(options = {}) {
           for (const [k, v] of Object.entries(obj)) storageData[k] = v;
         },
       },
+      // MV3 `storage.session`: in-memory, survives service-worker
+      // restarts, dies with the browser session.
+      session: {
+        async get(key) {
+          clearLastError();
+          if (key == null) return { ...sessionData };
+          const keys = Array.isArray(key) ? key : [key];
+          const out = {};
+          for (const k of keys) if (k in sessionData) out[k] = sessionData[k];
+          return out;
+        },
+        async set(obj) {
+          clearLastError();
+          for (const [k, v] of Object.entries(obj)) sessionData[k] = v;
+        },
+      },
       onChanged: { addListener: (fn) => listeners.onChanged.push(fn) },
     },
   };
@@ -440,8 +470,34 @@ export function createChromeMock(options = {}) {
     calls,
     logs,
     storageData,
+    sessionData,
     ws: wsFake,
     listeners,
+    /// Fire `webRequest.onHeadersReceived` like the browser would.
+    ///
+    /// `contentType` is sugar for the one header the extension
+    /// classifies on; `headers` lets a test pass the raw list.
+    fireResponse({
+      url,
+      tabId = 1,
+      frameId = 0,
+      type = "xmlhttprequest",
+      contentType,
+      headers,
+    } = {}) {
+      const responseHeaders =
+        headers ||
+        (contentType ? [{ name: "content-type", value: contentType }] : []);
+      const details = { url, tabId, frameId, type, responseHeaders };
+      for (const fn of [...listeners.onHeadersReceived]) fn(details);
+      return details;
+    },
+    fireTabRemoved(tabId = 1) {
+      for (const fn of [...listeners.onTabRemoved]) fn(tabId);
+    },
+    fireTabUpdated(tabId = 1, changeInfo = { status: "loading" }) {
+      for (const fn of [...listeners.onTabUpdated]) fn(tabId, changeInfo);
+    },
     /// Fire `downloads.onCreated` like the browser would.
     fireCreated(item) {
       const full = {
@@ -722,6 +778,12 @@ export function loadExtension(scripts, env) {
   // page's playurl API). Injected per-test via `env.fetch`; when
   // absent, content.js takes its synchronous heuristic-only path.
   if (env.fetch !== undefined) sandbox.fetch = env.fetch;
+  // PerformanceObserver is how content.js mirrors resource entries into
+  // its own ring buffer. Absent in the vm by default; tests that care
+  // about buffer eviction inject a controllable fake.
+  if (env.PerformanceObserver !== undefined) {
+    sandbox.PerformanceObserver = env.PerformanceObserver;
+  }
   // AbortController is used for the enhancement's timeout.
   if (typeof AbortController !== "undefined") {
     sandbox.AbortController = AbortController;

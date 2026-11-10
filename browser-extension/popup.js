@@ -500,7 +500,14 @@ if (grabBtn) {
           `Grab failed: ${(res && res.error) || "no response from the background"}.`,
         );
       } else if (!res.urls) {
-        setNote("warn", res.note || "No media found on this page.");
+        // The background always answers with a note now: "no player at
+        // all", "a player whose source is a blob:" and "found N
+        // requests but none is downloadable" are different problems and
+        // used to render as the same sentence.
+        const seen = res.observed
+          ? ` (${res.observed} media request(s) seen in this tab)`
+          : "";
+        setNote("warn", res.note || `No media found on this page.${seen}`);
       } else if (!res.delivered) {
         setNote(
           "err",

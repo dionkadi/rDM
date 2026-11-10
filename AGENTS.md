@@ -84,6 +84,12 @@ DM/
 │   │                          #   `chrome.runtime.lastError` is captured in the
 │   │                          #   same tick as `connectNative` (Firefox clears it
 │   │                          #   on the next runtime API call).
+│   │                          #   Also owns the cross-frame media log: an
+│   │                          #   observational `webRequest.onHeadersReceived`
+│   │                          #   listener classifies responses by Content-Type
+│   │                          #   per tab, keeps a bounded log in
+│   │                          #   `chrome.storage.session`, and hands it to the
+│   │                          #   content script as `hints` on grab.
 │   ├── content.js             # Two responsibilities, both opt-in:
 │   │                          #   (1) capture-phase click interceptor on `<a>` elements
 │   │                          #       matching MEDIA_RE (or with a `download` attribute)
@@ -96,6 +102,8 @@ DM/
 │   │                          #   (2) explicit `collect` message handler for the popup's
 │   │                          #       "Grab page media" button. Modifier keys, middle/right
 │   │                          #       click, and non-http(s) URLs bypass the interceptor.
+│   │                          #   Runs at `document_start` so the resource-timing
+│   │                          #   observer is installed before the page's load burst.
 │   ├── popup.html / popup.js  # Host status, the two behaviour switches, "Grab page
 │   │                          #   media" and "Test host connection" buttons (themed;
 │   │                          #   surfaces the actual `chrome.runtime.lastError.message`
@@ -171,7 +179,7 @@ The browser extension MV3 background relays URLs from three sources, in priority
 
 Do **not** assume Chrome reads `background.scripts` as a service worker — it does not. Before Chrome 121 a Manifest V3 extension declaring `background.scripts` is **refused at load**; from Chrome 121 the key is **ignored**, and since the source manifest declares no `background.service_worker`, loading the repo directory unpacked in Chrome produces **no background context at all** (the popup reports "background not reachable" and nothing works). Chromium builds must come from the released `.zip`. `scripts/verify-package.sh` asserts both manifest shapes.
 
-**The Firefox path needs the `nativeMessaging` permission.** Without it, `chrome.runtime.connectNative` is not a function, the native transport can never connect, and — because the content script used to intercept unconditionally — the only visible symptom was "media links stop working". `manifest.json` declares it; the Chromium `.zip` must not (the WebSocket path doesn't need it, and an unnecessary permission enlarges the install prompt). `test/manifest.test.mjs` derives the required permission set from the source and fails if the manifest disagrees in either direction.
+**The Firefox path needs the `nativeMessaging` permission.** Without it, `chrome.runtime.connectNative` is not a function, the native transport can never connect, and — because the content script used to intercept unconditionally — the only visible symptom was "media links stop working". `manifest.json` declares it; the Chromium `.zip` must not (the WebSocket path doesn't need it, and an unnecessary permission enlarges the install prompt). The same manifest declares `webRequest` (observational only) and injects the content script at `document_start`; `test/manifest.test.mjs` derives the required permission set from the source and fails if the manifest disagrees in either direction, and also asserts the run timing and the absence of `webRequestBlocking`.
 
 **No Chrome extension ID to copy any more.** Chromium talks to DM over WebSocket, so there is no `allowed_origins` host manifest to register and no `REPLACE_WITH_YOUR_CHROME_EXTENSION_ID` placeholder to substitute. Only the Firefox host manifest exists (`com.app.dm.native.firefox.json`, `allowed_extensions: ["dm-grabber@dm-project"]`), and its `path` ships as a placeholder the user must point at the built `dm-native-host` binary. (The `com.app.dm.native.json` / `com.app.dm.native.chrome.json` templates were deleted in 0.4.2 — if you find a doc or README pointing at them, the doc is stale.)
 
@@ -199,9 +207,11 @@ The popup exposes two `chrome.storage.local` switches (`dmSettings`), both defau
 
 ```bash
 cd browser-extension
-node --test test/*.test.mjs          # the regression suite (48 tests)
-node test/mutation-check.mjs         # re-introduces each fixed bug; every one must be caught
+node --test test/*.test.mjs          # the regression suite (104 tests)
+node test/mutation-check.mjs         # re-introduces each fixed bug; every one must be caught (24)
 ```
+
+`test/media-detection.test.mjs` is the one that pins the *detection* contract (relative `src`, blob-only players, extensionless `Content-Type` hints, same-origin iframe timelines, buffer eviction, cid grouping, note/reason passthrough, cross-frame end-to-end); `content.test.mjs` / `background.test.mjs` / `integration.test.mjs` cover the click and delivery paths.
 
 `mutation-check.mjs` deliberately rewrites the sources (and restores them in a `finally`), so it is not named `*.test.mjs` and isn't picked up by the normal run. **If you fix a bug here, add a test and a mutation for it** — a regression test that can't fail is decoration.
 
@@ -217,7 +227,18 @@ Verified against the real code: a browser-shaped client (Chrome's exact headers 
 
 **The `media` message type is a hard boundary, not a soft one.** The previous content-script auto-scrape path used to send `{type: "media", urls: [...]}` on every page load / DOM mutation, which flooded DM. The content script no longer auto-sends, and the background's `onMessage` handler now **drops `type === "media"` on the floor** — even if a stale cached content script (or a third-party script) tries to send it, the background refuses. Only `type === "grab"` (the popup button's explicit ask) is accepted. This is a deliberate, documented boundary so the next refactor can't accidentally re-enable passive capture by leaving a "harmless" `media` branch in the handler.
 
-**What "Grab page media" is allowed to look at, and why the order matters.** `collectMedia()` in `content.js` scans, in descending trust: media elements' `currentSrc`/`src` → HLS/DASH hints and downloadable-looking `<a>` links → Open Graph video → iframes **only when the iframe URL itself looks like media** → and finally `performance.getEntriesByType("resource")`. The last one is not optional: MSE players (bilibili and the like) load the stream into `<video src="blob:…">` with `fetch`, so the DOM never contains a usable URL while the real `.m4s`/`.mp4`/`.m3u8` URLs sit in the resource timing buffer. The iframe filter is equally load-bearing — an unfiltered branch is how "grab" came to offer `player.html` and `iframe.html` as "media". Results are ranked (downloadable file → manifest → segment), capped at `MAX_GRAB_URLS`, deduped, and reported with a `note` that says where they came from or why nothing usable was found (media inside a cross-origin iframe is genuinely invisible from the top frame — the honest answer, not a silent empty list). Mutation `grab offer the player's HTML again` / `grab stop scanning network activity` cover both.
+**What "Grab page media" is allowed to look at, and why the order matters.** `collectMedia(hints)` in `content.js` scans, in descending trust: media elements (`currentSrc` → `.src` → the raw attribute) → HLS/DASH hints and downloadable-looking `<a>` links → Open Graph video → same-origin iframes' DOM **and their own `performance` timeline** → the top frame's resource timing → and finally the background's `webRequest` log (`hints`, newest first). Every candidate goes through `absoluteUrl()` first: a relative `<video src="/v/clip.mp4">` is a real media URL, and rejecting it for not matching `^https?:` was why pages "worked after you pressed play but not before" (`currentSrc` is empty until the resource selection algorithm runs). `add()` then drops non-http(s) schemes (`blob:`/`data:` — MSE keeps the real stream out of the DOM), HTML documents (pathname only — a query string may legitimately contain `.html`), and duplicates.
+
+Curation is one logical download, IDM-style: a `.m4s` **pair** (range stripped, signing params kept) → a direct file → a manifest → a lone segment, in that order. The episode grouping is allowed to *reorder and prefer*, never to empty the set: `dominantCid()` only votes among bases we actually hold, an empty intersection falls back to every base, and bases whose cid cannot be parsed are kept because they are not evidence of another episode. Getting this wrong is how a page that was playing fine answered "no media".
+
+**Empty results are diagnostics, not a verdict.** `collectMedia` returns `diag` (`frames`, `players`, `blobPlayers`, `unusablePlayers`, `network`, `hints`, per-source counts) and a `note`; `handleGrab` forwards both plus a machine-readable `reason` (`no_content_script` / `player_without_url` / `filtered_out` / `no_media_observed`). The note used to be dropped on exactly the empty path, which is why "there is a player I cannot name", "the page script isn't running" and "nothing here" all rendered as `no media found on this page`. Keep the three distinguishable.
+
+**The resource-timing buffer keeps the OLDEST entries.** Once it reaches its cap the browser stops recording new ones — it does not evict — so on a long video the requests made while watching are the ones that go missing. That is why the content script runs at `document_start`, mirrors entries into a 400-entry ring via `PerformanceObserver`, and calls `clearResourceTimings()` in the callback. `setResourceTimingBufferSize` alone is not a fix: it only raises the cap and cannot recover what already fell out.
+
+**`window.__playinfo__` is not visible from a content script.** Page expandos live in the page's world; Chrome's isolated world cannot see them and Firefox only exposes them through `window.wrappedJSObject` (`pageGlobal()`). The harness loads both scripts into one vm context, so a test that reads `window.__playinfo__` proves nothing about the browser — assume the source is absent unless `wrappedJSObject` is in play.
+
+**Cross-frame media is observed in the background, not the content script.** A content script only sees its own frame: `performance` is per-window, a cross-origin player iframe exposes neither its DOM nor its timeline, and `all_frames` is deliberately off. So `background.js` keeps an observational `chrome.webRequest.onHeadersReceived` listener (`types: ["media","xmlhttprequest","other"]`, `["responseHeaders"]`, **never** `webRequestBlocking` — Chrome restricts it to policy installs) that classifies responses by `Content-Type`: `video/*`/`audio/*` → `file`, `application/vnd.apple.mpegurl` / `x-mpegurl` / `audio/mpegurl` / `dash+xml` → `manifest`, and `video/mp2t` / `application/octet-stream` → nothing (a fragment, or a CDN that doesn't know). The per-tab log is bounded (120 entries, 30 min TTL, cleared on navigation/tab close) and persisted to `chrome.storage.session` on a 400 ms debounce — the popup wakes a *fresh* worker after the media was played, so an in-memory-only log would be empty exactly when it is needed. Hints are advisory: they widen what `collectMedia` can see, but the content script still decides what to offer.
+
 
 **Captures notify.** A captured URL raises a desktop notification (Tauri `notify` command) *and* an in-app toast, because the `CaptureDialog` is a modal in a window the user is almost certainly not looking at — they just clicked a link in their browser. The notification is skipped when the window already has focus (`document.hasFocus()`), so it never duplicates what's on screen. The focus test belongs in the event listener (`stores/downloads.ts`), not in the dialog: the listener is the only place that knows about focus, and a toast in an unfocused window is not a notification.
 

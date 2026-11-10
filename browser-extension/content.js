@@ -83,6 +83,120 @@ function mediaRank(url) {
 }
 
 /**
+ * Resolve `raw` against the document's base URL.
+ *
+ * A content script sees whatever the page wrote into the attribute:
+ * `<video src="/v/clip.mp4">`, `<source src="../a.m4a">`, or a
+ * protocol-relative `//cdn/…`. Those are perfectly good media URLs,
+ * but they are not `^https?:` strings, and the old `add()` rejected
+ * them outright — which is why a page whose player had not started
+ * buffering (so `currentSrc` was still empty, leaving only the
+ * relative attribute) reported "no media" while the same page worked
+ * after the user pressed play.
+ *
+ * `blob:` / `data:` / `javascript:` stay non-http(s) after
+ * resolution, so the caller's scheme check still filters them.
+ */
+function absoluteUrl(raw) {
+  if (!raw || typeof raw !== "string") return null;
+  const value = raw.trim();
+  if (!value) return null;
+  let base;
+  try {
+    base =
+      (typeof document !== "undefined" && document.baseURI) ||
+      (typeof location !== "undefined" ? location.href : undefined);
+  } catch (_e) {
+    base = undefined;
+  }
+  try {
+    return new URL(value, base).href;
+  } catch (_e) {
+    return null;
+  }
+}
+
+/** Resource-timing URL list for a window, in the browser's own order. */
+function entriesFrom(perf) {
+  try {
+    if (!perf || typeof perf.getEntriesByType !== "function") return [];
+    return perf
+      .getEntriesByType("resource")
+      .map((e) => (e && e.name) || "")
+      .filter(Boolean);
+  } catch (_e) {
+    return [];
+  }
+}
+
+// ─── Our own resource-request log ───────────────────────────────
+//
+// `performance.setResourceTimingBufferSize` only raises the cap; once
+// the buffer is full the browser stops recording **new** entries (it
+// does not evict the oldest). On a long video the requests made while
+// the user is watching are therefore the ones that go missing — the
+// buffer keeps the page-load preloads and loses the stream. Raising
+// the cap at `document_start` shrinks the window but cannot close it,
+// so we mirror every entry into our own bounded ring buffer as it
+// arrives and clear the browser's buffer to keep it from filling.
+const OBSERVED_MAX = 400;
+const observed = [];
+const observedSeen = new Set();
+
+function rememberResource(name) {
+  if (!name || typeof name !== "string") return;
+  if (observedSeen.has(name)) return;
+  observedSeen.add(name);
+  observed.push(name);
+  if (observed.length > OBSERVED_MAX) {
+    observedSeen.delete(observed.shift());
+  }
+}
+
+/**
+ * All resource URLs this frame knows about, newest first: the
+ * browser's live buffer, then our ring for whatever already fell out
+ * of it. Duplicates are dropped by the caller's `seen` set.
+ */
+function resourceNames() {
+  const names = entriesFrom(typeof performance !== "undefined" ? performance : null);
+  names.reverse(); // getEntriesByType is oldest-first
+  for (let i = observed.length - 1; i >= 0; i--) names.push(observed[i]);
+  return names;
+}
+
+function startResourceObserver() {
+  if (typeof PerformanceObserver !== "function") return;
+  const onEntries = (list) => {
+    try {
+      for (const entry of list.getEntries()) rememberResource(entry && entry.name);
+      // Keeping the browser's buffer empty is what stops it from
+      // reaching its cap and silently dropping the newest entries.
+      if (typeof performance.clearResourceTimings === "function") {
+        performance.clearResourceTimings();
+      }
+    } catch (_e) {
+      // A throw here would kill the observer: swallow it.
+    }
+  };
+  try {
+    new PerformanceObserver(onEntries).observe({
+      type: "resource",
+      buffered: true,
+    });
+  } catch (_e) {
+    // Older syntax (`entryTypes`) or no observer support at all:
+    // `resourceNames` still reads the live buffer, which is what the
+    // code did before.
+    try {
+      new PerformanceObserver(onEntries).observe({ entryTypes: ["resource"] });
+    } catch (_inner) {
+      // No observation available.
+    }
+  }
+}
+
+/**
  * True when two URLs live on the same host in the same directory —
  * the layout sites use when a DASH pair has explicit extensions
  * (`…/video.m4a` + `…/video.mp4` side by side). Two random files from
@@ -287,14 +401,19 @@ function cidOfMediaUrl(u) {
  * hover previews / promo clips / preloaded episodes that fetch a handful
  * of segments. Pure "newest wins" selection picked such a clip over the
  * watched video; request counts do not.
+ *
+ * `allowed` (a set of base URLs) restricts the vote to streams we can
+ * actually offer. Without it the counter could elect a cid whose bases
+ * never made it into `dashBases`, and the caller's episode filter then
+ * discarded every real base.
  */
-function observedCidCounts() {
+function observedCidCounts(allowed) {
   const counts = new Map();
   try {
-    const entries = performance.getEntriesByType("resource");
-    for (const e of entries) {
-      const name = e && e.name;
+    const names = resourceNames();
+    for (const name of names) {
       if (!name || !/\.m4s(\?|#|$)/i.test(name)) continue;
+      if (allowed && !allowed.has(name.split("#")[0].split("?")[0])) continue;
       const cid = cidOfMediaUrl(name);
       if (!cid) continue;
       counts.set(cid, (counts.get(cid) || 0) + 1);
@@ -309,18 +428,18 @@ function observedCidCounts() {
  * The cid with the most segment requests; ties go to the newest
  * (entries are scanned newest-first). `null` when nothing observable.
  */
-function dominantCid() {
-  const counts = observedCidCounts();
+function dominantCid(allowed) {
+  const counts = observedCidCounts(allowed);
   let max = 0;
   for (const n of counts.values()) {
     if (n > max) max = n;
   }
   if (max === 0) return null;
   try {
-    const entries = performance.getEntriesByType("resource");
-    for (let i = entries.length - 1; i >= 0; i--) {
-      const name = entries[i] && entries[i].name;
+    const names = resourceNames();
+    for (const name of names) {
       if (!name || !/\.m4s(\?|#|$)/i.test(name)) continue;
+      if (allowed && !allowed.has(name.split("#")[0].split("?")[0])) continue;
       const cid = cidOfMediaUrl(name);
       if (cid && counts.get(cid) === max) return cid;
     }
@@ -421,55 +540,99 @@ function collectPageMeta() {
  * keeps media embedded in a same-origin player visible without any
  * cross-frame races.
  */
-function collectMedia() {
+function collectMedia(hints) {
   const ordered = [];
   const seen = new Set();
-  const sources = { player: 0, link: 0, meta: 0, iframe: 0, network: 0 };
+  const hintKind = new Map();
+  const sources = {
+    player: 0,
+    link: 0,
+    meta: 0,
+    iframe: 0,
+    network: 0,
+    frame: 0,
+    log: 0,
+  };
+  let players = 0;
+  let blobPlayers = 0;
+  let unusablePlayers = 0;
+  let networkSeen = 0;
 
-  const add = (raw, source) => {
-    if (!raw || typeof raw !== "string") return;
-    const url = raw.trim();
-    // `blob:` (MSE), `data:`, `javascript:` and relative URLs are all
-    // unusable as a download target.
+  const add = (raw, source, kind) => {
+    // Resolve first: a relative `src` is a real media URL, not junk.
+    const url = absoluteUrl(raw);
+    if (!url) return;
+    // `blob:` (MSE), `data:`, `javascript:` are unusable as a
+    // download target.
     if (!/^https?:/i.test(url)) return;
-    // HTML documents are not media (see DOCUMENT_RE). This is the
-    // last-resort net: no matter which heuristic found the URL, a
-    // `…/player.html` must never reach DM from a grab.
-    if (DOCUMENT_RE.test(url)) return;
+    // HTML documents are not media (see DOCUMENT_RE). Test the
+    // *path* only: a query string may legitimately contain ".html"
+    // (redirect/tracking params) without making the response a page.
+    let pathname = url;
+    try {
+      pathname = new URL(url).pathname;
+    } catch (_e) {
+      pathname = url;
+    }
+    if (DOCUMENT_RE.test(pathname)) return;
     if (seen.has(url)) return;
     seen.add(url);
     ordered.push(url);
     sources[source]++;
+    if (kind === "file" || kind === "manifest") hintKind.set(url, kind);
   };
 
   // Documents to scan for sources 1–4. `contentDocument` access is
   // wrapped per-iframe: on exotic setups (sandboxed frames) it can
   // throw, and a throw here would look like "found nothing".
-  const docs = [document];
+  //
+  // Each entry keeps the frame's `window` too: `performance` is
+  // per-window, so a same-origin player iframe has its own resource
+  // timeline that the top document's scan can never see.
+  const docs = [
+    { doc: document, win: typeof window !== "undefined" ? window : null },
+  ];
   try {
     document.querySelectorAll("iframe").forEach((el) => {
       let inner = null;
+      let win = null;
       try {
         inner = el.contentDocument;
       } catch (_e) {
         inner = null;
       }
+      try {
+        win = el.contentWindow;
+      } catch (_e) {
+        win = null;
+      }
       // Dedupe: nested iframes are visited once via their own parent
       // scan only when we push them here — we deliberately do NOT
       // recurse deeper than one level to bound the work.
-      if (inner) docs.push(inner);
+      if (inner) docs.push({ doc: inner, win });
     });
   } catch (_e) {
     // The top document scan below still runs.
   }
 
-  for (const doc of docs) {
-    // 1. Media elements.
+  for (const { doc } of docs) {
+    // 1. Media elements. `.currentSrc` is the URL the element actually
+    //    resolved and loaded; `.src` resolves a relative attribute;
+    //    `getAttribute("src")` is the last resort (and is what an
+    //    un-started `<video preload="none">` leaves us with).
     doc
       .querySelectorAll("video, audio, source, picture source, track")
       .forEach((el) => {
-        add(el.currentSrc, "player");
-        add(el.getAttribute("src"), "player");
+        const tag = String(el.tagName || "").toUpperCase();
+        if (tag === "VIDEO" || tag === "AUDIO") players++;
+        const raw = el.getAttribute("src") || "";
+        const resolved = el.currentSrc || el.src || raw;
+        const hasBlob = /^blob:/i.test(resolved) || /^blob:/i.test(raw);
+        if (hasBlob) blobPlayers++;
+        // No URL at all, or only a `blob:` handle: the element proves
+        // there IS media here even though we cannot name it.
+        if (!resolved || hasBlob) unusablePlayers++;
+        add(resolved, "player");
       });
 
     // 2. Manifest and media links. The old extra `a[href*="manifest"]`
@@ -500,24 +663,43 @@ function collectMedia() {
     });
   }
 
-  // 5. Network activity — top frame only: a child iframe's requests
-  //    never appear in this document's buffer anyway. `performance` is
-  //    always present in a page context, but guard anyway: a grab that
-  //    throws would look like "found nothing".
+  // 5. Network activity. `performance` is always present in a page
+  //    context, but guard anyway: a grab that throws would look like
+  //    "found nothing". `resourceNames` merges the live timeline with
+  //    our own ring buffer, newest first — the most recent requests
+  //    are the ones describing what the user is watching right now.
   try {
-    const entries =
-      typeof performance !== "undefined" &&
-      typeof performance.getEntriesByType === "function"
-        ? performance.getEntriesByType("resource")
-        : [];
-    // Reverse: the most recent requests are the most likely to be what
-    // the user is watching right now.
-    for (let i = entries.length - 1; i >= 0; i--) {
-      const name = entries[i] && entries[i].name;
-      if (name && RESOURCE_MEDIA_RE.test(name)) add(name, "network");
+    const names = resourceNames();
+    for (let i = 0; i < names.length; i++) {
+      if (!RESOURCE_MEDIA_RE.test(names[i])) continue;
+      networkSeen++;
+      add(names[i], "network");
     }
   } catch (_e) {
     // Nothing to add; the other sources still count.
+  }
+
+  // 5b. Same-origin child frames. Their requests live in *their*
+  //     resource timeline, so an embedded same-origin player used to
+  //     be invisible even though its DOM was scanned. `contentWindow`
+  //     is readable for same-origin frames only; a cross-origin one
+  //     throws on `.performance` and is skipped by `entriesFrom`.
+  for (let i = 1; i < docs.length; i++) {
+    const names = entriesFrom(docs[i].win && docs[i].win.performance);
+    for (let j = names.length - 1; j >= 0; j--) {
+      if (!RESOURCE_MEDIA_RE.test(names[j])) continue;
+      add(names[j], "frame");
+    }
+  }
+
+  // 6. Background hints — the extension's own `webRequest` log. This
+  //    is the only source that covers media fetched inside a
+  //    cross-origin iframe, MSE players with extensionless URLs, and
+  //    streams whose resource entries were already dropped. The
+  //    background classifies each by `Content-Type` and only reports
+  //    "file" or "manifest" (never a fragment).
+  for (const hint of Array.isArray(hints) ? hints : []) {
+    if (hint && hint.url) add(hint.url, "log", hint.kind);
   }
 
   // ── One grab, one download (the IDM contract) ────────────────────
@@ -603,14 +785,19 @@ function collectMedia() {
       }
     } else if (isTsSegment.test(url)) {
       // `.ts` never becomes a candidate: one piece of a longer stream.
-    } else if (isManifestUrl.test(url)) {
+    } else if (isManifestUrl.test(url) || hintKind.get(url) === "manifest") {
       manifests.push(url);
-    } else if (mediaRank(url) < 2) {
-      // Rank 0/1: a real video or audio file extension.
+    } else if (mediaRank(url) < 2 || hintKind.get(url) === "file") {
+      // Rank 0/1: a real video or audio file extension. The background
+      // hint covers streams whose URL has no extension at all
+      // (`/videoplayback?…`) but whose `Content-Type` is video/* or
+      // audio/* — that is a whole file served with ranges, not a
+      // fragment.
       files.push(url);
     }
-    // Anything else (rank ≥ 2 non-manifest, extensionless URLs) is
-    // dropped: it cannot be described as "the file" confidently.
+    // Anything else (rank ≥ 2 non-manifest, extensionless URLs with no
+    // typed hint) is dropped: it cannot be described as "the file"
+    // confidently.
   });
 
   const candidates = [];
@@ -622,10 +809,18 @@ function collectMedia() {
   // previously watched parts), and pairing a video from one episode
   // with audio from another merges two different videos into one file.
   // The newest base's cid is the stream the player is actually
-  // fetching, so the pair is drawn from that cid alone. Within the
-  // episode, P2P-edge copies are demoted: a normal CDN base downloads
-  // fine, an mcdn copy usually refuses whole-file requests.
+  // fetching, so the pair is drawn from that cid alone.
   const bases = [...dashBases.values()].sort((a, b) => a.index - b.index);
+  // P2P edge copies are demoted within the pair: a normal CDN base
+  // downloads fine, an mcdn copy usually refuses whole-file requests.
+  const rankBases = (list) =>
+    list
+      .slice()
+      .sort(
+        (a, b) =>
+          Number(isP2pUrl(a.url)) - Number(isP2pUrl(b.url)) ||
+          a.index - b.index,
+      );
   // The episode the player is ACTUALLY streaming: the one whose
   // segments dominate the request log. Pure "newest wins" loses to
   // hover previews and promo clips — a 14-second clip fetched just now
@@ -633,23 +828,37 @@ function collectMedia() {
   // (which streamed hundreds of segment requests). Ties go to the
   // newest; when nothing carries a recognizable cid, fall back to the
   // newest base's cid.
-  const currentCid = dominantCid() ?? (bases.length > 0 ? bases[0].cid : null);
+  //
+  // The vote is restricted to the bases we actually hold: scanning the
+  // raw buffer (as this used to) could elect a cid whose streams never
+  // made it into `dashBases`, which then filtered every real base out
+  // and produced "no media" on a page that was playing fine.
+  const currentCid =
+    dominantCid(new Set(dashBases.keys())) ??
+    (bases.length > 0 ? bases[0].cid : null);
   // When no base carries a recognizable cid (generic DASH URLs like
   // `…/seg.m4s` don't embed one), skip the episode grouping entirely —
   // there is nothing to group by.
-  const episodeBases = bases
-    .filter(
-      (b) =>
-        currentCid === null || (b.cid !== null && b.cid === currentCid),
-    )
-    .sort(
-      (a, b) =>
-        Number(isP2pUrl(a.url)) - Number(isP2pUrl(b.url)) || a.index - b.index,
+  //
+  // The grouping is allowed to *reorder* and *prefer*, never to empty
+  // the set: an empty intersection falls back to every base, and bases
+  // whose cid is unparseable are kept as candidates because they are
+  // not evidence of a different episode.
+  const matching = bases.filter(
+    (b) => currentCid === null || (b.cid !== null && b.cid === currentCid),
+  );
+  let offerBases = matching.length > 0 ? matching : bases;
+  if (offerBases.length < 2) {
+    const unknown = bases.filter(
+      (b) => b.cid === null && !offerBases.includes(b),
     );
-  if (episodeBases.length >= 2) {
+    if (unknown.length > 0) offerBases = offerBases.concat(unknown);
+  }
+  offerBases = rankBases(offerBases);
+  if (offerBases.length >= 2) {
     candidates.push({
       kind: "pair",
-      urls: [episodeBases[0].url, episodeBases[1].url],
+      urls: [offerBases[0].url, offerBases[1].url],
     });
   }
 
@@ -664,10 +873,10 @@ function collectMedia() {
       }
     } else if (manifests.length > 0) {
       candidates.push({ kind: "manifest", urls: [manifests[0]] });
-    } else if (episodeBases.length === 1) {
+    } else if (offerBases.length === 1) {
       // A lone segment is a fragment, not a file — only surfaced when
       // the page gave us nothing better at all.
-      candidates.push({ kind: "segment", urls: [episodeBases[0].url] });
+      candidates.push({ kind: "segment", urls: [offerBases[0].url] });
     }
   }
 
@@ -679,13 +888,29 @@ function collectMedia() {
   const total = Object.values(sources).reduce((a, b) => a + b, 0);
   let note;
   if (urls.length === 0) {
-    note =
-      total === 0
-        ? "No media found in this page's DOM or network activity. Media " +
-          "loaded inside a cross-origin iframe or fetched by a service " +
-          "worker can't be seen from here."
-        : `Found ${total} media request(s) but none of them is a direct ` +
-          "file, stream pair, or manifest a download manager can use.";
+    if (total === 0 && unusablePlayers > 0 && blobPlayers > 0) {
+      // A player is there. Saying "no media" here is what made an
+      // actively playing MSE page look broken.
+      note =
+        `Found ${players} media element(s) on this page, but their source ` +
+        "is a blob: URL (MSE) and the underlying request is not observable " +
+        "from here yet — press play, let it buffer for a few seconds, then " +
+        "grab again.";
+    } else if (total === 0 && unusablePlayers > 0) {
+      note =
+        `Found ${players} media element(s) on this page, but none of them ` +
+        "resolved to a URL and no media request is observable from here — " +
+        "press play, let it buffer, then grab again.";
+    } else if (total === 0) {
+      note =
+        "No media found in this page's DOM or network activity. Media " +
+        "loaded inside a cross-origin iframe or fetched by a service " +
+        "worker can't be seen from here.";
+    } else {
+      note =
+        `Found ${total} media request(s) but none of them is a direct ` +
+        "file, stream pair, or manifest a download manager can use.";
+    }
   } else {
     const parts = [];
     if (candidates[0].kind === "pair") {
@@ -738,6 +963,17 @@ function collectMedia() {
     // silently un-paired such grabs.
     pair: candidates.length > 0 && candidates[0].kind === "pair",
     note,
+    // What the scan actually saw, so the popup can distinguish "this
+    // page has no media" from "it has media I could not name".
+    diag: {
+      frames: docs.length,
+      players,
+      blobPlayers,
+      unusablePlayers,
+      network: networkSeen,
+      hints: Array.isArray(hints) ? hints.length : 0,
+      sources,
+    },
     // Raw findings, newest-discovery first. Consumed by the play-info
     // enhancer below (observed-path matching) and stripped from the
     // payload before the reply is sent.
@@ -766,25 +1002,36 @@ function isPlayInfoUrl(name) {
   }
 }
 
+/**
+ * Read a page-defined global from the content script's isolated world.
+ *
+ * `window.__playinfo__` is set by the page's own script, so in Chrome's
+ * isolated world it is simply absent — the earlier code (and the
+ * harness, which loads both scripts into one context) assumed it was
+ * visible, which made this source silently dead on every real page.
+ * Firefox exposes page expando properties through `wrappedJSObject`;
+ * Chrome has no equivalent without a MAIN-world injection, so there
+ * the call returns null and the playurl replay below is the only path.
+ */
+function pageGlobal(name) {
+  try {
+    if (typeof window === "undefined" || !window) return null;
+    const w = window.wrappedJSObject || window;
+    return w[name] || null;
+  } catch (_e) {
+    return null;
+  }
+}
+
 function hasPlayInfoCandidate() {
   // The page's embedded initial play state counts too: bilibili defines
   // `window.__playinfo__` (the raw playurl payload) on every watch page,
-  // and unlike a resource-buffer entry it can never be dropped.
+  // and unlike a resource-buffer entry it can never be dropped. Only
+  // readable through `wrappedJSObject` (Firefox) — see `pageGlobal`.
+  if (pageGlobal("__playinfo__")) return true;
   try {
-    if (typeof window !== "undefined" && window.__playinfo__) return true;
-  } catch (_e) {
-    // Fall through.
-  }
-  if (
-    typeof performance === "undefined" ||
-    typeof performance.getEntriesByType !== "function"
-  ) {
-    return false;
-  }
-  try {
-    const entries = performance.getEntriesByType("resource");
-    for (let i = entries.length - 1; i >= 0; i--) {
-      const name = entries[i] && entries[i].name;
+    const names = resourceNames();
+    for (const name of names) {
       if (name && isPlayInfoUrl(name)) return true;
     }
   } catch (_e) {
@@ -802,9 +1049,9 @@ function hasPlayInfoCandidate() {
 function playInfoUrls() {
   const urls = [];
   try {
-    const entries = performance.getEntriesByType("resource");
-    for (let i = entries.length - 1; i >= 0; i--) {
-      const name = entries[i] && entries[i].name;
+    // `resourceNames` includes our own ring, so a playurl request that
+    // fell out of the browser's buffer is still re-playable.
+    for (const name of resourceNames()) {
       if (name && isPlayInfoUrl(name)) urls.push(name);
     }
   } catch (_e) {
@@ -872,13 +1119,8 @@ function streamUrls(entry) {
  */
 async function enhanceWithPlayInfo(base, ordered) {
   const sources = [];
-  try {
-    if (typeof window !== "undefined" && window.__playinfo__) {
-      sources.push(window.__playinfo__);
-    }
-  } catch (_e) {
-    // Cross-origin window access — ignore.
-  }
+  const embedded = pageGlobal("__playinfo__");
+  if (embedded) sources.push(embedded);
   for (const u of playInfoUrls().slice(0, 5)) sources.push(u);
 
   // The newest observed m4s names the playing episode's cid. (ordered is
@@ -1033,22 +1275,24 @@ if (_proto === "http:" || _proto === "https:") {
   }
   // Learn whether DM is reachable before the user's first click.
   refreshState();
-  // The resource-timing buffer holds ~250 entries by default — a long
-  // bilibili session blows past it and silently drops the newest media
-  // requests (this is why a grab late in a session can end up seeing
-  // only one of the two streams). Raise it early; entries dropped
-  // before the content script ran cannot be recovered, but the rest of
-  // the session stays observable.
-  try {
-    if (
-      typeof performance !== "undefined" &&
-      typeof performance.setResourceTimingBufferSize === "function"
-    ) {
-      performance.setResourceTimingBufferSize(1024);
-    }
-  } catch (_e) {
-    // Non-fatal; the grab works with whatever the buffer holds.
+}
+
+// Resource observation starts regardless of the page's protocol: the
+// content script is injected at `document_start` precisely so this runs
+// before the page's own load burst fills the browser's ~250-entry
+// buffer. `setResourceTimingBufferSize` only raises the cap — once full,
+// the browser stops recording *new* entries — so the observer mirrors
+// every entry into our ring and keeps the live buffer empty.
+startResourceObserver();
+try {
+  if (
+    typeof performance !== "undefined" &&
+    typeof performance.setResourceTimingBufferSize === "function"
+  ) {
+    performance.setResourceTimingBufferSize(1024);
   }
+} catch (_e) {
+  // Non-fatal; the grab works with whatever the buffer holds.
 }
 
 // Respond to explicit "collect" messages from the popup / background,
@@ -1075,7 +1319,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     const inTopFrame =
       typeof window === "undefined" || window.top === window;
     if (!inTopFrame) return;
-    const base = collectMedia();
+    // `hints` carries the background's `webRequest` log — the only
+    // source that sees media inside cross-origin iframes, MSE traffic
+    // with extensionless URLs, and requests the resource buffer already
+    // dropped. It is advisory: the curation below still decides.
+    const base = collectMedia(msg.hints);
     // When the page exposed its play-info API (bilibili) and fetch is
     // available, upgrade the heuristic result asynchronously: the API
     // names BOTH streams explicitly, which the finite resource buffer

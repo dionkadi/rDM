@@ -813,32 +813,317 @@ chrome.downloads.onCreated.addListener((item) => {
   void handleCreatedDownload(item);
 });
 
+// ─── Cross-frame media observation (webRequest) ──────────────────
+//
+// The content script can only see its own frame: `performance` is
+// per-window, a cross-origin player iframe exposes neither its DOM nor
+// its timeline, and MSE players hide the real stream behind `blob:`.
+// `webRequest` sees every request in every frame, which makes it the
+// one source that can answer "does this page have media?" for embed
+// players, extensionless CDN URLs (`/videoplayback?…`), and long
+// sessions whose resource buffer has already dropped the stream.
+//
+// What we keep is a small bounded log per tab, handed to the content
+// script as `hints` on grab. Nothing here decides what to download —
+// the content script's curation still does that; this only widens what
+// it can see.
+const STORAGE_KEY_MEDIA = "dmMediaLog";
+const MEDIA_LOG_MAX = 120;
+const MEDIA_HINT_MAX = 40;
+const MEDIA_LOG_TTL_MS = 30 * 60_000;
+const MEDIA_FLUSH_MS = 400;
+
+/// tabId → `[{ url, kind, frameId, at }]`, oldest first.
+const mediaLogByTab = new Map();
+let mediaFlushTimer = null;
+let mediaLoaded = false;
+
+/**
+ * `Content-Type` → candidate kind, or null when it is not something a
+ * download manager can take whole.
+ *
+ * `video/mp2t` is an HLS transport-stream *fragment*, and
+ * `application/octet-stream` is what a CDN returns when it has no idea
+ * — offering either as "the file" would be the old mistake of handing
+ * DM a piece of a stream.
+ */
+function mediaKindFromContentType(contentType) {
+  const type = String(contentType || "")
+    .split(";")[0]
+    .trim()
+    .toLowerCase();
+  if (!type) return null;
+  if (
+    type === "application/vnd.apple.mpegurl" ||
+    type === "application/x-mpegurl" ||
+    type === "audio/mpegurl" ||
+    type === "application/dash+xml"
+  ) {
+    return "manifest";
+  }
+  if (type === "video/mp2t" || type === "application/octet-stream") return null;
+  if (type.startsWith("video/") || type.startsWith("audio/")) return "file";
+  return null;
+}
+
+/** Fallback for responses that carry no usable Content-Type. */
+function mediaKindFromUrl(url) {
+  if (/\.(m3u8|mpd)(\?|#|$)/i.test(url)) return "manifest";
+  if (
+    /\.(mp4|m4v|webm|mkv|mov|flv|avi|m4a|mp3|wav|flac|aac|ogg|opus)(\?|#|$)/i.test(
+      url,
+    )
+  ) {
+    return "file";
+  }
+  return null;
+}
+
+function recordMediaRequest(details) {
+  if (!details || !details.url) return;
+  const tabId = details.tabId;
+  // tabId is -1 for requests that belong to no tab (service workers,
+  // other extensions); there is nothing to attach them to.
+  if (typeof tabId !== "number" || tabId < 0) return;
+  if (!/^https?:/i.test(details.url)) return;
+  if (details.type === "main_frame" || details.type === "sub_frame") return;
+
+  let contentType = null;
+  for (const header of details.responseHeaders || []) {
+    if (header && String(header.name).toLowerCase() === "content-type") {
+      contentType = header.value;
+    }
+  }
+  const kind =
+    mediaKindFromContentType(contentType) || mediaKindFromUrl(details.url);
+  if (!kind) return;
+
+  const now = Date.now();
+  const previous = mediaLogByTab.get(tabId) || [];
+  const list = previous.filter(
+    (entry) => now - entry.at <= MEDIA_LOG_TTL_MS && entry.url !== details.url,
+  );
+  list.push({
+    url: details.url,
+    kind,
+    frameId: typeof details.frameId === "number" ? details.frameId : 0,
+    at: now,
+  });
+  mediaLogByTab.set(tabId, list.slice(-MEDIA_LOG_MAX));
+  scheduleMediaFlush();
+}
+
+function mediaSessionArea() {
+  try {
+    return (chrome.storage && chrome.storage.session) || null;
+  } catch (_e) {
+    return null;
+  }
+}
+
+function scheduleMediaFlush() {
+  if (mediaFlushTimer != null) return;
+  // The log must outlive the MV3 service worker, or the whole point is
+  // lost: the popup wakes a fresh worker *after* the media was played.
+  // `storage.session` is per-browser-session and in memory, which is
+  // exactly the lifetime we want. Writes are debounced — a video
+  // produces hundreds of segment requests.
+  mediaFlushTimer = setTimeout(() => {
+    mediaFlushTimer = null;
+    const area = mediaSessionArea();
+    if (!area) return;
+    const payload = {};
+    for (const [tabId, list] of mediaLogByTab) payload[String(tabId)] = list;
+    try {
+      area.set({ [STORAGE_KEY_MEDIA]: payload }, () => {
+        void chrome.runtime.lastError;
+      });
+    } catch (_e) {
+      // Storage unavailable: the in-memory log still serves this
+      // worker's lifetime.
+    }
+  }, MEDIA_FLUSH_MS);
+}
+
+/**
+ * Read one key from a storage area whether the browser returns a
+ * Promise or only answers the callback (Chrome/Firefox differ, and a
+ * missed value must not throw away the stored log).
+ */
+function readStorageKey(area, key) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    try {
+      const returned = area.get(key, (value) => {
+        void chrome.runtime.lastError;
+        finish(value);
+      });
+      if (returned && typeof returned.then === "function") {
+        returned.then(finish, () => finish(null));
+      }
+    } catch (_e) {
+      finish(null);
+    }
+  });
+}
+
+/** Restore the log a previous worker instance persisted. */
+async function hydrateMediaLog() {
+  if (mediaLoaded) return;
+  mediaLoaded = true;
+  const area = mediaSessionArea();
+  if (!area) return;
+  try {
+    const stored = await readStorageKey(area, STORAGE_KEY_MEDIA);
+    const data = stored && stored[STORAGE_KEY_MEDIA];
+    if (!data || typeof data !== "object") return;
+    const now = Date.now();
+    for (const [key, list] of Object.entries(data)) {
+      const tabId = Number(key);
+      if (!Number.isFinite(tabId) || !Array.isArray(list)) continue;
+      const existing = mediaLogByTab.get(tabId) || [];
+      const seen = new Set(existing.map((entry) => entry.url));
+      const extra = list.filter(
+        (entry) =>
+          entry &&
+          typeof entry.url === "string" &&
+          !seen.has(entry.url) &&
+          now - (entry.at || 0) <= MEDIA_LOG_TTL_MS,
+      );
+      if (extra.length === 0) continue;
+      // Persisted entries are older: keep them at the front so the
+      // list stays oldest-first, which `mediaHints` relies on.
+      mediaLogByTab.set(tabId, extra.concat(existing).slice(-MEDIA_LOG_MAX));
+    }
+  } catch (_e) {
+    // No persisted log: start with what this worker has seen.
+  }
+}
+
+/** Newest-first hints for one tab, capped so the message stays small. */
+function mediaHints(tabId) {
+  const list = mediaLogByTab.get(tabId) || [];
+  const out = [];
+  const seen = new Set();
+  for (let i = list.length - 1; i >= 0 && out.length < MEDIA_HINT_MAX; i--) {
+    const entry = list[i];
+    if (!entry || !entry.url || seen.has(entry.url)) continue;
+    seen.add(entry.url);
+    out.push({ url: entry.url, kind: entry.kind });
+  }
+  return out;
+}
+
+try {
+  if (chrome.webRequest && chrome.webRequest.onHeadersReceived) {
+    chrome.webRequest.onHeadersReceived.addListener(
+      (details) => {
+        try {
+          recordMediaRequest(details);
+        } catch (_e) {
+          // A throw in a webRequest listener is swallowed by the
+          // browser anyway; keep it local so one bad entry can't stop
+          // the rest of the log.
+        }
+      },
+      { urls: ["<all_urls>"], types: ["media", "xmlhttprequest", "other"] },
+      ["responseHeaders"],
+    );
+  }
+} catch (_e) {
+  // Permission denied / API missing: hints stay empty and the grab
+  // degrades to the content script's own view.
+}
+
+try {
+  if (chrome.tabs.onRemoved) {
+    chrome.tabs.onRemoved.addListener((tabId) => {
+      mediaLogByTab.delete(tabId);
+      scheduleMediaFlush();
+    });
+  }
+  if (chrome.tabs.onUpdated) {
+    chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+      // A navigation invalidates every URL we recorded for the tab.
+      if (changeInfo && (changeInfo.url || changeInfo.status === "loading")) {
+        mediaLogByTab.delete(tabId);
+        scheduleMediaFlush();
+      }
+    });
+  }
+} catch (_e) {
+  // Older browser without these events: stale entries expire by TTL.
+}
+
 // ─── Messaging ──────────────────────────────────────────────────
 
 /**
  * The popup's "Grab page media" button. Answers with what actually
  * happened — the popup used to hardcode success and print
  * "✓ Native host connected" no matter what.
+ *
+ * Every empty result carries a `note` and a machine-readable `reason`.
+ * The note used to be dropped on exactly this path, so "the page has a
+ * player I could not name", "the content script isn't running" and
+ * "there is genuinely nothing here" all rendered as the same
+ * `no media found on this page`.
  */
-function handleGrab(tabId, sendResponse) {
+async function handleGrab(tabId, sendResponse) {
   if (tabId == null) {
-    sendResponse({ ok: false, error: "no active tab", delivered: false });
+    sendResponse({
+      ok: false,
+      reason: "no_active_tab",
+      error: "no active tab",
+      delivered: false,
+    });
     return;
   }
+  // The service worker may have been restarted since the media played.
+  await hydrateMediaLog();
+  const hints = mediaHints(tabId);
+
+  const noContentScript = () =>
+    sendResponse({
+      ok: true,
+      urls: 0,
+      delivered: false,
+      reason: "no_content_script",
+      error: "the page script is not running in this tab",
+      note: hints.length
+        ? `DM saw ${hints.length} media request(s) from this tab, but the ` +
+          "page script is not running — reload the tab and grab again."
+        : "The page script is not running in this tab. Reload the tab " +
+          "after installing or updating DM Grabber, then grab again.",
+      observed: hints.length,
+    });
+
   try {
-    chrome.tabs.sendMessage(tabId, { type: "collect" }, (res) => {
+    chrome.tabs.sendMessage(tabId, { type: "collect", hints }, (res) => {
       const err = chrome.runtime.lastError;
       if (err) {
-        sendResponse({ ok: false, error: err.message, delivered: false });
+        noContentScript();
         return;
       }
       const urls = (res && res.urls) || [];
       if (!urls.length) {
+        const diag = (res && res.diag) || null;
+        let reason = "no_media_observed";
+        if (diag && diag.players > 0) reason = "player_without_url";
+        else if (hints.length > 0) reason = "filtered_out";
         sendResponse({
           ok: true,
           urls: 0,
           delivered: false,
+          reason,
           error: "no media found on this page",
+          note: (res && res.note) || null,
+          diag,
+          observed: hints.length,
         });
         return;
       }
@@ -851,6 +1136,10 @@ function handleGrab(tabId, sendResponse) {
         // Page metadata (title / date / uploader) for a meaningful
         // merged filename and container tags.
         meta: (res && res.meta) || null,
+        // Pairing intent. Without this the native host always reads
+        // `pair: false`, so a video+audio grab whose halves live on
+        // different CDN hosts arrives as two unrelated downloads.
+        pair: !!(res && res.pair),
       });
       sendResponse({
         ok: true,
@@ -861,11 +1150,15 @@ function handleGrab(tabId, sendResponse) {
         // it found none) — without it a grab that legitimately finds
         // nothing is indistinguishable from a broken button.
         note: (res && res.note) || null,
+        diag: (res && res.diag) || null,
+        pair: !!(res && res.pair),
+        observed: hints.length,
       });
     });
   } catch (e) {
     sendResponse({
       ok: false,
+      reason: "grab_failed",
       error: String((e && e.message) || e),
       delivered: false,
     });
@@ -895,7 +1188,21 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         );
       return true; // async
     case "grab":
-      handleGrab(msg.tabId, sendResponse);
+      // `handleGrab` is async (it may hydrate the media log from
+      // `storage.session` first). Never let a rejection leave the
+      // popup's button spinning with no answer.
+      handleGrab(msg.tabId, sendResponse).catch((e) => {
+        try {
+          sendResponse({
+            ok: false,
+            reason: "grab_failed",
+            error: String((e && e.message) || e),
+            delivered: false,
+          });
+        } catch (_e) {
+          // The message channel is already gone.
+        }
+      });
       return true; // async
     case "download-click": {
       // **Primary takeover path.** The content script has already
