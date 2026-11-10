@@ -9,6 +9,130 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > ship breaking changes between minor versions. Once we hit 1.0.0 we
 > commit to the SemVer stability guarantees.
 
+## [0.6.0] - 2026-11-10
+
+### Added — HLS grabs now download the video instead of the playlist
+
+- **A grabbed `.m3u8` used to save ~300 bytes of text.** The URL names a
+  table of contents, and the engine downloaded it verbatim: a row said
+  "Completed" and the file opened as `#EXTM3U … segment_000.ts`.
+  `crates/engine/src/hls.rs` now parses master and media playlists
+  (variants, `EXTINF`, `EXT-X-BYTERANGE` with implicit offsets,
+  `EXT-X-MAP`, `EXT-X-KEY`, `EXT-X-ENDLIST`), and
+  `task::run_hls_download` follows one master hop to the highest
+  bandwidth variant, then streams every segment into one file with the
+  same client, speed limiter, pause/cancel and progress events as the
+  chunk path.
+- **`.m3u8` is renamed `.ts` when the row is created** (`normalize_media`
+  in `manager.add()`, the Tauri `add_download` and startup resume), so
+  the playlist can never be the payload — including for rows persisted
+  before this release. With ffmpeg installed the concatenated `.ts` is
+  remuxed to `.mp4` (`aac_adtstoasc`, retried without it for non-AAC
+  audio) and the row follows the MP4; the `.ts` is kept as the source,
+  the same contract as the DASH pair merge. fMP4 playlists are named
+  `.mp4` from the start.
+- **AES-128 is decrypted.** Keys are parsed per segment (they can rotate
+  mid-playlist), fetched once per URI with the download's headers/auth,
+  and the IV is the `IV=` attribute or the media sequence number
+  (RFC 8216 §5.2). Encrypted segments are buffered (≤128 MiB) and
+  decrypted with `aes`/`cbc` + PKCS#7; clear segments still stream
+  straight to disk.
+- **Per-segment retry and resume.** Each segment is retried with
+  backoff (500 ms / 1.5 s / 4 s), a stalled segment is abandoned after
+  5 minutes, and progress is tracked per segment in a
+  `<save>.part.hls.json` sidecar — a paused or killed download continues
+  at the next segment instead of re-downloading from zero, as long as
+  the playlist URL, first segment and segment count still match.
+- **Refused with a reason instead of producing a broken file:** live
+  playlists (no `EXT-X-ENDLIST`, an endless stream), SAMPLE-AES and
+  other DRM methods, an encrypted fMP4 init section, and masters that
+  keep audio in a separate rendition (the variant is video-only).
+
+### Fixed — "no media found on this page" while the video was playing
+
+- **The grab judged the top frame's resource buffer, not the page.**
+  Four independent gaps all produced that one sentence:
+  - **Cross-origin player iframes were invisible.** The content script
+    only sees its own frame (`performance` is per-window) and
+    `all_frames` is off. `background.js` now runs an observational
+    `chrome.webRequest.onHeadersReceived` listener, classifies responses
+    by `Content-Type` (which is how extensionless `/videoplayback?…`
+    streams are recognised at all) and keeps a bounded per-tab log in
+    `chrome.storage.session` — it has to survive the service worker,
+    because the popup wakes a fresh one *after* the media played.
+  - **A relative `<video src="/v/clip.mp4">` was rejected** for not
+    matching `^https?:`, which is why such pages only worked after you
+    pressed play (when `currentSrc` finally had a value). URLs are now
+    resolved against the document base; `<source>` and `preload="none"`
+    players work without starting playback.
+  - **Once the resource-timing buffer filled, the browser stopped
+    recording new entries** (it keeps the oldest), so a long video lost
+    exactly the requests made while watching. The content script now
+    runs at `document_start`, mirrors entries into its own 400-entry
+    ring via `PerformanceObserver`, and clears the live buffer.
+  - **Curation could empty the candidate set:** `dominantCid()` voted on
+    the raw buffer, so a cid with no surviving base filtered every real
+    base out. The vote is restricted to held bases, an empty
+    intersection falls back to all of them, and bases whose cid cannot
+    be parsed are kept.
+- **Empty results are now diagnostics.** The content script returns
+  `diag` (frames, players, blob players, network/hint counts) and a
+  `note`; the background forwards both plus a `reason`
+  (`no_content_script` / `player_without_url` / `filtered_out` /
+  `no_media_observed`). An MSE player now says "source is a `blob:` URL —
+  press play and grab again" instead of "no media", and the note is no
+  longer dropped on the empty path.
+- **`pair` is forwarded to the native host.** It was computed by the
+  content script and dropped by `handleGrab`, so the host always read
+  `pair: false` and a cross-CDN video+audio grab arrived as two
+  unrelated downloads.
+- **`window.__playinfo__` is read through `wrappedJSObject`.** The page
+  global is invisible from Chrome's isolated world; the old code (and
+  the test harness, which loads both scripts into one context) assumed
+  otherwise, so that bilibili source was dead on every real page.
+
+### Fixed — a finished download could come back as a stuck "Queued" row
+
+- **`Storage::load_active` compared a JSON column against bare words.**
+  `save_download` writes `serde_json::to_string(&status)` — `"completed"`,
+  quotes included — while the SQL filtered
+  `NOT IN ('completed','canceled')`, which never matched. Every finished
+  row therefore loaded as "active", `start()` set it to `Queued`, and
+  because the spawn gate is computed from the *stored* status it never
+  started: a permanently stuck row after any restart. Both values now
+  come from the same serializer; `Storage::load_download(id)` reads a
+  row regardless of status.
+
+### Changed
+
+- The extension asks for **`webRequest`** (observational only — never
+  `webRequestBlocking`, which Chrome restricts to policy installs) and
+  injects its content script at **`document_start`**. Both are pinned by
+  `test/manifest.test.mjs`, which derives the required permission set
+  from the source in either direction.
+- The grab note for a manifest now distinguishes HLS ("DM downloads its
+  segments and remuxes them into one file") from DASH ("the manifest
+  file itself", still unsupported).
+
+### Tests
+
+- Extension: **104** tests, including a new `media-detection.test.mjs`
+  that pins relative `src`, blob-only players, typed hints, same-origin
+  iframe timelines, buffer eviction, cid grouping and note/reason
+  passthrough; **24/24** mutations caught.
+- Engine: **82** lib tests (playlist parser, key rotation, sequence
+  IVs, decrypt roundtrip, resume validation), **7** HLS integration
+  tests (master → 1080p, AES-128 plaintext, live/SAMPLE-AES refusal,
+  120 clear + 60 encrypted segments in order, real-ffmpeg remux) and
+  **12** integration tests — the crash-recovery test now seeds the
+  crashed state instead of racing its own background task, and the
+  cancel test is speed-capped so it can actually cancel.
+- `examples/hls_bench.rs` (`cargo run --release --example hls_bench`)
+  measures clear / AES-128 / many-small and verifies the output hash on
+  every run. Loopback, release: 150 MiB clear in 1.85 s (81 MB/s,
+  162 req/s), 75 MiB AES-128 in 1.77 s (42 MB/s, 169 req/s — decryption
+  is not the bottleneck), 2000 × 8 KiB at 657 req/s.
+
 ## [0.5.0] - 2026-09-26
 
 ### Fixed — completed task turning "Queued at 0 %" after a restart
