@@ -10,6 +10,7 @@ use dm_engine::manager::DownloadManager;
 use dm_engine::model::{Download, DownloadStatus};
 use dm_engine::storage::Storage;
 
+use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -70,11 +71,33 @@ fn serve(assets: HashMap<String, Asset>) -> u16 {
     port
 }
 
-fn playlist(body: &str) -> Asset {
+fn playlist(body: impl AsRef<str>) -> Asset {
     Asset {
         content_type: "application/vnd.apple.mpegurl",
-        body: body.as_bytes().to_vec(),
+        body: body.as_ref().as_bytes().to_vec(),
     }
+}
+
+type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
+
+/// AES-128-CBC + PKCS#7, the way an HLS packager encrypts segments.
+fn encrypt(plain: &[u8], key: &[u8; 16], iv: [u8; 16]) -> Vec<u8> {
+    let mut buf = vec![0u8; plain.len() + 16];
+    buf[..plain.len()].copy_from_slice(plain);
+    let encryptor = Aes128CbcEnc::new_from_slices(key, &iv).expect("key/iv");
+    let written = encryptor
+        .encrypt_padded_mut::<Pkcs7>(&mut buf, plain.len())
+        .expect("encrypt")
+        .len();
+    buf.truncate(written);
+    buf
+}
+
+/// `EXT-X-KEY` without an `IV` uses the media sequence number.
+fn sequence_iv(sequence: u64) -> [u8; 16] {
+    let mut iv = [0u8; 16];
+    iv[8..].copy_from_slice(&sequence.to_be_bytes());
+    iv
 }
 
 fn segment(body: Vec<u8>) -> Asset {
@@ -209,19 +232,36 @@ async fn a_live_playlist_is_refused_with_a_reason() {
 }
 
 #[tokio::test]
-async fn an_encrypted_playlist_fails_loudly_instead_of_writing_ciphertext() {
+async fn aes_128_segments_are_decrypted_before_they_are_written() {
+    let key = [0x42u8; 16];
+    let plain_a = b"first clear segment".to_vec();
+    let plain_b = b"second clear segment, a bit longer".to_vec();
+    let cipher_a = encrypt(&plain_a, &key, sequence_iv(0));
+    let cipher_b = encrypt(&plain_b, &key, sequence_iv(1));
+
     let mut assets = HashMap::new();
     assets.insert(
         "/enc.m3u8".to_string(),
         playlist(
             "#EXTM3U\n\
+             #EXT-X-MEDIA-SEQUENCE:0\n\
              #EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n\
              #EXTINF:6,\n\
              a.ts\n\
+             #EXTINF:6,\n\
+             b.ts\n\
              #EXT-X-ENDLIST\n",
         ),
     );
-    assets.insert("/a.ts".into(), segment(b"ciphertext".to_vec()));
+    assets.insert(
+        "/key.bin".to_string(),
+        Asset {
+            content_type: "application/octet-stream",
+            body: key.to_vec(),
+        },
+    );
+    assets.insert("/a.ts".into(), segment(cipher_a.clone()));
+    assets.insert("/b.ts".into(), segment(cipher_b.clone()));
     let port = serve(assets);
 
     let dir = tempfile::tempdir().unwrap();
@@ -233,11 +273,143 @@ async fn an_encrypted_playlist_fails_loudly_instead_of_writing_ciphertext() {
         "enc.m3u8",
     );
 
+    let done = wait_done(&mgr, &id, Duration::from_secs(30)).await;
+    assert_eq!(done.status, DownloadStatus::Completed, "{:?}", done.error);
+
+    let written = std::fs::read(dir.path().join("enc.ts")).expect("output");
+    assert_eq!(
+        written,
+        concat(&[plain_a, plain_b]),
+        "segments must be decrypted, not concatenated as ciphertext"
+    );
+    assert_ne!(
+        written,
+        concat(&[cipher_a, cipher_b]),
+        "the ciphertext must never reach the output file"
+    );
+}
+
+#[tokio::test]
+async fn a_sample_aes_playlist_is_refused_before_any_segment_is_fetched() {
+    let mut assets = HashMap::new();
+    assets.insert(
+        "/skd.m3u8".to_string(),
+        playlist(
+            "#EXTM3U\n\
+             #EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"skd://key\"\n\
+             #EXTINF:6,\n\
+             a.ts\n\
+             #EXT-X-ENDLIST\n",
+        ),
+    );
+    assets.insert("/a.ts".into(), segment(b"whatever".to_vec()));
+    let port = serve(assets);
+
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = DownloadManager::new(Storage::open_memory().unwrap());
+    let id = add(
+        &mgr,
+        dir.path(),
+        format!("http://127.0.0.1:{port}/skd.m3u8"),
+        "skd.m3u8",
+    );
+
     let done = wait_done(&mgr, &id, Duration::from_secs(10)).await;
     assert_eq!(done.status, DownloadStatus::Error);
     let error = done.error.unwrap_or_default();
-    assert!(error.contains("encrypted"), "{error}");
-    assert!(!dir.path().join("enc.ts").exists());
+    assert!(error.contains("SAMPLE-AES"), "{error}");
+    assert!(!dir.path().join("skd.ts").exists());
+}
+
+/// Deterministic body so 120 segments can be generated without keeping
+/// 2 MiB of fixtures in the source.
+fn pattern(index: usize, len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|j| (index.wrapping_mul(31).wrapping_add(j) % 251) as u8)
+        .collect()
+}
+
+/// Stress: many segments must come out in playlist order, byte for byte.
+/// This is the property a "throughput" number is meaningless without —
+/// a fast download that reorders or drops a segment is a corrupt file.
+#[tokio::test]
+async fn many_segments_are_concatenated_in_order() {
+    const N: usize = 120;
+    const SEG: usize = 16 * 1024;
+    let mut assets = HashMap::new();
+    let mut playlist_text = String::from("#EXTM3U\n#EXT-X-TARGETDURATION:4\n");
+    let mut expected = Vec::new();
+    for i in 0..N {
+        let body = pattern(i, SEG);
+        playlist_text.push_str(&format!("#EXTINF:4,\nseg_{i}.ts\n"));
+        assets.insert(format!("/seg_{i}.ts"), segment(body.clone()));
+        expected.extend_from_slice(&body);
+    }
+    playlist_text.push_str("#EXT-X-ENDLIST\n");
+    assets.insert("/index.m3u8".to_string(), playlist(playlist_text));
+
+    let port = serve(assets);
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = DownloadManager::new(Storage::open_memory().unwrap());
+    let id = add(
+        &mgr,
+        dir.path(),
+        format!("http://127.0.0.1:{port}/index.m3u8"),
+        "many.m3u8",
+    );
+
+    let done = wait_done(&mgr, &id, Duration::from_secs(60)).await;
+    assert_eq!(done.status, DownloadStatus::Completed, "{:?}", done.error);
+    let written = std::fs::read(dir.path().join("many.ts")).expect("output");
+    assert_eq!(written.len(), expected.len());
+    assert_eq!(written, expected, "segments were reordered or dropped");
+}
+
+/// The same shape with AES-128 segments: decryption must not disturb the
+/// order or the padding of the final segment.
+#[tokio::test]
+async fn many_encrypted_segments_are_decrypted_in_order() {
+    const N: usize = 60;
+    const SEG: usize = 8 * 1024;
+    let key = [0x11u8; 16];
+    let mut assets = HashMap::new();
+    let mut playlist_text = String::from(
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n",
+    );
+    let mut expected = Vec::new();
+    for i in 0..N {
+        let plain = pattern(i, SEG);
+        playlist_text.push_str(&format!("#EXTINF:4,\nseg_{i}.ts\n"));
+        assets.insert(
+            format!("/seg_{i}.ts"),
+            segment(encrypt(&plain, &key, sequence_iv(i as u64))),
+        );
+        expected.extend_from_slice(&plain);
+    }
+    playlist_text.push_str("#EXT-X-ENDLIST\n");
+    assets.insert("/index.m3u8".to_string(), playlist(playlist_text));
+    assets.insert(
+        "/key.bin".to_string(),
+        Asset {
+            content_type: "application/octet-stream",
+            body: key.to_vec(),
+        },
+    );
+
+    let port = serve(assets);
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = DownloadManager::new(Storage::open_memory().unwrap());
+    let id = add(
+        &mgr,
+        dir.path(),
+        format!("http://127.0.0.1:{port}/index.m3u8"),
+        "encmany.m3u8",
+    );
+
+    let done = wait_done(&mgr, &id, Duration::from_secs(60)).await;
+    assert_eq!(done.status, DownloadStatus::Completed, "{:?}", done.error);
+    let written = std::fs::read(dir.path().join("encmany.ts")).expect("output");
+    assert_eq!(written, expected, "decryption must preserve plaintext order");
 }
 
 /// Real-MPEG-TS variant: exercises the remux step, so it only runs

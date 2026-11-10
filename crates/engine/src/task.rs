@@ -7,9 +7,10 @@ use crate::limiter::CombinedLimiter;
 use crate::manager::{DownloadEvent, RunContext};
 use crate::model::{AuthSpec, ChunkState, Download, DownloadStatus, MediaKind};
 use crate::protocol::{build_plan, plan_chunks};
+use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::SeekFrom;
 use std::path::Path;
 use std::process::Stdio;
@@ -18,6 +19,8 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
+
+type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
 
 /// Shared mutable state for one download.
 pub struct TaskState {
@@ -758,26 +761,7 @@ async fn hls_copy_into(
         .send()
         .await
         .map_err(|e| SegmentError::Retry(format!("{e}")))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let message = format!("HTTP {status} for {url}");
-        let retryable = status.is_server_error()
-            || status.as_u16() == 408
-            || status.as_u16() == 429;
-        return Err(if retryable {
-            SegmentError::Retry(message)
-        } else {
-            SegmentError::Fatal(message)
-        });
-    }
-    // A 200 answers a ranged request with the *whole* file: appending it
-    // would splice the wrong bytes into the output.
-    if range.is_some() && status.as_u16() != 206 {
-        return Err(SegmentError::Fatal(format!(
-            "the server ignored the byte range (HTTP {status}); this playlist's \
-             segments are slices of one file"
-        )));
-    }
+    hls_check_status(resp.status(), url, range.is_some())?;
 
     let mut stream = resp.bytes_stream();
     let mut written = 0u64;
@@ -819,6 +803,205 @@ async fn hls_copy_segment(
             "no data for {}s",
             CHUNK_STALL_SECS
         ))),
+    }
+}
+
+/// A single segment larger than this is refused rather than buffered.
+/// AES-128 decryption needs the whole ciphertext in memory, and an HLS
+/// segment is a few seconds of media (single-digit MB), so a larger one
+/// means the playlist is not what it claims.
+const HLS_MAX_SEGMENT_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Shared status handling for segment / key requests.
+fn hls_check_status(
+    status: reqwest::StatusCode,
+    url: &str,
+    ranged: bool,
+) -> Result<(), SegmentError> {
+    if !status.is_success() {
+        let message = format!("HTTP {status} for {url}");
+        let retryable = status.is_server_error()
+            || status.as_u16() == 408
+            || status.as_u16() == 429;
+        return Err(if retryable {
+            SegmentError::Retry(message)
+        } else {
+            SegmentError::Fatal(message)
+        });
+    }
+    // A 200 answers a ranged request with the *whole* file: appending it
+    // would splice the wrong bytes into the output.
+    if ranged && status.as_u16() != 206 {
+        return Err(SegmentError::Fatal(format!(
+            "the server ignored the byte range (HTTP {status}); this playlist's \
+             segments are slices of one file"
+        )));
+    }
+    Ok(())
+}
+
+/// Fetch one segment into memory. Only used when the bytes need
+/// decrypting — the clear path streams straight to disk.
+async fn hls_fetch_bytes(
+    client: &reqwest::Client,
+    url: &str,
+    range: Option<(u64, u64)>,
+    headers: &BTreeMap<String, String>,
+    auth: Option<&AuthSpec>,
+    limiter: &CombinedLimiter,
+    control: &SharedControl,
+) -> Result<Vec<u8>, SegmentError> {
+    let mut req = hls_request(client, url, headers, auth);
+    if let Some((length, offset)) = range {
+        req = req.header(
+            reqwest::header::RANGE,
+            format!(
+                "bytes={}-{}",
+                offset,
+                offset.saturating_add(length).saturating_sub(1)
+            ),
+        );
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| SegmentError::Retry(format!("{e}")))?;
+    hls_check_status(resp.status(), url, range.is_some())?;
+
+    let mut out = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        if control.is_canceled() {
+            return Err(SegmentError::Canceled);
+        }
+        let bytes = chunk.map_err(|e| SegmentError::Retry(format!("{e}")))?;
+        limiter.acquire(bytes.len() as u64).await;
+        if out.len() as u64 + bytes.len() as u64 > HLS_MAX_SEGMENT_BYTES {
+            return Err(SegmentError::Fatal(format!(
+                "an encrypted segment exceeded {} MiB; refusing to buffer it",
+                HLS_MAX_SEGMENT_BYTES / (1024 * 1024)
+            )));
+        }
+        out.extend_from_slice(&bytes);
+    }
+    Ok(out)
+}
+
+/// Fetch the AES-128 key. Sixteen bytes is the only valid length.
+async fn hls_fetch_key(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &BTreeMap<String, String>,
+    auth: Option<&AuthSpec>,
+) -> Result<[u8; 16], String> {
+    let resp = hls_request(client, url, headers, auth)
+        .send()
+        .await
+        .map_err(|e| format!("could not fetch the key: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("the key URL returned HTTP {status}"));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("could not read the key: {e}"))?;
+    if bytes.len() != 16 {
+        return Err(format!(
+            "the AES-128 key is {} bytes, expected 16",
+            bytes.len()
+        ));
+    }
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&bytes);
+    Ok(key)
+}
+
+/// The IV for one AES-128 segment: the `IV=` attribute when present,
+/// otherwise the media sequence number in a 16-byte big-endian block
+/// (RFC 8216 §5.2).
+fn hls_iv(key: &crate::hls::Key, sequence: u64) -> Result<[u8; 16], String> {
+    let mut iv = [0u8; 16];
+    match &key.iv {
+        Some(raw) => {
+            let hex = raw.trim().trim_start_matches("0x").trim_start_matches("0X");
+            if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(format!("unsupported AES-128 IV {raw:?}"));
+            }
+            for (i, byte) in iv.iter_mut().enumerate() {
+                *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+                    .map_err(|_| format!("unsupported AES-128 IV {raw:?}"))?;
+            }
+        }
+        None => iv[8..].copy_from_slice(&sequence.to_be_bytes()),
+    }
+    Ok(iv)
+}
+
+/// AES-128-CBC decrypt in place, PKCS#7 unpadded.
+fn aes128_cbc_decrypt(data: &mut Vec<u8>, key: &[u8; 16], iv: &[u8; 16]) -> Result<(), String> {
+    if data.is_empty() || data.len() % 16 != 0 {
+        return Err(format!(
+            "encrypted segment is {} bytes, not a positive multiple of the AES block size",
+            data.len()
+        ));
+    }
+    let plain_len = {
+        let decryptor = Aes128CbcDec::new_from_slices(key, iv)
+            .map_err(|_| "invalid AES-128 key or IV length".to_string())?;
+        decryptor
+            .decrypt_padded_mut::<Pkcs7>(data.as_mut_slice())
+            .map_err(|_| "AES-128 padding is invalid — wrong key or IV".to_string())?
+            .len()
+    };
+    data.truncate(plain_len);
+    Ok(())
+}
+
+/// Write one segment: streamed for clear media, buffered + decrypted
+/// for AES-128.
+#[allow(clippy::too_many_arguments)]
+async fn hls_write_segment(
+    client: &reqwest::Client,
+    segment: &crate::hls::Segment,
+    crypto: Option<([u8; 16], [u8; 16])>,
+    headers: &BTreeMap<String, String>,
+    auth: Option<&AuthSpec>,
+    limiter: &CombinedLimiter,
+    control: &SharedControl,
+    file: &mut tokio::fs::File,
+) -> Result<u64, SegmentError> {
+    match crypto {
+        None => {
+            hls_copy_segment(
+                client,
+                &segment.uri,
+                segment.range,
+                headers,
+                auth,
+                limiter,
+                control,
+                file,
+            )
+            .await
+        }
+        Some((key, iv)) => {
+            let mut data = hls_fetch_bytes(
+                client,
+                &segment.uri,
+                segment.range,
+                headers,
+                auth,
+                limiter,
+                control,
+            )
+            .await?;
+            aes128_cbc_decrypt(&mut data, &key, &iv).map_err(SegmentError::Fatal)?;
+            file.write_all(&data)
+                .await
+                .map_err(|e| SegmentError::Fatal(format!("could not write the file: {e}")))?;
+            Ok(data.len() as u64)
+        }
     }
 }
 
@@ -955,25 +1138,64 @@ async fn run_hls_download(
                 .into(),
         );
     }
-    if media.encrypted() {
-        let method = media
-            .key
-            .as_ref()
-            .map(|k| k.method.clone())
-            .unwrap_or_default();
+    if let Some(method) = media.unsupported_key_method() {
         return hls_fail(
             &ctx,
             &state,
             &id,
             format!(
-                "this HLS stream is encrypted ({method}); DM does not decrypt segments yet — \
-                 open the URL in a player that handles it, or install ffmpeg and download it \
-                 directly"
+                "this HLS stream uses {method} encryption; DM only decrypts AES-128 \
+                 (and clear) segments — writing the ciphertext as media would produce a \
+                 corrupt file"
             ),
         );
     }
 
-    // ---- 2. Output naming + resume point ----
+    if media.init_encrypted {
+        return hls_fail(
+            &ctx,
+            &state,
+            &id,
+            "the fMP4 init section of this playlist is encrypted (#EXT-X-KEY before \
+             #EXT-X-MAP); DM cannot decrypt it, and a ciphertext init makes the whole \
+             file unplayable"
+                .into(),
+        );
+    }
+
+    // ---- 2. AES-128 keys (one fetch per key URI) ----
+    let mut keys: HashMap<String, [u8; 16]> = HashMap::new();
+    for segment in &media.segments {
+        let Some(key) = segment.key.as_ref() else {
+            continue;
+        };
+        let Some(uri) = key.uri.as_deref() else {
+            return hls_fail(
+                &ctx,
+                &state,
+                &id,
+                "an AES-128 segment has no key URI in the playlist".into(),
+            );
+        };
+        if keys.contains_key(uri) {
+            continue;
+        }
+        match hls_fetch_key(&client, uri, &headers, auth.as_ref()).await {
+            Ok(bytes) => {
+                keys.insert(uri.to_string(), bytes);
+            }
+            Err(e) => {
+                return hls_fail(
+                    &ctx,
+                    &state,
+                    &id,
+                    format!("could not fetch the AES-128 key {uri}: {e}"),
+                )
+            }
+        }
+    }
+
+    // ---- 3. Output naming + resume point ----
     // fMP4 playlists (`#EXT-X-MAP`) concatenate into a valid MP4; TS
     // playlists stay `.ts` until the optional remux.
     let container = if media.init.is_some() { "mp4" } else { "ts" };
@@ -1085,7 +1307,7 @@ async fn run_hls_download(
         }
     }
 
-    // ---- 3. Segments ----
+    // ---- 4. Segments ----
     let mut media_done: f64 = media
         .segments
         .iter()
@@ -1098,6 +1320,33 @@ async fn run_hls_download(
         if control.wait_while_paused().await {
             return hls_canceled(&ctx, &state, &id);
         }
+        // Resolve this segment's key before the retry loop: a key
+        // failure is not something a retry of the segment changes.
+        let crypto = match segment.key.as_ref() {
+            None => None,
+            Some(key) => {
+                let Some(uri) = key.uri.as_deref() else {
+                    return hls_fail(
+                        &ctx,
+                        &state,
+                        &id,
+                        "an AES-128 segment has no key URI in the playlist".into(),
+                    );
+                };
+                let Some(bytes) = keys.get(uri).copied() else {
+                    return hls_fail(
+                        &ctx,
+                        &state,
+                        &id,
+                        format!("the AES-128 key {uri} was not fetched"),
+                    );
+                };
+                match hls_iv(key, segment.sequence) {
+                    Ok(iv) => Some((bytes, iv)),
+                    Err(e) => return hls_fail(&ctx, &state, &id, e),
+                }
+            }
+        };
         let boundary = downloaded;
         let mut attempt: usize = 0;
         loop {
@@ -1128,10 +1377,10 @@ async fn run_hls_download(
                     );
                 }
             }
-            match hls_copy_segment(
+            match hls_write_segment(
                 &client,
-                &segment.uri,
-                segment.range,
+                segment,
+                crypto,
                 &headers,
                 auth.as_ref(),
                 &limiter,
@@ -1216,7 +1465,7 @@ async fn run_hls_download(
     }
     drop(file);
 
-    // ---- 4. Finalize ----
+    // ---- 5. Finalize ----
     if state.control.is_removed() {
         ctx.scheduler.release_download_state(&id);
         return;
@@ -1556,6 +1805,66 @@ mod tests {
             ),
             "a next index past the end is not a resume point"
         );
+    }
+
+    #[test]
+    fn aes_iv_defaults_to_the_media_sequence() {
+        let key = crate::hls::Key {
+            method: "AES-128".into(),
+            uri: None,
+            iv: None,
+        };
+        let iv = hls_iv(&key, 0x0102).expect("iv");
+        assert_eq!(&iv[..8], &[0u8; 8], "the sequence lives in the low 64 bits");
+        assert_eq!(&iv[8..], &[0, 0, 0, 0, 0, 0, 1, 2]);
+
+        let explicit = crate::hls::Key {
+            method: "AES-128".into(),
+            uri: None,
+            iv: Some("0x000102030405060708090A0B0C0D0E0F".into()),
+        };
+        assert_eq!(
+            hls_iv(&explicit, 9).expect("explicit iv"),
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
+
+        let malformed = crate::hls::Key {
+            method: "AES-128".into(),
+            uri: None,
+            iv: Some("0x12".into()),
+        };
+        assert!(hls_iv(&malformed, 0).is_err(), "short IVs must be reported");
+    }
+
+    #[test]
+    fn aes_decryption_roundtrips_and_rejects_non_block_data() {
+        use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+        type Enc = cbc::Encryptor<aes::Aes128>;
+
+        let key = [7u8; 16];
+        let iv = [0u8; 16];
+        let plain = b"a segment payload that is not block aligned".to_vec();
+
+        let mut buf = vec![0u8; plain.len() + 16];
+        buf[..plain.len()].copy_from_slice(&plain);
+        let encryptor = Enc::new_from_slices(&key, &iv).expect("key/iv");
+        let written = encryptor
+            .encrypt_padded_mut::<Pkcs7>(&mut buf, plain.len())
+            .expect("encrypt")
+            .len();
+        buf.truncate(written);
+
+        let mut decrypted = buf.clone();
+        aes128_cbc_decrypt(&mut decrypted, &key, &iv).expect("decrypt");
+        assert_eq!(decrypted, plain);
+
+        let mut ragged = vec![0u8; 17];
+        assert!(
+            aes128_cbc_decrypt(&mut ragged, &key, &iv).is_err(),
+            "ciphertext that is not a multiple of 16 cannot be AES-CBC"
+        );
+        let mut empty: Vec<u8> = Vec::new();
+        assert!(aes128_cbc_decrypt(&mut empty, &key, &iv).is_err());
     }
 
 }

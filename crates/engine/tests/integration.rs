@@ -10,6 +10,7 @@
 use dm_engine::manager::{DownloadEvent, DownloadManager};
 use dm_engine::model::{Download, DownloadStatus, Settings};
 use dm_engine::storage::Storage;
+use dm_engine::task::layout_for_resume;
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -414,9 +415,14 @@ async fn progress_persists_to_sqlite_mid_transfer() {
     // Re-open a fresh manager + storage over the same file and
     // confirm the row survived.
     let storage2 = Storage::open(&db_path).expect("reopen storage");
-    let active = storage2.load_active().expect("load_active");
-    assert_eq!(active.len(), 1, "expected 1 active row, got {active:?}");
-    let row = &active[0];
+    // Read by id, not via `load_active`: the transfer is allowed to have
+    // finished by now, and a completed row is (correctly) not "active".
+    // What this test checks is that the progress *was flushed*, whatever
+    // the final status is.
+    let row = storage2
+        .load_download("persist")
+        .expect("load_download")
+        .expect("the row must survive a restart");
     assert_eq!(row.id, "persist");
     assert!(
         row.downloaded > 0,
@@ -439,36 +445,51 @@ async fn progress_persists_to_sqlite_mid_transfer() {
     );
 }
 
-/// End-to-end crash-recovery: start a download, let it run a while,
-/// drop the manager (= power loss), build a new manager over the
-/// same on-disk file, and confirm the transfer finishes with the
-/// correct bytes.
+/// End-to-end crash recovery: a hard kill leaves a row that still says
+/// `downloading`, a chunk layout, and a `.part` holding some of the
+/// bytes. A fresh manager over the same DB must resume from there and
+/// finish with exactly the source bytes.
+///
+/// The crashed state is **seeded by hand** rather than produced by
+/// dropping a live manager. Dropping a manager does not stop its Tokio
+/// task, so the previous version of this test kept downloading in the
+/// background: on a fast loopback the row was often already `Completed`
+/// (or the old task was still writing the same `.part` as the new one)
+/// by the time the restart looked at it. Seeding is what makes the
+/// assertion about *resume*, not about who won a race.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resume_after_crash_finishes_with_correct_bytes() {
     let port = spawn_server(0, 1);
     let tmp_dir = tempfile::tempdir().expect("tempdir");
     let db_path = tmp_dir.path().join("dm.sqlite");
     let out_path = tmp_dir.path().join("out.bin");
+    let payload = large_payload();
+    let total = payload.len() as u64;
+    let already_have = 1024 * 1024u64;
 
+    let mut d = Download::new(format!("http://127.0.0.1:{port}/file.bin"));
+    d.id = "crash".into();
+    d.save_path = out_path.clone();
+    d.total_size = Some(total);
+    d.can_resume = true;
+    d.status = DownloadStatus::Downloading;
+    let mut chunks = layout_for_resume(total, 8);
+    assert!(chunks[0].end - chunks[0].start + 1 > already_have);
+    chunks[0].downloaded = already_have;
+    d.downloaded = already_have;
+    d.chunks = chunks;
+
+    // What the OS would have flushed before the power went out.
+    std::fs::write(d.part_path(), &payload[..already_have as usize]).expect("seed .part");
     {
         let storage = Storage::open(&db_path).expect("file storage");
-        let mgr = DownloadManager::with_settings(storage, Settings::default());
+        storage.save_download(&d).expect("seed row");
+    }
 
-        let mut d = Download::new(format!("http://127.0.0.1:{port}/file.bin"));
-        d.id = "crash".into();
-        d.save_path = out_path.clone();
-        let id = d.id.clone();
-        mgr.add(d);
-
-        // Wait until some bytes are on disk AND on SQLite.
-        let _ = wait_for_min_bytes(&mgr, &id, 32 * 1024).await;
-        // The transfer is still going — simulate a hard kill.
-    } // mgr + storage drop here
-
-    // Restart with a brand new manager on the same DB file.
     let storage = Storage::open(&db_path).expect("reopen storage");
     let mgr = DownloadManager::with_settings(storage, Settings::default());
     mgr.start().await;
+
     let d = wait_until_downloaded(&mgr, "crash").await;
     assert_eq!(
         d.status,
@@ -477,24 +498,31 @@ async fn resume_after_crash_finishes_with_correct_bytes() {
         d.status,
         d.error
     );
+    assert!(
+        d.downloaded >= already_have,
+        "progress was thrown away: {} < {already_have}",
+        d.downloaded
+    );
 
     let written = std::fs::read(&out_path).expect("output file exists");
     assert_eq!(
         written.len(),
-        large_payload().len(),
+        payload.len(),
         "resumed file length does not match server"
     );
-    assert_eq!(
-        written,
-        large_payload(),
-        "resumed file bytes do not match the source payload"
-    );
+    assert_eq!(written, payload, "resumed file bytes do not match the source payload");
 }
 
 /// Cancellation must persist whatever progress was made. The
 /// aggregator's final flush guarantees that even if the user hits
 /// Cancel the instant the transfer starts, the row records the
 /// partial work instead of snapping back to 0.
+///
+/// The download is speed-capped on purpose: at loopback speed the 64 MiB
+/// payload can finish between `wait_for_min_bytes` and `cancel()`, which
+/// made this test flaky — it asserted `Canceled` on a row that had
+/// legitimately completed first. The cap keeps the transfer alive long
+/// enough for the cancel to be the thing that ends it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancel_persists_partial_progress() {
     let port = spawn_server(0, 1);
@@ -508,37 +536,42 @@ async fn cancel_persists_partial_progress() {
     let mut d = Download::new(format!("http://127.0.0.1:{port}/file.bin"));
     d.id = "cancel".into();
     d.save_path = out_path.clone();
+    // 512 KiB/s against a 64 MiB payload: minutes of headroom.
+    d.speed_limit = Some(512 * 1024);
     let id = d.id.clone();
     mgr.add(d);
 
     let snap = wait_for_min_bytes(&mgr, &id, 32 * 1024).await;
+    assert_eq!(
+        snap.status,
+        DownloadStatus::Downloading,
+        "the speed cap should have kept the transfer running"
+    );
     let partial = snap.downloaded;
     mgr.cancel(&id);
+
+    // Wait for the task to finalize before reopening the database, or
+    // the assertion races the very flush it is meant to check.
+    let canceled = wait_until_downloaded(&mgr, &id).await;
+    assert_eq!(canceled.status, DownloadStatus::Canceled);
     drop(mgr);
 
     let storage2 = Storage::open(&db_path).expect("reopen storage");
     let row = storage2
-        .load_active()
-        .expect("load_active")
-        .into_iter()
-        .find(|d| d.id == "cancel")
+        .load_download("cancel")
+        .expect("load_download")
         .expect("cancel row should still exist (status = canceled)");
     assert_eq!(row.status, DownloadStatus::Canceled);
     // `>=`, not `==`. The guarantee is "no progress is lost", and the
     // value on disk is written from the *current* in-memory count when
-    // the task finalizes — which is why the row can legitimately hold
-    // more than the snapshot taken a moment earlier. Over loopback the
-    // transfer runs at GB/s, so between `wait_for_min_bytes` returning
-    // and `cancel()` landing, several megabytes routinely go by; an
-    // equality assertion against the earlier snapshot fails on exactly
-    // the fast machines where nothing is wrong. (Observed here: the
-    // snapshot said 1.1 MiB while the row held 16 MiB — i.e. the
-    // download had advanced, not lost anything.)
+    // the task finalizes — so the row can legitimately hold more than
+    // the snapshot taken a moment earlier. A value *below* the snapshot
+    // means work was rolled back, which is the bug this test guards.
     assert!(
         row.downloaded >= partial,
         "cancel must not discard progress: observed {partial} in-memory, \
          but only {} on disk — a value below the snapshot means work was \
-         rolled back, which is the bug this test guards",
+         rolled back",
         row.downloaded
     );
 }

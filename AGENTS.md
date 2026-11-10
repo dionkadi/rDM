@@ -346,14 +346,18 @@ A `.m3u8` URL is a **playlist**, not a file. Downloading it verbatim is the repo
 Scope is enforced, not guessed:
 
 * **Live** (no `#EXT-X-ENDLIST`) is refused with a reason — it is an endless stream, not a file.
-* **AES-128** (`#EXT-X-KEY` ≠ `NONE`) is refused — writing ciphertext to a `.ts` would be a corrupt "success".
+* **AES-128 is decrypted** (`#EXT-X-KEY`), per segment: keys are fetched once per URI, the IV is the `IV=` attribute or the media sequence number (RFC 8216 §5.2), and the payload is buffered (≤128 MiB), decrypted with `aes`/`cbc` + PKCS#7, then written. Keys can rotate mid-playlist, so the key lives on `Segment`, not the playlist.
+* **SAMPLE-AES** (and any other method) is refused — DM has no DRM story, and writing ciphertext to a `.ts` would be a corrupt "success".
+* **An encrypted fMP4 init section** (`#EXT-X-KEY` *before* `#EXT-X-MAP`) is refused; a clear init is written as-is.
 * **A master with a separate audio rendition** (`#EXT-X-MEDIA:TYPE=AUDIO` + `URI`) is refused — the variant is video-only, and a silent file is worse than an error.
 
 **Naming:** `Download::normalize_media()` runs in `DownloadManager::add()` and in the Tauri `add_download`, so every entry point agrees before the row is shown: `.m3u8` → `.ts`. fMP4 playlists (`#EXT-X-MAP`) are renamed to `.mp4` at download time, because concatenating init + fragments *is* an MP4. When ffmpeg is available the `.ts` is remuxed (`-c copy`, `aac_adtstoasc` first and a retry without it for non-AAC audio) and the row is retargeted to the `.mp4`; the `.ts` is kept as the source, same contract as the pair merge. No ffmpeg ⇒ a complete, playable `.ts` and a log line, never a failed download.
 
 **Resume is per segment**, not per byte: `Download.chunks` cannot express "the first 5 segments of this playlist", so a sidecar `<save_path>.part.hls.json` records `{url, first, count, next, bytes}` after every completed segment. It is only honoured when the playlist URL, the first segment URI and the segment count still match (an edited playlist must not splice), and it is discarded if it claims more bytes than the `.part` holds. Deleting the sidecar forces a clean re-download.
 
-Tests live in `tests/hls.rs`: a master+media server proves the concatenated bytes equal the segments (and never the playlist text, and that the 1080p variant won), live/encrypted are refused with their reasons, and a real ffmpeg-generated TS proves the remux + row retarget (skipped with a printed note when ffmpeg is absent).
+Tests live in `tests/hls.rs`: a master+media server proves the concatenated bytes equal the segments (and never the playlist text, and that the 1080p variant won), AES-128 segments decrypt to their plaintext, live/SAMPLE-AES are refused with their reasons, 120-segment and 60-encrypted-segment runs prove order under load, and a real ffmpeg-generated TS proves the remux + row retarget (skipped with a printed note when ffmpeg is absent). `examples/hls_bench.rs` is the throughput harness (`cargo run --release --example hls_bench`): clear / AES-128 / many-small scenarios, each verified against the expected bytes so a fast run can never be a corrupt one.
+
+**`Storage::load_active` compares JSON.** The `status` column holds `serde_json::to_string(&DownloadStatus)` — `"completed"` *with quotes* — so a SQL literal `'completed'` never matched and every finished row came back as "active". `start()` then set it to `Queued` without spawning anything, which is a permanently stuck row after a restart. The filter now derives both values from the same serializer (`status_as_json`), and `load_download(id)` exists for callers that need a finished row (the cancel test, "where did my download go" checks).
 
 ## Media merging (`crates/engine/src/media.rs`)
 

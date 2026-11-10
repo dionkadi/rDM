@@ -57,6 +57,13 @@ pub struct Segment {
     pub duration: f64,
     /// `#EXT-X-BYTERANGE` as `(length, offset)`.
     pub range: Option<(u64, u64)>,
+    /// Media sequence number (`#EXT-X-MEDIA-SEQUENCE` + position). It is
+    /// also the default AES-128 IV when `#EXT-X-KEY` carries no `IV`.
+    pub sequence: u64,
+    /// The key in force when this segment was listed. `None` means the
+    /// segment is clear — keys can rotate mid-playlist, so this cannot
+    /// be a playlist-level field.
+    pub key: Option<Key>,
 }
 
 /// `#EXT-X-KEY`. `method == "NONE"` means unencrypted.
@@ -74,7 +81,11 @@ pub struct MediaPlaylist {
     /// `#EXT-X-MAP` init segment (fMP4). Must be written before the
     /// first segment.
     pub init: Option<String>,
-    pub key: Option<Key>,
+    /// Whether a key was in force when `#EXT-X-MAP` appeared. Per RFC
+    /// 8216 §4.3.2.5 that ordering is what says the init section is
+    /// encrypted — in practice packagers leave it clear, and a
+    /// ciphertext init would make the whole output unplayable.
+    pub init_encrypted: bool,
     /// `#EXT-X-ENDLIST` seen: the playlist is complete, not live.
     pub ended: bool,
     /// Sum of the segment durations.
@@ -93,12 +104,21 @@ pub enum Playlist {
 }
 
 impl MediaPlaylist {
-    /// True when the segments are AES-128 ciphertext.
+    /// True when any segment carries a key.
     pub fn encrypted(&self) -> bool {
-        self.key
-            .as_ref()
-            .map(|k| !k.method.eq_ignore_ascii_case("NONE"))
-            .unwrap_or(false)
+        self.segments.iter().any(|s| s.key.is_some())
+    }
+
+    /// The first key method DM cannot decrypt, if any. `AES-128` and
+    /// clear segments are supported; `SAMPLE-AES` (and anything else)
+    /// is refused because writing ciphertext as media is worse than
+    /// saying so.
+    pub fn unsupported_key_method(&self) -> Option<&str> {
+        self.segments
+            .iter()
+            .filter_map(|s| s.key.as_ref())
+            .map(|k| k.method.as_str())
+            .find(|m| !m.eq_ignore_ascii_case("AES-128"))
     }
 }
 
@@ -184,7 +204,9 @@ pub fn parse(text: &str, base: &Url) -> Result<Playlist, HlsError> {
     let mut pending_range: Option<(u64, Option<u64>)> = None;
     let mut last_range_end: u64 = 0;
     let mut init: Option<String> = None;
+    let mut init_encrypted = false;
     let mut key: Option<Key> = None;
+    let mut media_sequence: u64 = 0;
     let mut ended = false;
 
     for line in lines {
@@ -215,6 +237,10 @@ pub fn parse(text: &str, base: &Url) -> Result<Playlist, HlsError> {
             }
             continue;
         }
+        if let Some(rest) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+            media_sequence = rest.trim().parse::<u64>().unwrap_or(0);
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("#EXTINF:") {
             // `#EXTINF:<duration>,[<title>]`
             let dur = rest.split(',').next().unwrap_or("").trim();
@@ -232,6 +258,7 @@ pub fn parse(text: &str, base: &Url) -> Result<Playlist, HlsError> {
             let attrs = attributes(rest);
             if let Some(uri) = attr(&attrs, "URI") {
                 init = Some(resolve(base, uri)?);
+                init_encrypted = key.is_some();
             }
             continue;
         }
@@ -282,6 +309,8 @@ pub fn parse(text: &str, base: &Url) -> Result<Playlist, HlsError> {
                 uri,
                 duration,
                 range,
+                sequence: media_sequence + segments.len() as u64,
+                key: key.clone(),
             });
         }
         // A URI with no `#EXTINF` (and no pending variant) is not a
@@ -301,7 +330,7 @@ pub fn parse(text: &str, base: &Url) -> Result<Playlist, HlsError> {
     Ok(Playlist::Media(MediaPlaylist {
         segments,
         init,
-        key,
+        init_encrypted,
         ended,
         duration,
     }))
@@ -360,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_aes_128_instead_of_downloading_ciphertext() {
+    fn attaches_the_key_to_the_segments_it_covers() {
         let text = "#EXTM3U\n\
                     #EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\",IV=0x0123456789ABCDEF0123456789ABCDEF\n\
                     #EXTINF:6,\n\
@@ -370,9 +399,62 @@ mod tests {
             panic!("expected a media playlist");
         };
         assert!(media.encrypted());
-        let key = media.key.unwrap();
+        assert_eq!(media.unsupported_key_method(), None);
+        let key = media.segments[0].key.as_ref().expect("segment key");
         assert_eq!(key.method, "AES-128");
         assert_eq!(key.uri.as_deref(), Some("https://cdn.test/hls/key.bin"));
+        assert_eq!(key.iv.as_deref(), Some("0x0123456789ABCDEF0123456789ABCDEF"));
+    }
+
+    #[test]
+    fn keys_can_rotate_mid_playlist() {
+        let text = "#EXTM3U\n\
+                    #EXT-X-KEY:METHOD=AES-128,URI=\"k1\"\n\
+                    #EXTINF:6,\n\
+                    a.ts\n\
+                    #EXT-X-KEY:METHOD=AES-128,URI=\"k2\"\n\
+                    #EXTINF:6,\n\
+                    b.ts\n\
+                    #EXT-X-KEY:METHOD=NONE\n\
+                    #EXTINF:6,\n\
+                    c.ts\n\
+                    #EXT-X-ENDLIST\n";
+        let Playlist::Media(media) = parse(text, &base()).unwrap() else {
+            panic!("expected a media playlist");
+        };
+        assert_eq!(
+            media.segments[0].key.as_ref().and_then(|k| k.uri.clone()),
+            Some("https://cdn.test/hls/k1".to_string())
+        );
+        assert_eq!(
+            media.segments[1].key.as_ref().and_then(|k| k.uri.clone()),
+            Some("https://cdn.test/hls/k2".to_string())
+        );
+        assert!(media.segments[2].key.is_none(), "METHOD=NONE clears the key");
+        assert!(media.encrypted());
+    }
+
+    #[test]
+    fn segments_carry_media_sequence_numbers() {
+        let text = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:42\n#EXTINF:6,\na.ts\n#EXTINF:6,\nb.ts\n#EXT-X-ENDLIST\n";
+        let Playlist::Media(media) = parse(text, &base()).unwrap() else {
+            panic!("expected a media playlist");
+        };
+        assert_eq!(media.segments[0].sequence, 42);
+        assert_eq!(media.segments[1].sequence, 43);
+    }
+
+    #[test]
+    fn a_sample_aes_playlist_is_reported_as_unsupported() {
+        let text = "#EXTM3U\n\
+                    #EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"skd://x\"\n\
+                    #EXTINF:6,\n\
+                    a.ts\n\
+                    #EXT-X-ENDLIST\n";
+        let Playlist::Media(media) = parse(text, &base()).unwrap() else {
+            panic!("expected a media playlist");
+        };
+        assert_eq!(media.unsupported_key_method(), Some("SAMPLE-AES"));
     }
 
     #[test]
@@ -387,6 +469,7 @@ mod tests {
             panic!("expected a media playlist");
         };
         assert!(!media.encrypted());
+        assert!(media.segments[0].key.is_none());
     }
 
     #[test]
@@ -455,6 +538,37 @@ mod tests {
             panic!("expected a media playlist");
         };
         assert_eq!(media.init.as_deref(), Some("https://cdn.test/hls/init.mp4"));
+    }
+
+    #[test]
+    fn an_encrypted_init_section_is_flagged_by_tag_order() {
+        // RFC 8216 §4.3.2.5: the key applies to the init section when
+        // it appears *before* EXT-X-MAP.
+        let encrypted = parse(
+            "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"k\"\n#EXT-X-MAP:URI=\"init.mp4\"\n\
+             #EXTINF:6,\na.m4s\n#EXT-X-ENDLIST\n",
+            &base(),
+        )
+        .unwrap();
+        let Playlist::Media(media) = encrypted else {
+            panic!("expected a media playlist");
+        };
+        assert!(media.init_encrypted);
+        assert_eq!(
+            media.init.as_deref(),
+            Some("https://cdn.test/hls/init.mp4")
+        );
+
+        let clear_init = parse(
+            "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXT-X-KEY:METHOD=AES-128,URI=\"k\"\n\
+             #EXTINF:6,\na.m4s\n#EXT-X-ENDLIST\n",
+            &base(),
+        )
+        .unwrap();
+        let Playlist::Media(media) = clear_init else {
+            panic!("expected a media playlist");
+        };
+        assert!(!media.init_encrypted, "a key after MAP leaves the init clear");
     }
 
     #[test]

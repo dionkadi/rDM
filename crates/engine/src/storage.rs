@@ -176,20 +176,52 @@ impl Storage {
     }
 
     /// Load downloads that are not finished/cancelled (resumable on startup).
+    ///
+    /// **The status column is JSON**, not a bare word: `save_download`
+    /// writes `serde_json::to_string(&status)`, which is `"completed"`
+    /// *including the quotes*. Comparing against `'completed'` therefore
+    /// never matched, so every finished row came back as "active" and
+    /// `start()` resurrected it as a permanently `Queued` row that would
+    /// never run (its `was_queued` gate is computed from the *stored*
+    /// status). The filter below derives both values from the same
+    /// serializer, so the encoding can never drift from the comparison
+    /// again.
     pub fn load_active(&self) -> Result<Vec<Download>, StorageError> {
         let conn = self.inner.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id,url,filename,save_path,total_size,downloaded,status,category,
                     content_type,chunks,speed_limit,proxy,checksum,error,created_at,
                     finished_at,can_resume FROM downloads
-             WHERE status NOT IN ('completed','canceled')",
+             WHERE status NOT IN (?1, ?2)",
         )?;
-        let rows = stmt.query_map([], |row| Ok(self_row_to_download(row)))?;
+        let rows = stmt.query_map(
+            params![
+                status_as_json(DownloadStatus::Completed),
+                status_as_json(DownloadStatus::Canceled),
+            ],
+            |row| Ok(self_row_to_download(row)),
+        )?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    /// Read one row by id, whatever its status.
+    ///
+    /// `load_active` deliberately skips finished rows; callers that need
+    /// to confirm what was persisted (the cancel test, a UI refresh
+    /// after the manager dropped the row) need the row itself.
+    pub fn load_download(&self, id: &str) -> Result<Option<Download>, StorageError> {
+        let conn = self.inner.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id,url,filename,save_path,total_size,downloaded,status,category,
+                    content_type,chunks,speed_limit,proxy,checksum,error,created_at,
+                    finished_at,can_resume FROM downloads WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], |row| Ok(self_row_to_download(row)))?;
+        Ok(rows.next().transpose()?)
     }
 
     pub fn mark_completed(&self, id: &str, finished_at: &str) -> Result<(), StorageError> {
@@ -309,6 +341,16 @@ impl Storage {
     }
 }
 
+/// The exact string `save_download` writes into the `status` column.
+///
+/// `status` is a JSON-encoded enum, so `Completed` is stored as
+/// `"completed"` (seven characters plus two quotes). Any SQL comparison
+/// against this column has to use the same serialization — see
+/// `load_active`.
+fn status_as_json(status: DownloadStatus) -> String {
+    serde_json::to_string(&status).unwrap_or_else(|_| "\"queued\"".to_string())
+}
+
 fn self_row_to_download(
     row: &rusqlite::Row<'_>,
 ) -> Download {
@@ -422,6 +464,50 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].downloaded, 40);
         assert_eq!(active[0].status, DownloadStatus::Paused);
+    }
+
+    #[test]
+    fn finished_rows_are_not_active() {
+        // The status column is JSON (`"completed"`), so the old
+        // `NOT IN ('completed','canceled')` literal matched nothing and
+        // every finished row came back as resumable — which `start()`
+        // then parked as `Queued` forever. Both encoding and filter now
+        // come from the same serializer.
+        let db = Storage::open_memory().unwrap();
+        for status in [
+            DownloadStatus::Completed,
+            DownloadStatus::Canceled,
+            DownloadStatus::Queued,
+            DownloadStatus::Error,
+        ] {
+            let mut d = sample();
+            d.id = format!("{status:?}");
+            d.status = status;
+            db.save_download(&d).unwrap();
+        }
+
+        let active: Vec<String> = db
+            .load_active()
+            .unwrap()
+            .into_iter()
+            .map(|d| d.id)
+            .collect();
+        assert!(
+            !active.contains(&"Completed".to_string()),
+            "a finished row must not be resumed: {active:?}"
+        );
+        assert!(
+            !active.contains(&"Canceled".to_string()),
+            "a cancelled row must not be resumed: {active:?}"
+        );
+        assert!(active.contains(&"Queued".to_string()));
+        // Errors stay loadable on purpose: `start()` retries them.
+        assert!(active.contains(&"Error".to_string()));
+
+        // And a finished row is still readable when asked for by id.
+        let completed = db.load_download("Completed").unwrap().expect("row");
+        assert_eq!(completed.status, DownloadStatus::Completed);
+        assert!(db.load_download("nope").unwrap().is_none());
     }
 
     #[test]
