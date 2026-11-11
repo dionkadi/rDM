@@ -5,7 +5,9 @@ use crate::chunk::download_chunk;
 use crate::control::SharedControl;
 use crate::limiter::CombinedLimiter;
 use crate::manager::{DownloadEvent, RunContext};
-use crate::model::{AuthSpec, ChunkState, Download, DownloadStatus, MediaKind};
+use crate::model::{
+    AuthSpec, ChunkState, Download, DownloadStatus, MediaKind, SegmentProgress,
+};
 use crate::protocol::{build_plan, plan_chunks};
 use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 use futures_util::StreamExt;
@@ -14,6 +16,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::SeekFrom;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -676,8 +679,8 @@ fn hls_request(
     headers: &BTreeMap<String, String>,
     auth: Option<&AuthSpec>,
 ) -> reqwest::RequestBuilder {
-    let mut req = client.get(url);
-    crate::chunk::apply_extra_headers(&mut req, headers);
+    let req = client.get(url);
+    let req = crate::chunk::apply_extra_headers(req, headers);
     crate::chunk::apply_auth(req, auth, url)
 }
 
@@ -710,6 +713,11 @@ fn hls_fail(ctx: &RunContext, state: &TaskState, id: &str, message: String) {
     let mut d = state.download.lock().unwrap();
     d.status = DownloadStatus::Error;
     d.error = Some(message.clone());
+    // The fetches are gone with this task; leaving `active` at N would
+    // show a permanently "in flight" strip on a dead row.
+    if let Some(sp) = d.segment_progress.as_mut() {
+        sp.active = 0;
+    }
     let _ = ctx.storage.mark_error(id, &message);
     ctx.emit(DownloadEvent::Error(d.clone()));
     drop(d);
@@ -723,6 +731,9 @@ fn hls_canceled(ctx: &RunContext, state: &TaskState, id: &str) {
     }
     let mut d = state.download.lock().unwrap();
     d.status = DownloadStatus::Canceled;
+    if let Some(sp) = d.segment_progress.as_mut() {
+        sp.active = 0;
+    }
     let _ = ctx.storage.save_download(&d);
     ctx.emit(DownloadEvent::StatusChanged(d.clone()));
     drop(d);
@@ -737,10 +748,75 @@ enum SegmentError {
     Fatal(String),
 }
 
-/// Stream one URI into the open `.part` file, honouring the limiter and
-/// the cancel flag. Returns the bytes written.
+/// Connect + response-headers budget for one segment attempt.
+///
+/// The old code had no per-request bound at all: the only guard was a
+/// five-minute timeout wrapped around the *whole* segment, so a CDN edge
+/// that accepted the connection and then went silent looked like "no
+/// progress" for five minutes before anything happened. 30 s is long
+/// enough for a slow origin and short enough that a dead edge is retried
+/// within the same minute.
+const HLS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Longest silence allowed between two body chunks of one segment. A
+/// socket that dies without a FIN has to be caught here rather than by a
+/// blanket timeout — this is the per-read stall detector the chunk path
+/// has always had and the HLS path never did.
+const HLS_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Upper bound on concurrent segment fetches. `connections_per_download`
+/// (default 8) is the real knob; this is a sanity cap so a user who sets
+/// 64 connections does not open 64 sockets to one CDN edge.
+const HLS_MAX_PARALLEL: usize = 8;
+
+/// Bytes a fetcher has counted as in flight but not yet handed to the
+/// writer. Dropping the guard without `keep()` subtracts them again, so
+/// a failed attempt can never leave the live counter permanently
+/// inflated (which would show up as a one-off speed spike).
+struct LiveBytes<'a> {
+    counter: &'a AtomicU64,
+    unclaimed: u64,
+}
+
+impl<'a> LiveBytes<'a> {
+    fn new(counter: &'a AtomicU64) -> Self {
+        Self {
+            counter,
+            unclaimed: 0,
+        }
+    }
+
+    fn add(&mut self, n: u64) {
+        self.unclaimed += n;
+        self.counter.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Hand the bytes to the caller: they are no longer rolled back on
+    /// drop, because the writer now owns them (and subtracts them once
+    /// they are on disk).
+    fn keep(&mut self) {
+        self.unclaimed = 0;
+    }
+}
+
+impl Drop for LiveBytes<'_> {
+    fn drop(&mut self) {
+        if self.unclaimed > 0 {
+            self.counter.fetch_sub(self.unclaimed, Ordering::Relaxed);
+        }
+    }
+}
+
+/// One attempt at fetching one segment (or the init section) into
+/// memory. Bounded at both ends: 30 s for the response headers, 30 s of
+/// silence for each body read.
+///
+/// The bytes go into memory rather than straight to the file because
+/// segments are fetched concurrently but written in playlist order — a
+/// worker cannot know its file offset until every earlier segment has
+/// landed. `HLS_MAX_SEGMENT_BYTES` caps the exposure.
 #[allow(clippy::too_many_arguments)]
-async fn hls_copy_into(
+async fn hls_fetch_once(
     client: &reqwest::Client,
     url: &str,
     range: Option<(u64, u64)>,
@@ -748,8 +824,8 @@ async fn hls_copy_into(
     auth: Option<&AuthSpec>,
     limiter: &CombinedLimiter,
     control: &SharedControl,
-    file: &mut tokio::fs::File,
-) -> Result<u64, SegmentError> {
+    live: &AtomicU64,
+) -> Result<Vec<u8>, SegmentError> {
     let mut req = hls_request(client, url, headers, auth);
     if let Some((length, offset)) = range {
         req = req.header(
@@ -757,52 +833,106 @@ async fn hls_copy_into(
             format!("bytes={}-{}", offset, offset.saturating_add(length).saturating_sub(1)),
         );
     }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| SegmentError::Retry(format!("{e}")))?;
+    let resp = match tokio::time::timeout(HLS_RESPONSE_TIMEOUT, req.send()).await {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(e)) => return Err(SegmentError::Retry(format!("{e}"))),
+        Err(_) => {
+            return Err(SegmentError::Retry(format!(
+                "no response headers within {}s",
+                HLS_RESPONSE_TIMEOUT.as_secs()
+            )))
+        }
+    };
     hls_check_status(resp.status(), url, range.is_some())?;
 
+    // `Content-Length` is the only per-segment integrity check a
+    // playlist gives us: an entry cut short by a proxy would otherwise
+    // be written as a hole in the middle of the file.
+    let declared = resp.content_length();
+
+    let mut gauge = LiveBytes::new(live);
+    let mut out: Vec<u8> = Vec::new();
     let mut stream = resp.bytes_stream();
-    let mut written = 0u64;
-    while let Some(chunk) = stream.next().await {
+    loop {
         if control.is_canceled() {
             return Err(SegmentError::Canceled);
         }
-        let bytes = chunk.map_err(|e| SegmentError::Retry(format!("{e}")))?;
+        let bytes = match tokio::time::timeout(HLS_READ_IDLE_TIMEOUT, stream.next()).await {
+            Ok(Some(Ok(bytes))) => bytes,
+            Ok(Some(Err(e))) => return Err(SegmentError::Retry(format!("{e}"))),
+            Ok(None) => break,
+            Err(_) => {
+                return Err(SegmentError::Retry(format!(
+                    "no data for {}s",
+                    HLS_READ_IDLE_TIMEOUT.as_secs()
+                )))
+            }
+        };
+        if out.len() as u64 + bytes.len() as u64 > HLS_MAX_SEGMENT_BYTES {
+            return Err(SegmentError::Fatal(format!(
+                "a segment exceeded {} MiB; refusing to buffer it",
+                HLS_MAX_SEGMENT_BYTES / (1024 * 1024)
+            )));
+        }
         limiter.acquire(bytes.len() as u64).await;
-        file.write_all(&bytes)
-            .await
-            .map_err(|e| SegmentError::Fatal(format!("could not write the file: {e}")))?;
-        written += bytes.len() as u64;
+        gauge.add(bytes.len() as u64);
+        out.extend_from_slice(&bytes);
     }
-    Ok(written)
+    if let Some(expected) = declared {
+        if expected != out.len() as u64 {
+            return Err(SegmentError::Retry(format!(
+                "the body ended at {} B of {expected} B",
+                out.len()
+            )));
+        }
+    }
+    gauge.keep();
+    Ok(out)
 }
 
-/// `hls_copy_into` with a stall cap: a CDN edge that accepts the
-/// connection and then goes silent must not hang the download forever.
+/// `hls_fetch_once` plus the retry policy, and the AES-128 decryption
+/// that has to happen between the network and the file.
 #[allow(clippy::too_many_arguments)]
-async fn hls_copy_segment(
+async fn hls_fetch_segment(
     client: &reqwest::Client,
     url: &str,
     range: Option<(u64, u64)>,
+    crypto: Option<([u8; 16], [u8; 16])>,
     headers: &BTreeMap<String, String>,
     auth: Option<&AuthSpec>,
     limiter: &CombinedLimiter,
     control: &SharedControl,
-    file: &mut tokio::fs::File,
-) -> Result<u64, SegmentError> {
-    match tokio::time::timeout(
-        Duration::from_secs(CHUNK_STALL_SECS),
-        hls_copy_into(client, url, range, headers, auth, limiter, control, file),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(SegmentError::Retry(format!(
-            "no data for {}s",
-            CHUNK_STALL_SECS
-        ))),
+    live: &AtomicU64,
+) -> Result<Vec<u8>, SegmentError> {
+    let mut attempt: usize = 0;
+    loop {
+        if control.is_canceled() {
+            return Err(SegmentError::Canceled);
+        }
+        let failure = match hls_fetch_once(
+            client, url, range, headers, auth, limiter, control, live,
+        )
+        .await
+        {
+            Ok(mut bytes) => {
+                if let Some((key, iv)) = crypto {
+                    aes128_cbc_decrypt(&mut bytes, &key, &iv).map_err(SegmentError::Fatal)?;
+                }
+                return Ok(bytes);
+            }
+            Err(SegmentError::Retry(message)) => message,
+            Err(other) => return Err(other),
+        };
+        if attempt >= HLS_RETRY_DELAYS_MS.len() {
+            return Err(SegmentError::Retry(format!(
+                "gave up after {} attempts: {failure}",
+                attempt + 1
+            )));
+        }
+        let delay = HLS_RETRY_DELAYS_MS[attempt];
+        attempt += 1;
+        log::warn!("hls segment attempt {attempt} failed ({failure}); retrying in {delay} ms");
+        tokio::time::sleep(Duration::from_millis(delay)).await;
     }
 }
 
@@ -838,53 +968,6 @@ fn hls_check_status(
         )));
     }
     Ok(())
-}
-
-/// Fetch one segment into memory. Only used when the bytes need
-/// decrypting — the clear path streams straight to disk.
-async fn hls_fetch_bytes(
-    client: &reqwest::Client,
-    url: &str,
-    range: Option<(u64, u64)>,
-    headers: &BTreeMap<String, String>,
-    auth: Option<&AuthSpec>,
-    limiter: &CombinedLimiter,
-    control: &SharedControl,
-) -> Result<Vec<u8>, SegmentError> {
-    let mut req = hls_request(client, url, headers, auth);
-    if let Some((length, offset)) = range {
-        req = req.header(
-            reqwest::header::RANGE,
-            format!(
-                "bytes={}-{}",
-                offset,
-                offset.saturating_add(length).saturating_sub(1)
-            ),
-        );
-    }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| SegmentError::Retry(format!("{e}")))?;
-    hls_check_status(resp.status(), url, range.is_some())?;
-
-    let mut out = Vec::new();
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        if control.is_canceled() {
-            return Err(SegmentError::Canceled);
-        }
-        let bytes = chunk.map_err(|e| SegmentError::Retry(format!("{e}")))?;
-        limiter.acquire(bytes.len() as u64).await;
-        if out.len() as u64 + bytes.len() as u64 > HLS_MAX_SEGMENT_BYTES {
-            return Err(SegmentError::Fatal(format!(
-                "an encrypted segment exceeded {} MiB; refusing to buffer it",
-                HLS_MAX_SEGMENT_BYTES / (1024 * 1024)
-            )));
-        }
-        out.extend_from_slice(&bytes);
-    }
-    Ok(out)
 }
 
 /// Fetch the AES-128 key. Sixteen bytes is the only valid length.
@@ -956,53 +1039,6 @@ fn aes128_cbc_decrypt(data: &mut Vec<u8>, key: &[u8; 16], iv: &[u8; 16]) -> Resu
     };
     data.truncate(plain_len);
     Ok(())
-}
-
-/// Write one segment: streamed for clear media, buffered + decrypted
-/// for AES-128.
-#[allow(clippy::too_many_arguments)]
-async fn hls_write_segment(
-    client: &reqwest::Client,
-    segment: &crate::hls::Segment,
-    crypto: Option<([u8; 16], [u8; 16])>,
-    headers: &BTreeMap<String, String>,
-    auth: Option<&AuthSpec>,
-    limiter: &CombinedLimiter,
-    control: &SharedControl,
-    file: &mut tokio::fs::File,
-) -> Result<u64, SegmentError> {
-    match crypto {
-        None => {
-            hls_copy_segment(
-                client,
-                &segment.uri,
-                segment.range,
-                headers,
-                auth,
-                limiter,
-                control,
-                file,
-            )
-            .await
-        }
-        Some((key, iv)) => {
-            let mut data = hls_fetch_bytes(
-                client,
-                &segment.uri,
-                segment.range,
-                headers,
-                auth,
-                limiter,
-                control,
-            )
-            .await?;
-            aes128_cbc_decrypt(&mut data, &key, &iv).map_err(SegmentError::Fatal)?;
-            file.write_all(&data)
-                .await
-                .map_err(|e| SegmentError::Fatal(format!("could not write the file: {e}")))?;
-            Ok(data.len() as u64)
-        }
-    }
 }
 
 /// `ffmpeg -c copy` an MPEG-TS file into MP4. Returns the MP4 path.
@@ -1261,67 +1297,82 @@ async fn run_hls_download(
         );
     }
 
+    let remaining = media.segments.len().saturating_sub(start_index);
+    let concurrency = ctx
+        .max_connections
+        .clamp(1, HLS_MAX_PARALLEL)
+        .min(remaining.max(1));
+
+    // The playlist is understood and the output file is open: from the
+    // user's point of view the download is running now, not connecting.
+    // The previous code never left `Connecting` for the whole transfer —
+    // `run_download` sets it before dispatching here and returns before
+    // its own `Downloading` transition, and only the finalize path ever
+    // touched the status again.
+    //
+    // The segment map is published in the same transition so the row
+    // shows "12 / 264 · 8 in flight" from the first frame instead of
+    // claiming there is no structure at all.
+    {
+        let mut d = state.download.lock().unwrap();
+        d.status = DownloadStatus::Downloading;
+        d.segment_progress = Some(SegmentProgress {
+            total: media.segments.len(),
+            done: start_index,
+            active: concurrency.min(remaining),
+        });
+        ctx.emit(DownloadEvent::StatusChanged(d.clone()));
+        let _ = ctx.storage.save_download(&d);
+    }
+
+    // ---- 4. Init section, then segments ----
+    //
+    // Segments are fetched `concurrency` at a time and written in
+    // playlist order: `buffered` polls every in-flight fetch and yields
+    // their results *in order*, so the writer only ever appends and the
+    // `.part` stays a valid prefix of the output — which is exactly what
+    // the resume sidecar claims it is.
+    //
+    // `live` counts bytes that in-flight fetches have received but that
+    // are not on disk yet. `downloaded + live` is the honest progress
+    // number; reporting only `downloaded` (the previous behaviour) made
+    // the row advance in whole-segment jumps and the throughput read
+    // 0 B/s in between.
+    let live = Arc::new(AtomicU64::new(0));
+
     // The init segment is part of the file, and only valid at offset 0.
     if start_index == 0 {
         if let Some(init) = media.init.clone() {
-            let mut attempt: usize = 0;
-            loop {
-                match hls_copy_segment(
-                    &client, &init, None, &headers, auth.as_ref(), &limiter, &control, &mut file,
-                )
-                .await
-                {
-                    Ok(n) => {
-                        downloaded += n;
-                        break;
-                    }
-                    Err(SegmentError::Canceled) => return hls_canceled(&ctx, &state, &id),
-                    Err(SegmentError::Fatal(e)) => return hls_fail(&ctx, &state, &id, e),
-                    Err(SegmentError::Retry(e)) if attempt < HLS_RETRY_DELAYS_MS.len() => {
-                        tokio::time::sleep(Duration::from_millis(
-                            HLS_RETRY_DELAYS_MS[attempt],
-                        ))
-                        .await;
-                        attempt += 1;
-                        log::warn!("hls init segment retry {attempt} id={id}: {e}");
-                        if let Err(err) = file.set_len(downloaded).await {
-                            return hls_fail(
-                                &ctx,
-                                &state,
-                                &id,
-                                format!("could not reset the output: {err}"),
-                            );
-                        }
-                        let _ = file.seek(SeekFrom::Start(downloaded)).await;
-                    }
-                    Err(SegmentError::Retry(e)) => {
+            match hls_fetch_segment(
+                &client, &init, None, None, &headers, auth.as_ref(), &limiter, &control, &live,
+            )
+            .await
+            {
+                Ok(bytes) => {
+                    if let Err(e) = file.write_all(&bytes).await {
                         return hls_fail(
                             &ctx,
                             &state,
                             &id,
-                            format!("the init segment failed after retries: {e}"),
-                        )
+                            format!("could not write the file: {e}"),
+                        );
                     }
+                    downloaded += bytes.len() as u64;
+                    live.fetch_sub(bytes.len() as u64, Ordering::Relaxed);
+                }
+                Err(SegmentError::Canceled) => return hls_canceled(&ctx, &state, &id),
+                Err(SegmentError::Fatal(e)) | Err(SegmentError::Retry(e)) => {
+                    return hls_fail(&ctx, &state, &id, format!("the init segment failed: {e}"))
                 }
             }
         }
     }
 
-    // ---- 4. Segments ----
-    let mut media_done: f64 = media
-        .segments
-        .iter()
-        .take(start_index)
-        .map(|s| s.duration)
-        .sum();
-    let mut last_emit = Instant::now() - HLS_EMIT_INTERVAL;
-
-    for (index, segment) in media.segments.iter().enumerate().skip(start_index) {
-        if control.wait_while_paused().await {
-            return hls_canceled(&ctx, &state, &id);
-        }
-        // Resolve this segment's key before the retry loop: a key
-        // failure is not something a retry of the segment changes.
+    // Resolve every segment's key material up front: a missing key or a
+    // malformed IV is a property of the playlist, not of an attempt, so
+    // it must fail before any segment work is queued.
+    let mut cryptos: Vec<Option<([u8; 16], [u8; 16])>> = Vec::with_capacity(media.segments.len());
+    for segment in &media.segments {
         let crypto = match segment.key.as_ref() {
             None => None,
             Some(key) => {
@@ -1347,116 +1398,152 @@ async fn run_hls_download(
                 }
             }
         };
-        let boundary = downloaded;
-        let mut attempt: usize = 0;
-        loop {
-            if attempt > 0 {
-                tokio::time::sleep(Duration::from_millis(
-                    HLS_RETRY_DELAYS_MS[attempt.saturating_sub(1)],
-                ))
-                .await;
-                if control.is_canceled() {
-                    return hls_canceled(&ctx, &state, &id);
-                }
-                // A failed attempt may have written a prefix: cut it
-                // back so a retry cannot splice two copies of a segment.
-                if let Err(e) = file.set_len(boundary).await {
-                    return hls_fail(
-                        &ctx,
-                        &state,
-                        &id,
-                        format!("could not reset the output: {e}"),
-                    );
-                }
-                if let Err(e) = file.seek(SeekFrom::Start(boundary)).await {
-                    return hls_fail(
-                        &ctx,
-                        &state,
-                        &id,
-                        format!("could not seek the output: {e}"),
-                    );
-                }
-            }
-            match hls_write_segment(
-                &client,
-                segment,
-                crypto,
-                &headers,
-                auth.as_ref(),
-                &limiter,
-                &control,
-                &mut file,
-            )
-            .await
-            {
-                Ok(n) => {
-                    downloaded = boundary + n;
-                    break;
-                }
-                Err(SegmentError::Canceled) => return hls_canceled(&ctx, &state, &id),
-                Err(SegmentError::Fatal(e)) => {
-                    return hls_fail(
-                        &ctx,
-                        &state,
-                        &id,
-                        format!("segment {} failed: {e}", index + 1),
-                    )
-                }
-                Err(SegmentError::Retry(e)) => {
-                    attempt += 1;
-                    if attempt > HLS_RETRY_DELAYS_MS.len() {
+        cryptos.push(crypto);
+    }
+
+    // One future per pending segment. Built in a plain loop rather than
+    // with `Iterator::map`: a closure here has to be higher-ranked over
+    // the `&Segment` lifetime, which Rust infers as "not general
+    // enough" once the future also borrows the client.
+    let mut jobs = Vec::with_capacity(remaining);
+    for (index, segment) in media.segments.iter().enumerate().skip(start_index) {
+        // Bind the shared borrows *outside* the `async move` so each
+        // future holds references instead of trying to move the client
+        // out of the enclosing scope.
+        let crypto = cryptos[index];
+        let live = Arc::clone(&live);
+        let client = &client;
+        let headers = &headers;
+        let auth = auth.as_ref();
+        let limiter = limiter.as_ref();
+        let control = &control;
+        jobs.push(async move {
+            let outcome = if control.wait_while_paused().await {
+                Err(SegmentError::Canceled)
+            } else {
+                hls_fetch_segment(
+                    client,
+                    &segment.uri,
+                    segment.range,
+                    crypto,
+                    headers,
+                    auth,
+                    limiter,
+                    control,
+                    &live,
+                )
+                .await
+            };
+            (index, outcome)
+        });
+    }
+    let mut results = futures_util::stream::iter(jobs).buffered(concurrency);
+
+    let mut media_done: f64 = media
+        .segments
+        .iter()
+        .take(start_index)
+        .map(|s| s.duration)
+        .sum();
+    let mut ticker = tokio::time::interval(HLS_EMIT_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // `interval` yields one tick immediately; consume it so the loop
+    // below does not publish a progress event before any byte moves.
+    ticker.tick().await;
+
+    loop {
+        tokio::select! {
+            biased;
+            next = results.next() => {
+                let Some((index, outcome)) = next else { break };
+                let bytes = match outcome {
+                    Ok(bytes) => bytes,
+                    Err(SegmentError::Canceled) => return hls_canceled(&ctx, &state, &id),
+                    Err(SegmentError::Fatal(e)) => {
+                        return hls_fail(
+                            &ctx,
+                            &state,
+                            &id,
+                            format!("segment {} failed: {e}", index + 1),
+                        )
+                    }
+                    Err(SegmentError::Retry(e)) => {
                         return hls_fail(
                             &ctx,
                             &state,
                             &id,
                             format!(
-                                "segment {} of {} failed after {} attempts: {e}",
+                                "segment {} of {} failed: {e}",
                                 index + 1,
-                                media.segments.len(),
-                                attempt
+                                media.segments.len()
                             ),
-                        );
+                        )
                     }
-                    log::warn!(
-                        "hls segment {}/{} retry {attempt} id={id}: {e}",
-                        index + 1,
-                        media.segments.len()
+                };
+                if control.is_canceled() {
+                    return hls_canceled(&ctx, &state, &id);
+                }
+                if let Err(e) = file.write_all(&bytes).await {
+                    return hls_fail(
+                        &ctx,
+                        &state,
+                        &id,
+                        format!("could not write the file: {e}"),
                     );
                 }
-            }
-        }
+                live.fetch_sub(bytes.len() as u64, Ordering::Relaxed);
+                downloaded += bytes.len() as u64;
+                media_done += media.segments[index].duration;
 
-        media_done += segment.duration;
-        let estimate = if media.duration > 0.0 && media_done > 0.0 {
-            // Bytes-per-second of media so far × total duration. The
-            // row shows a real percentage instead of "unknown total"
-            // for the whole download; it is corrected on completion.
-            let est = (downloaded as f64 / media_done) * media.duration;
-            Some(est.max(downloaded as f64) as u64)
-        } else {
-            None
-        };
-        {
-            let mut d = state.download.lock().unwrap();
-            d.downloaded = downloaded;
-            if let Some(total) = estimate {
-                d.total_size = Some(total);
+                let estimate = if media.duration > 0.0 && media_done > 0.0 {
+                    // Bytes-per-second of media so far × total duration.
+                    // The row shows a real percentage instead of
+                    // "unknown total"; it is corrected on completion.
+                    let est = (downloaded as f64 / media_done) * media.duration;
+                    Some(est.max(downloaded as f64) as u64)
+                } else {
+                    None
+                };
+                let snapshot = {
+                    let mut d = state.download.lock().unwrap();
+                    d.downloaded = downloaded + live.load(Ordering::Relaxed);
+                    if let Some(total) = estimate {
+                        d.total_size = Some(total);
+                    }
+                    // `done` counts what is *in the file*; the fetches
+                    // still in flight are the next `active` ones, which
+                    // is what `buffered` guarantees once the queue is
+                    // saturated.
+                    d.segment_progress = Some(SegmentProgress {
+                        total: media.segments.len(),
+                        done: index + 1,
+                        active: concurrency
+                            .min(media.segments.len().saturating_sub(index + 1)),
+                    });
+                    d.clone()
+                };
+                ctx.emit(DownloadEvent::Progress(snapshot.clone()));
+                let _ = ctx.storage.save_download(&snapshot);
+
+                let progress = HlsProgress {
+                    url: url.clone(),
+                    first: media.segments[0].uri.clone(),
+                    count: media.segments.len(),
+                    next: index + 1,
+                    bytes: downloaded,
+                };
+                if let Ok(json) = serde_json::to_vec(&progress) {
+                    let _ = tokio::fs::write(&sidecar, json).await;
+                }
             }
-        }
-        if last_emit.elapsed() >= HLS_EMIT_INTERVAL {
-            last_emit = Instant::now();
-            let d = state.download.lock().unwrap();
-            ctx.emit(DownloadEvent::Progress(d.clone()));
-        }
-        let progress = HlsProgress {
-            url: url.clone(),
-            first: media.segments[0].uri.clone(),
-            count: media.segments.len(),
-            next: index + 1,
-            bytes: downloaded,
-        };
-        if let Ok(json) = serde_json::to_vec(&progress) {
-            let _ = tokio::fs::write(&sidecar, json).await;
+            _ = ticker.tick() => {
+                let snapshot = {
+                    let mut d = state.download.lock().unwrap();
+                    d.downloaded = downloaded + live.load(Ordering::Relaxed);
+                    d.clone()
+                };
+                ctx.emit(DownloadEvent::Progress(snapshot));
+            }
         }
     }
 
@@ -1531,6 +1618,10 @@ async fn run_hls_download(
                 end: downloaded.saturating_sub(1),
                 downloaded,
             }];
+        }
+        if let Some(sp) = d.segment_progress.as_mut() {
+            sp.done = sp.total;
+            sp.active = 0;
         }
         d.can_resume = false;
         d.status = DownloadStatus::Completed;

@@ -89,9 +89,9 @@ fn status_error(resp: reqwest::Response) -> ChunkError {
 /// (reqwest's `HeaderMap` is case-insensitive on the wire, so
 /// `referer` and `Referer` both end up as the same header).
 pub(crate) fn apply_extra_headers(
-    req: &mut reqwest::RequestBuilder,
+    mut req: reqwest::RequestBuilder,
     extra: &std::collections::BTreeMap<String, String>,
-) {
+) -> reqwest::RequestBuilder {
     use std::str::FromStr;
     const RESTRICTED: [&str; 3] = ["host", "content-length", "accept-encoding"];
     for (k, v) in extra {
@@ -110,13 +110,19 @@ pub(crate) fn apply_extra_headers(
             log::warn!("ignoring per-download header {k} with invalid value");
             continue;
         };
-        // `RequestBuilder::header` takes `self` by value, so we
-        // have to re-assign rather than mutate. This is a
-        // straight-line rewrite — the builder is a thin wrapper
-        // around an `Option<Request>` and `.header()` clones the
-        // inner state.
-        *req = std::mem::replace(req, reqwest::Client::new().get("http://localhost/")).header(name, value);
+        // `RequestBuilder::header` takes `self` by value, so the
+        // builder is threaded through instead of mutated in place.
+        //
+        // Do **not** "fix" this by building a throwaway
+        // `reqwest::Client` to keep the `&mut` signature: a
+        // `RequestBuilder` carries the client that will execute it, so
+        // the request would run on a brand-new client — losing the
+        // proxy, the timeouts, the browser UA and, worst of all, the
+        // connection pool (every segment/range then pays a fresh
+        // TCP+TLS handshake).
+        req = req.header(name, value);
     }
+    req
 }
 
 /// Apply the per-download `Authorization` to a request builder. The
@@ -318,7 +324,7 @@ pub async fn download_chunk(
     // refuses to set them at `.send()` time and a confusing error
     // is worse than a silent drop. A restricted header in
     // `extra_headers` is logged and ignored.
-    apply_extra_headers(&mut req, extra_headers);
+    req = apply_extra_headers(req, extra_headers);
 
     // `Digest` is a placeholder for a future digest auth
     // implementation (the engine would need a challenge/response

@@ -24,6 +24,20 @@ export interface ChecksumSpec {
  expected: string;
 }
 
+/**
+ * Segment-level progress for a manifest-backed download (HLS).
+ * `chunks` is empty for those — a segment is a whole request, not a
+ * byte range — so the row renders this instead.
+ */
+export interface SegmentProgress {
+ /** Segments the playlist lists. */
+ total: number;
+ /** Segments already appended to the output file. */
+ done: number;
+ /** Segment fetches in flight right now (0 when idle or paused). */
+ active: number;
+}
+
 export interface Download {
  id: string;
  url: string;
@@ -46,6 +60,15 @@ export interface Download {
  sortKey: number;
  /** 0 = low, 1 = normal (default), 2 = high. */
  priority: number;
+ /**
+  * Set when the URL is a media manifest rather than a file. `"hls"`
+  * rows are a playlist expanded into segments (see
+  * `crates/engine/src/task.rs::run_hls_download`), so their progress is
+  * segment-shaped and `chunks` stays empty.
+  */
+ media?: "hls" | "dash" | null;
+ /** Present only for playlist downloads; see `SegmentProgress`. */
+ segmentProgress?: SegmentProgress | null;
 }
 
 export interface Category {

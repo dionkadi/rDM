@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > ship breaking changes between minor versions. Once we hit 1.0.0 we
 > commit to the SemVer stability guarantees.
 
+## [Unreleased]
+
+### Added — the row shows what an HLS download is actually doing
+
+- **Per-segment map.** `Download.segmentProgress` (`total` / `done` /
+  `active`) is published by the HLS task and rendered in the expanded
+  row as a bucketed cell strip (one cell per segment, bucketed at 64
+  for long playlists), with an "N / M" count, an "N in flight" note,
+  a "N streams" chip in the meta line, and a translucent in-flight
+  band on the progress bar. Until now the panel said
+  "Chunks (0) — single-connection transfer" for a download that was
+  using eight connections.
+- The value is persisted as a JSON column (`downloads.segment_progress`),
+  so a restart shows the last known `4 / 10` before the task resumes;
+  rows written by an older build load as `None`.
+
+### Fixed — HLS grabs were stuck at one connection and reported no progress
+
+- **Segments are fetched in parallel.** `run_hls_download` walked the
+  playlist with one request at a time, so throughput was
+  `segment_size / (RTT + transfer)`: on a ~1 MB-per-segment playlist that
+  is the reported "~1 MB every so often, 900 KB/s–1 MB/s". Segments are
+  now fetched `connections_per_download` at a time (capped at 8) and
+  written in playlist order through `StreamExt::buffered`, so the output
+  bytes are identical and the `.part` stays a valid prefix.
+- **The row no longer sits on "Connecting".** The HLS branch returned
+  before `run_download`'s `Downloading` transition and never set a status
+  of its own, so only the completion path ever changed it. It now
+  transitions to `Downloading` once the playlist is parsed.
+- **Progress and throughput move continuously.** `downloaded` was only
+  bumped after a whole segment landed, so the UI advanced in ~1 MB jumps
+  and the throughput read 0 B/s in between. In-flight bytes are counted
+  live, and progress is emitted on a 150 ms ticker.
+- **Two per-request timeouts replace the 5-minute blanket one:** 30 s to
+  first response byte and 30 s of silence between body reads. A CDN edge
+  that accepted the connection and then went quiet used to block the
+  transfer for minutes before the retry fired. A body shorter than its
+  `Content-Length` is retried instead of being written as a hole.
+- **`apply_extra_headers` no longer rebuilds the HTTP client per
+  header.** It used `std::mem::replace` with a throwaway
+  `reqwest::Client`, and because a `RequestBuilder` carries the client
+  that executes it, every request with a custom header (a `Referer` from
+  the capture dialog, an `Authorization`) ran on a fresh client: no
+  proxy, no timeouts, default UA, and — for HLS — a new TCP+TLS
+  handshake per segment. The builder is now threaded through instead.
+
 ## [0.6.0] - 2026-11-10
 
 ### Added — HLS grabs now download the video instead of the playlist

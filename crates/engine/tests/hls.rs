@@ -486,3 +486,174 @@ async fn a_real_ts_stream_is_remuxed_to_mp4() {
     assert!(out_dir.path().join("stream.ts").is_file());
 }
 
+
+/// Serve `assets` with an artificial per-response delay and record the
+/// highest number of requests that were ever in flight at the same time.
+/// A serial segment walk can never exceed 1 here.
+fn serve_with_delay(
+    assets: HashMap<String, Asset>,
+    delay: Duration,
+) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let assets = Arc::new(assets);
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let reported = Arc::clone(&peak);
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut socket) = stream else { break };
+            let assets = Arc::clone(&assets);
+            let in_flight = Arc::clone(&in_flight);
+            let peak = Arc::clone(&peak);
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut byte = [0u8; 1];
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < deadline {
+                    match socket.read(&mut byte) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            buf.push(byte[0]);
+                            if buf.ends_with(b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+                let request = String::from_utf8_lossy(&buf);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+
+                // Count the request as in flight while the artificial
+                // origin latency is being served.
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(delay);
+
+                let (status, content_type, body) = match assets.get(path) {
+                    Some(asset) => ("200 OK", asset.content_type, asset.body.clone()),
+                    None => ("404 Not Found", "text/plain", b"not found".to_vec()),
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes());
+                let _ = socket.write_all(&body);
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+    });
+    (port, reported)
+}
+
+/// The reported bug: an HLS grab used one connection, so throughput was
+/// one request's worth of latency at a time (~1 MB per second on a
+/// segment-per-second playlist). Segments must be fetched concurrently,
+/// while the bytes still land in playlist order.
+#[tokio::test]
+async fn segments_are_fetched_concurrently_and_stay_in_order() {
+    use std::sync::atomic::Ordering;
+
+    const COUNT: usize = 16;
+    const SEG: usize = 4096;
+
+    let mut assets = HashMap::new();
+    let mut body = String::from("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n");
+    let mut expected: Vec<u8> = Vec::new();
+    for i in 0..COUNT {
+        let bytes: Vec<u8> = (0..SEG).map(|n| ((n + i * 7) % 251) as u8).collect();
+        assets.insert(format!("/segment_{i:03}.ts"), segment(bytes.clone()));
+        expected.extend_from_slice(&bytes);
+        body.push_str(&format!("#EXTINF:2.0,\nsegment_{i:03}.ts\n"));
+    }
+    body.push_str("#EXT-X-ENDLIST\n");
+    assets.insert("/index.m3u8".to_string(), playlist(body));
+
+    // 120 ms per response: 16 segments serial = ~1.9 s, 8 at a time = ~0.3 s.
+    let (port, peak) = serve_with_delay(assets, Duration::from_millis(120));
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = DownloadManager::new(Storage::open_memory().unwrap());
+    let id = add(
+        &mgr,
+        dir.path(),
+        format!("http://127.0.0.1:{port}/index.m3u8"),
+        "parallel.m3u8",
+    );
+
+    let done = wait_done(&mgr, &id, Duration::from_secs(30)).await;
+    assert_eq!(done.status, DownloadStatus::Completed, "{:?}", done.error);
+
+    let out = std::fs::read(dir.path().join("parallel.ts")).expect("the .ts must exist");
+    assert_eq!(out, expected, "parallel fetch must not reorder the segments");
+    assert_eq!(done.downloaded, expected.len() as u64);
+
+    // The row must be able to say "16 / 16" instead of "no chunks".
+    let sp = done.segment_progress.expect("HLS rows carry a segment map");
+    assert_eq!(sp.total, COUNT);
+    assert_eq!(sp.done, COUNT, "every segment must be accounted for");
+    assert_eq!(sp.active, 0, "nothing can be in flight once the file is done");
+
+    let peak = peak.load(Ordering::SeqCst);
+    assert!(
+        peak >= 4,
+        "segments were fetched {peak} at a time; an HLS grab should use several connections"
+    );
+}
+
+/// The reported bug: the row said "Connecting" for the whole transfer,
+/// because the HLS branch returns before `run_download`'s status
+/// transition and nothing else set it until completion.
+#[tokio::test]
+async fn the_row_enters_downloading_before_the_segments_run() {
+    use dm_engine::manager::DownloadEvent;
+    use std::sync::{Arc, Mutex};
+
+    let mut assets = HashMap::new();
+    let mut body = String::from("#EXTM3U\n");
+    for i in 0..6 {
+        assets.insert(format!("/seg{i}.ts"), segment(vec![i as u8; 2048]));
+        body.push_str(&format!("#EXTINF:2.0,\nseg{i}.ts\n"));
+    }
+    body.push_str("#EXT-X-ENDLIST\n");
+    assets.insert("/index.m3u8".to_string(), playlist(body));
+
+    let (port, _peak) = serve_with_delay(assets, Duration::from_millis(40));
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = DownloadManager::new(Storage::open_memory().unwrap());
+
+    let events: Arc<Mutex<Vec<DownloadStatus>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let events = Arc::clone(&events);
+        mgr.set_event_sink(Arc::new(move |e: DownloadEvent| {
+            if let DownloadEvent::StatusChanged(d) = e {
+                events.lock().unwrap().push(d.status);
+            }
+        }));
+    }
+
+    let id = add(
+        &mgr,
+        dir.path(),
+        format!("http://127.0.0.1:{port}/index.m3u8"),
+        "status.m3u8",
+    );
+    let done = wait_done(&mgr, &id, Duration::from_secs(30)).await;
+    assert_eq!(done.status, DownloadStatus::Completed, "{:?}", done.error);
+
+    let seen = events.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        vec![DownloadStatus::Connecting, DownloadStatus::Downloading],
+        "the row must leave Connecting once the segments start, got {seen:?}"
+    );
+}

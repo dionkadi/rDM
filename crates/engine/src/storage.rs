@@ -71,7 +71,8 @@ impl Storage {
                 finished_at TEXT,
                 can_resume INTEGER NOT NULL DEFAULT 0,
                 sort_key INTEGER NOT NULL DEFAULT 0,
-                priority INTEGER NOT NULL DEFAULT 1
+                priority INTEGER NOT NULL DEFAULT 1,
+                segment_progress TEXT
             );
             CREATE TABLE IF NOT EXISTS history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,6 +107,10 @@ impl Storage {
         // upgrading.
         Self::ensure_column(&conn, "downloads", "sort_key", "INTEGER NOT NULL DEFAULT 0")?;
         Self::ensure_column(&conn, "downloads", "priority", "INTEGER NOT NULL DEFAULT 1")?;
+        // `segment_progress` is the JSON form of `SegmentProgress`; NULL
+        // means "not a playlist download" (the overwhelmingly common
+        // case), so no backfill is needed.
+        Self::ensure_column(&conn, "downloads", "segment_progress", "TEXT")?;
         Ok(())
     }
 
@@ -145,12 +150,13 @@ impl Storage {
             INSERT INTO downloads (
                 id, url, filename, save_path, total_size, downloaded, status,
                 category, content_type, chunks, speed_limit, proxy, checksum,
-                error, created_at, finished_at, can_resume
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
+                error, created_at, finished_at, can_resume, segment_progress
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
             ON CONFLICT(id) DO UPDATE SET
                 url=?2, filename=?3, save_path=?4, total_size=?5, downloaded=?6,
                 status=?7, category=?8, content_type=?9, chunks=?10, speed_limit=?11,
-                proxy=?12, checksum=?13, error=?14, finished_at=?16, can_resume=?17
+                proxy=?12, checksum=?13, error=?14, finished_at=?16, can_resume=?17,
+                segment_progress=?18
             "#,
             params![
                 d.id,
@@ -170,6 +176,9 @@ impl Storage {
                 d.created_at.to_rfc3339(),
                 d.finished_at.map(|t| t.to_rfc3339()),
                 d.can_resume as i64,
+                d.segment_progress
+                    .as_ref()
+                    .map(|p| serde_json::to_string(p).unwrap()),
             ],
         )?;
         Ok(())
@@ -191,7 +200,7 @@ impl Storage {
         let mut stmt = conn.prepare(
             "SELECT id,url,filename,save_path,total_size,downloaded,status,category,
                     content_type,chunks,speed_limit,proxy,checksum,error,created_at,
-                    finished_at,can_resume FROM downloads
+                    finished_at,can_resume,sort_key,priority,segment_progress FROM downloads
              WHERE status NOT IN (?1, ?2)",
         )?;
         let rows = stmt.query_map(
@@ -218,7 +227,8 @@ impl Storage {
         let mut stmt = conn.prepare(
             "SELECT id,url,filename,save_path,total_size,downloaded,status,category,
                     content_type,chunks,speed_limit,proxy,checksum,error,created_at,
-                    finished_at,can_resume FROM downloads WHERE id = ?1",
+                    finished_at,can_resume,sort_key,priority,segment_progress
+             FROM downloads WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], |row| Ok(self_row_to_download(row)))?;
         Ok(rows.next().transpose()?)
@@ -379,6 +389,9 @@ fn self_row_to_download(
     // `sort_key = 0` and `priority = 1` (normal).
     let sort_key: i64 = row.get::<_, Option<i64>>(17).unwrap_or(None).unwrap_or(0);
     let priority: i64 = row.get::<_, Option<i64>>(18).unwrap_or(None).unwrap_or(1);
+    // Column 19 (`segment_progress`) is the newest; a row written by an
+    // older build has NULL there, which is exactly "not a playlist".
+    let segment_progress: Option<String> = row.get(19).unwrap_or(None);
 
     Download {
         id,
@@ -420,6 +433,7 @@ fn self_row_to_download(
         auth: None,
         mirrors: Vec::new(),
         media: None,
+        segment_progress: segment_progress.and_then(|s| serde_json::from_str(&s).ok()),
     }
 }
 
@@ -453,6 +467,11 @@ mod tests {
             auth: None,
             mirrors: Vec::new(),
             media: None,
+            segment_progress: Some(crate::model::SegmentProgress {
+                total: 10,
+                done: 4,
+                active: 3,
+            }),
         }
     }
 
@@ -464,6 +483,34 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].downloaded, 40);
         assert_eq!(active[0].status, DownloadStatus::Paused);
+        // The HLS segment map is persisted as JSON so a restart shows
+        // "4 / 10" again instead of an empty row until the task resumes.
+        assert_eq!(
+            active[0].segment_progress,
+            Some(crate::model::SegmentProgress {
+                total: 10,
+                done: 4,
+                active: 3
+            })
+        );
+    }
+
+    /// A row written before `segment_progress` existed must still load —
+    /// `Download::segment_progress` is `None`, not a failed query.
+    #[test]
+    fn a_row_without_segment_progress_loads_as_none() {
+        let db = Storage::open_memory().unwrap();
+        {
+            let conn = db.inner.lock().unwrap();
+            conn.execute(
+                "INSERT INTO downloads (id,url,filename,save_path,downloaded,status,chunks,created_at)
+                 VALUES ('old','https://example.com/a.bin','a.bin','/tmp/a.bin',0,'\"paused\"','[]','2024-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+        let loaded = db.load_download("old").unwrap().expect("row");
+        assert!(loaded.segment_progress.is_none());
     }
 
     #[test]

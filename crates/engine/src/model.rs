@@ -78,6 +78,26 @@ pub struct ChecksumSpec {
     pub expected: String,
 }
 
+/// Segment-level progress for a manifest-backed download (HLS today).
+///
+/// `chunks` cannot express this. A chunk is a byte range that resumes
+/// from a byte offset; an HLS segment is a whole request whose bytes
+/// must land in playlist order, and a resumed HLS download is "the first
+/// N segments", not "the first N bytes". The UI needs the three numbers
+/// to draw a per-segment map instead of a lie about there being no
+/// chunks at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SegmentProgress {
+    /// Segments the playlist lists.
+    pub total: usize,
+    /// Segments already appended to the output file.
+    pub done: usize,
+    /// Segment fetches in flight right now. `0` when idle, paused, or
+    /// when the download is running with a single connection.
+    pub active: usize,
+}
+
 /// A single managed download.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -155,6 +175,11 @@ pub struct Download {
     /// piece of work tracked in TODO.md.
     #[serde(default)]
     pub media: Option<MediaKind>,
+    /// `Some` only for manifest-backed downloads. `chunks` stays empty
+    /// for those (segments are not byte ranges), so this is what the
+    /// row renders instead.
+    #[serde(default)]
+    pub segment_progress: Option<SegmentProgress>,
 }
 
 /// HLS / DASH manifest kinds. The presence of `Some(kind)`
@@ -224,6 +249,7 @@ impl Download {
             auth: None,
             mirrors: Vec::new(),
             media: None,
+            segment_progress: None,
         }
     }
 

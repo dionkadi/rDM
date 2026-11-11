@@ -150,9 +150,9 @@ pub async fn probe(
     // the `reqwest::Error` and dump the status, headers, and a body
     // preview to the log. Without this, the next "error decoding
     // response body" leaves no forensic trace.
-    let mut head_req = client.head(url);
-    crate::chunk::apply_extra_headers(&mut head_req, extra_headers);
-    head_req = crate::chunk::apply_auth(head_req, auth, url);
+    let head_req = client.head(url);
+    let head_req = crate::chunk::apply_extra_headers(head_req, extra_headers);
+    let head_req = crate::chunk::apply_auth(head_req, auth, url);
     let head = head_req.send().await;
     let mut resp = match head {
         Ok(r) => r,
@@ -164,9 +164,9 @@ pub async fn probe(
     let status = resp.status();
     // Some servers reject HEAD; retry with a 0-byte range GET.
     if !status.is_success() {
-        let mut ranged_req = client.get(url);
-        crate::chunk::apply_extra_headers(&mut ranged_req, extra_headers);
-        ranged_req = crate::chunk::apply_auth(ranged_req, auth, url);
+        let ranged_req = client.get(url);
+        let ranged_req = crate::chunk::apply_extra_headers(ranged_req, extra_headers);
+        let ranged_req = crate::chunk::apply_auth(ranged_req, auth, url);
         let ranged = ranged_req
             .header(reqwest::header::RANGE, "bytes=0-0")
             .send()

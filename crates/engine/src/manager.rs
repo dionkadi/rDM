@@ -997,6 +997,7 @@ mod tests {
             auth: None,
             mirrors: Vec::new(),
             media: None,
+            segment_progress: None,
         }
     }
 

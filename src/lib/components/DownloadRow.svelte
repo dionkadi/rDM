@@ -48,6 +48,49 @@
   $: pctNum = download.totalSize ? (download.downloaded / download.totalSize) * 100 : 0;
   $: eta = computeEta(download, speed);
   $: menuItems = buildMenu(download, () => (menuOpen = false));
+  // Chunked downloads report their chunk count; HLS reports live fetches.
+  // Both mean "how many connections are working on this right now".
+  $: liveStreams = download.segmentProgress
+    ? download.segmentProgress.active
+    : download.chunks.length;
+  $: segmentCells = buildSegmentCells(download);
+
+  // ── Segment map (HLS) ────────────────────────────────────
+  // A playlist can list thousands of segments. One cell per segment
+  // would bloat the DOM and be unreadable in a 400 px panel, so large
+  // playlists are bucketed: each cell covers `total / cells` segments
+  // and still shows the fraction of that bucket which is on disk.
+  const MAX_SEGMENT_CELLS = 64;
+
+  interface SegmentCell {
+    /** Fill of this cell, 0–100. */
+    pct: number;
+    /** A fetch for this bucket is in flight right now. */
+    active: boolean;
+  }
+
+  function buildSegmentCells(d: Download): SegmentCell[] {
+    const sp = d.segmentProgress;
+    if (!sp || sp.total <= 0) return [];
+    const cells = Math.min(sp.total, MAX_SEGMENT_CELLS);
+    const per = sp.total / cells;
+    const activeEnd = sp.done + sp.active;
+    const out: SegmentCell[] = [];
+    for (let i = 0; i < cells; i++) {
+      const from = Math.floor(i * per);
+      const to = Math.max(from + 1, Math.floor((i + 1) * per));
+      const count = to - from;
+      const done = Math.min(count, Math.max(0, sp.done - from));
+      out.push({
+        pct: (done / count) * 100,
+        // Only buckets that start at/after the written prefix are
+        // "in flight"; the boundary bucket is already partly on disk
+        // and must not fade its fill.
+        active: sp.active > 0 && from >= sp.done && from < activeEnd,
+      });
+    }
+    return out;
+  }
 
   function computeEta(d: Download, s: number): string | null {
     if (!d.totalSize || s <= 0) return null;
@@ -252,6 +295,7 @@
       progress={pctNum}
       status={download.status}
       chunks={download.chunks}
+      segmentProgress={download.segmentProgress ?? null}
       height={compact ? 4 : 6}
     />
 
@@ -262,10 +306,10 @@
         <span class="seg speed">{fmtRate(speed)}</span>
         {#if eta}<span class="seg">eta {eta}</span>{/if}
       {/if}
-      {#if download.chunks.length > 1}
-        <span class="seg streams">
+      {#if liveStreams > 1}
+        <span class="seg streams" title="{liveStreams} connections working on this download">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h4M17 12h4M7 8v8M17 8v8M11 6v12"/></svg>
-          {download.chunks.length} streams
+          {liveStreams} streams
         </span>
       {/if}
       {#if download.category}
@@ -287,35 +331,60 @@
 
     {#if expanded}
       <div class="expanded" transition:slide={{ duration: 220, easing: cubicOut }}>
-        <div class="ex-section">
-          <div class="ex-label">Chunks ({download.chunks.length})</div>
-          {#if download.chunks.length > 0}
-            <div class="chunks">
-              {#each download.chunks as chunk}
-                {@const isOpenEnded = !Number.isFinite(chunk.end) || chunk.end > Number.MAX_SAFE_INTEGER}
-                {@const size = isOpenEnded ? 0 : chunk.end - chunk.start + 1}
-                {@const chunkPct = isOpenEnded ? 0 : (chunk.downloaded / size) * 100}
-                <div class="chunk">
-                  <div class="chunk-head">
-                    <span>#{chunk.index}</span>
-                    <span>
-                      {fmtBytes(chunk.downloaded)}{#if isOpenEnded}
-                        <span class="open-ended-hint">· unknown total</span>
-                      {:else}
-                        &nbsp;/&nbsp;{fmtBytes(size)}
-                      {/if}
-                    </span>
-                  </div>
-                  <div class="chunk-bar">
-                    <div class="chunk-fill" style="width: {chunkPct}%"></div>
-                  </div>
-                </div>
+        {#if download.segmentProgress}
+          {@const sp = download.segmentProgress}
+          <div class="ex-section">
+            <div class="ex-label">
+              Segments
+              <span class="ex-count">{sp.done.toLocaleString()} / {sp.total.toLocaleString()}</span>
+              {#if sp.active > 0}
+                <span class="ex-note">{sp.active} in flight</span>
+              {:else if sp.done >= sp.total}
+                <span class="ex-note">all written</span>
+              {/if}
+            </div>
+            <div class="seg-map" title="One cell per segment (bucketed for long playlists): filled means the bytes are in the output file">
+              {#each segmentCells as cell}
+                <span class="seg-cell" class:active={cell.active}>
+                  <i style="width: {cell.pct}%"></i>
+                </span>
               {/each}
             </div>
-          {:else}
-            <div class="hint">Single-connection transfer (no chunks)</div>
-          {/if}
-        </div>
+            <div class="hint seg-legend">
+              Fetched concurrently, written in playlist order; tinted cells are in flight.
+            </div>
+          </div>
+        {:else}
+          <div class="ex-section">
+            <div class="ex-label">Chunks ({download.chunks.length})</div>
+            {#if download.chunks.length > 0}
+              <div class="chunks">
+                {#each download.chunks as chunk}
+                  {@const isOpenEnded = !Number.isFinite(chunk.end) || chunk.end > Number.MAX_SAFE_INTEGER}
+                  {@const size = isOpenEnded ? 0 : chunk.end - chunk.start + 1}
+                  {@const chunkPct = isOpenEnded ? 0 : (chunk.downloaded / size) * 100}
+                  <div class="chunk">
+                    <div class="chunk-head">
+                      <span>#{chunk.index}</span>
+                      <span>
+                        {fmtBytes(chunk.downloaded)}{#if isOpenEnded}
+                          <span class="open-ended-hint">· unknown total</span>
+                        {:else}
+                          &nbsp;/&nbsp;{fmtBytes(size)}
+                        {/if}
+                      </span>
+                    </div>
+                    <div class="chunk-bar">
+                      <div class="chunk-fill" style="width: {chunkPct}%"></div>
+                    </div>
+                  </div>
+                {/each}
+              </div>
+            {:else}
+              <div class="hint">Single-connection transfer (no chunks)</div>
+            {/if}
+          </div>
+        {/if}
 
         <div class="ex-grid">
           <div class="ex-stat">
@@ -623,6 +692,46 @@
     letter-spacing: 0.1em;
     color: var(--text-faint);
     margin-bottom: 8px;
+  }
+  .ex-count {
+    margin-left: 6px;
+    font-weight: 600;
+    letter-spacing: 0;
+    text-transform: none;
+    color: var(--text);
+  }
+  .ex-note {
+    margin-left: 8px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0;
+    text-transform: none;
+    color: var(--accent);
+  }
+  .seg-map {
+    display: flex;
+    gap: 1px;
+    height: 18px;
+  }
+  .seg-cell {
+    flex: 1 1 0;
+    min-width: 0;
+    background: rgba(255, 255, 255, 0.06);
+    border-radius: 1px;
+    overflow: hidden;
+  }
+  .seg-cell i {
+    display: block;
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), var(--accent-2));
+    transition: width 0.3s;
+  }
+  .seg-cell.active {
+    background: var(--accent);
+    opacity: 0.55;
+  }
+  .seg-legend {
+    margin-top: 8px;
   }
   .chunks {
     display: grid;

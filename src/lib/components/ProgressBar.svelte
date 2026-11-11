@@ -1,9 +1,16 @@
 <script lang="ts">
-  import type { ChunkState } from "../types";
+  import type { ChunkState, SegmentProgress } from "../types";
 
   export let progress: number = 0;        // 0-100
   export let status: string = "";
   export let chunks: ChunkState[] = [];   // for segmented display
+  /**
+   * HLS rows have no chunks (a segment is a whole request, not a byte
+   * range) but they do have several fetches in flight. Drawing that
+   * window just past the filled part is what makes the bar look alive
+   * instead of frozen between segment boundaries.
+   */
+  export let segmentProgress: SegmentProgress | null = null;
   export let height: number = 6;
   export let showShimmer: boolean | undefined = undefined;
 
@@ -11,8 +18,22 @@
   $: shimmer = showShimmer ?? isActive;
   $: hasSegments = chunks.length > 1;
 
-  // Compute per-chunk progress
-  $: segmentProgress = hasSegments
+  // The in-flight band sits at the end of the *byte* fill, not at the
+  // segment fraction: the two are close but not identical (the total is
+  // an estimate derived from segment durations), and a band that floats
+  // away from the fill edge reads as a bug.
+  $: fillPct = Math.min(100, Math.max(0, progress));
+  $: activePct =
+    segmentProgress && segmentProgress.total > 0 && segmentProgress.active > 0
+      ? Math.min(
+          100 - fillPct,
+          Math.max(1.5, (segmentProgress.active / segmentProgress.total) * 100)
+        )
+      : 0;
+
+  // Per-chunk fill percentages (the chunked path); the HLS path uses
+  // the `segmentProgress` prop instead — do not reuse the name.
+  $: chunkFill = hasSegments
     ? chunks.map((c) => {
         const size = c.end - c.start + 1;
         return Math.min(100, (c.downloaded / size) * 100);
@@ -22,10 +43,10 @@
 
 <div class="bar" style="height: {height}px" class:segmented={hasSegments} role="progressbar" aria-valuenow={progress} aria-valuemin="0" aria-valuemax="100" aria-label="Download progress">
   {#if hasSegments}
-    {#each segmentProgress as seg, i}
+    {#each chunkFill as seg, i}
       <div class="seg" style="--pct: {seg}%">
         <div class="seg-fill" class:shimmer={isActive}></div>
-        {#if i < segmentProgress.length - 1}
+        {#if i < chunkFill.length - 1}
           <div class="divider"></div>
         {/if}
       </div>
@@ -34,8 +55,11 @@
     <div
       class="fill {status}"
       class:shimmer={shimmer}
-      style="width: {Math.min(100, Math.max(0, progress))}%"
+      style="width: {fillPct}%"
     ></div>
+    {#if activePct > 0}
+      <div class="inflight" style="left: {fillPct}%; width: {activePct}%"></div>
+    {/if}
   {/if}
 </div>
 
@@ -65,6 +89,15 @@
   }
   .fill.paused {
     background: linear-gradient(90deg, var(--text-muted), var(--text-faint));
+  }
+  .inflight {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    background: var(--accent);
+    opacity: 0.3;
+    border-radius: 9999px;
+    transition: left 0.3s cubic-bezier(0.4, 0, 0.2, 1), width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
   }
   .fill.shimmer::after {
     content: "";
