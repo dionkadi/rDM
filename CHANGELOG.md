@@ -16,6 +16,8 @@ remains the detailed source of truth.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-11
+
 ### Added — the row shows what an HLS download is actually doing
 
 - **Per-segment map.** `Download.segmentProgress` (`total` / `done` /

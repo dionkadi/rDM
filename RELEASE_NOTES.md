@@ -13,6 +13,8 @@ complete when they don't.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-11
+
 ### Fixed
 
 - **The global speed limit is actually global now.** It applied per
