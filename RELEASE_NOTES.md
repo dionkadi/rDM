@@ -13,6 +13,20 @@ complete when they don't.
 
 ## [Unreleased]
 
+### Added
+
+- **Multi-algorithm checksums.** Downloads can be verified against
+  MD5, SHA-1, SHA-256 or SHA-512; common tool spellings (`sha256sum`,
+  `sha-256`, …) are accepted, and unsupported algorithms are rejected
+  when the download is added instead of at 100 %.
+- **Launch at login** toggle in Settings → General → Behavior
+  (Registry Run key / LaunchAgent / `.desktop` autostart).
+
+### Fixed
+
+- **Windows: adding a task no longer wedges the UI.** Event-emitting
+  Tauri commands run on the async runtime instead of the main thread.
+
 ## [0.7.0] - 2026-11-11
 
 ### Fixed

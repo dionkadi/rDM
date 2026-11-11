@@ -81,6 +81,17 @@
   let error = "";
   let pingResult = "";
 
+  // Checksum algorithms the engine can verify. The engine accepts the
+  // common tool spellings too (md5sum, sha-256, …) but the UI offers
+  // the canonical names only — the dropdown sends exactly what the
+  // engine normalizes to.
+  const CHECKSUM_ALGOS: Array<{ value: string; label: string }> = [
+    { value: "md5", label: "MD5" },
+    { value: "sha1", label: "SHA-1" },
+    { value: "sha256", label: "SHA-256" },
+    { value: "sha512", label: "SHA-512" },
+  ];
+
   let clipTimer: ReturnType<typeof setInterval> | null = null;
   let dragDepth = 0;
 
@@ -617,16 +628,6 @@
     }
   }
 
-  // ── Autostart (informational; the actual toggle lives in Settings) ───
-  // Note: the autostart plugin is queried at app start to verify availability.
-  // Toggling happens via the Settings panel.
-  async function loadAutostart() {
-    try {
-      const { isEnabled } = await import("@tauri-apps/plugin-autostart");
-      await isEnabled();
-    } catch { /* unavailable outside Tauri */ }
-  }
-
   // ── Clipboard ─────────────────────────────────────────────────
   async function checkClipboard() {
     try {
@@ -757,7 +758,6 @@
       }
       await loadSettings();
       if ($settings?.clipboardMonitor) startClipboardMonitor();
-      await loadAutostart();
       startSpeedMonitor();
       await startEventListener();
       doPing();
@@ -941,6 +941,16 @@
           checksum
         </label>
         {#if showChecksum}
+          <select
+            class="cat-select"
+            style="flex:0 0 auto;width:auto"
+            bind:value={checksumAlgo}
+            aria-label="Checksum algorithm"
+          >
+            {#each CHECKSUM_ALGOS as algo}
+              <option value={algo.value}>{algo.label}</option>
+            {/each}
+          </select>
           <input class="grow" style="flex:1 1 160px" placeholder="expected hash (hex)" bind:value={checksumExpected} />
         {/if}
       </div>

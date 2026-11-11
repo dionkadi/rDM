@@ -108,6 +108,7 @@
   // the Network tab and focus the URL field. The window event is dispatched
   // by App.svelte (dynamic import → cleaner than threading a prop).
   import { onMount, onDestroy } from "svelte";
+  import { isEnabled as autostartIsEnabled, enable as autostartEnable, disable as autostartDisable } from "@tauri-apps/plugin-autostart";
   function focusProxyUrlFromPalette() {
     activeTab = "network";
     // Wait for the tab to render before focusing.
@@ -120,6 +121,20 @@
     refreshAppInfo();
     refreshExtStatus();
     probeTimer = setInterval(refreshExtStatus, 3000);
+    // Autostart (launch at login) is managed by the tauri-plugin-autostart
+    // plugin rather than the engine's settings table — the OS owns this
+    // preference, so we read it from the plugin and only mirror the value
+    // into this local component state. `isEnabled` rejects outside Tauri
+    // (preview mode) or when the OS backend refuses; in that case the
+    // toggle is rendered disabled with a hint instead of lying.
+    autostartIsEnabled()
+      .then((on) => {
+        autostartEnabled = on;
+        autostartAvailable = true;
+      })
+      .catch(() => {
+        autostartAvailable = false;
+      });
   });
   onDestroy(() => {
     if (typeof window !== "undefined") {
@@ -167,6 +182,48 @@
   function toggleScheduler() {
     if (!$settings) return;
     save({ scheduleEnabled: !$settings.scheduleEnabled });
+  }
+
+  // ── Launch at login (autostart) ─────────────────────────────────
+  //
+  // Unlike the toggles above, autostart is NOT stored in the engine's
+  // settings table: the OS owns the registration (Registry Run key on
+  // Windows, LaunchAgent on macOS, .desktop autostart entry on Linux)
+  // via tauri-plugin-autostart. The Rust side registered the plugin
+  // and the `autostart:*` permissions are in the capability file, so
+  // the frontend can call enable/disable/isEnabled directly.
+  let autostartAvailable = false;
+  let autostartEnabled = false;
+  let autostartBusy = false;
+
+  async function toggleAutostart() {
+    if (!autostartAvailable || autostartBusy) return;
+    autostartBusy = true;
+    const want = !autostartEnabled;
+    try {
+      if (want) {
+        await autostartEnable();
+      } else {
+        await autostartDisable();
+      }
+      // Re-read rather than trusting the call succeeded — some Linux
+      // backends resolve the promise even when the .desktop write
+      // failed, and re-reading keeps the switch honest.
+      autostartEnabled = await autostartIsEnabled();
+      showToast({
+        kind: autostartEnabled === want ? "success" : "error",
+        title: autostartEnabled ? "DM will start on login" : "Autostart disabled",
+        duration: 1800,
+      });
+    } catch (e) {
+      showToast({
+        kind: "error",
+        title: "Autostart change failed",
+        message: String(e),
+      });
+    } finally {
+      autostartBusy = false;
+    }
   }
 
   async function addCategory() {
@@ -252,6 +309,27 @@
 
         <section class="set-section">
           <h3>Behavior</h3>
+          <div class="set-line">
+            <div>
+              <div class="lbl">Launch at login</div>
+              <div class="hint">
+                {#if autostartAvailable}
+                  Start DM automatically when you sign in
+                {:else}
+                  Autostart is not available in this environment
+                {/if}
+              </div>
+            </div>
+            <button
+              class="switch"
+              class:on={autostartEnabled}
+              aria-pressed={autostartEnabled}
+              disabled={!autostartAvailable || autostartBusy}
+              on:click={toggleAutostart}
+            >
+              <span class="knob"></span>
+            </button>
+          </div>
           <div class="set-line">
             <div>
               <div class="lbl">Close to system tray</div>

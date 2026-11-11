@@ -16,6 +16,42 @@ remains the detailed source of truth.
 
 ## [Unreleased]
 
+### Added — multi-algorithm checksum verification
+
+- **Checksums now support MD5, SHA-1, SHA-256 and SHA-512** (previously
+  the engine verified `sha256` only and silently skipped every other
+  algorithm name). The engine normalizes the common tool spellings too
+  (`md5sum`, `sha-256`, `sha256sum`, …), so a digest pasted out of a
+  `.sha256`/`.md5` listing works regardless of how it was labelled.
+  Unknown algorithms are rejected with a clear error when the download
+  is added instead of failing at 100 %.
+- The checksum algorithm dropdowns (home add-row and capture dialog)
+  now offer MD5 / SHA-1 / SHA-256 / SHA-512.
+
+### Added — launch at login (autostart)
+
+- **Settings → General → Behavior → "Launch at login".** The
+  `tauri-plugin-autostart` plugin was already registered with its
+  capability permissions in place, but no UI exposed it; the new toggle
+  reads the OS registration via the plugin (Registry Run key on Windows,
+  LaunchAgent on macOS, `.desktop` autostart entry on Linux) and
+  disables itself with a hint when the backend is unavailable.
+
+### Fixed — Windows: adding a task wedged the UI
+
+- **On Windows, adding a download left the app half-alive: the window
+  kept painting (UI "not frozen") but every button that talks to the
+  engine did nothing and the new task only appeared after a restart.**
+  Root cause: `add_download`, pause/resume/cancel/remove, reorder,
+  priority and trash were *synchronous* Tauri commands. Sync commands
+  run on the main thread, and each of them emits a lifecycle event to
+  the webview while it runs — a combination that wedges the WebView2
+  IPC channel (see tauri-apps/tauri#9453): `invoke()` promises never
+  resolve, so the post-add list refresh and every later engine-driven
+  update never arrive. All event-emitting commands are now `async`
+  (they run on the async runtime thread pool), which removes the
+  re-entrancy entirely.
+
 ## [0.7.0] - 2026-11-11
 
 ### Added — the row shows what an HLS download is actually doing

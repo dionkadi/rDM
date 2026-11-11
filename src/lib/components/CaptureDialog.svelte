@@ -409,9 +409,10 @@
             <span class="lbl">Checksum</span>
             <div class="chk-row">
               <select class="sel" bind:value={checksumAlgo}>
-                <option value="sha256">SHA-256</option>
-                <option value="sha1">SHA-1</option>
                 <option value="md5">MD5</option>
+                <option value="sha1">SHA-1</option>
+                <option value="sha256">SHA-256</option>
+                <option value="sha512">SHA-512</option>
               </select>
               <input class="inp" type="text" placeholder="expected hex" bind:value={checksumExpected} spellcheck="false" />
             </div>
