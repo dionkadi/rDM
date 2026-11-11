@@ -1,7 +1,7 @@
 //! Token-bucket rate limiting for download speed caps (global + per-download).
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 struct BucketState {
@@ -83,18 +83,38 @@ impl TokenBucket {
 }
 
 /// Combines a global and a per-download bucket; the more restrictive one wins.
+///
+/// Both buckets are held behind `Arc` so a per-download limiter can share the
+/// manager's *single* global bucket: without sharing, every download gets its
+/// own full-rate bucket and N concurrent downloads reach N × the configured
+/// global cap.
 #[derive(Default)]
 pub struct CombinedLimiter {
-    global: TokenBucket,
-    per_download: TokenBucket,
+    global: Arc<TokenBucket>,
+    per_download: Arc<TokenBucket>,
 }
 
 impl CombinedLimiter {
     pub fn new(global_rate: u64, per_download_rate: u64) -> Self {
         CombinedLimiter {
-            global: TokenBucket::new(global_rate),
-            per_download: TokenBucket::new(per_download_rate),
+            global: Arc::new(TokenBucket::new(global_rate)),
+            per_download: Arc::new(TokenBucket::new(per_download_rate)),
         }
+    }
+
+    /// Build a per-download limiter that **shares** the manager's global
+    /// bucket and owns a fresh per-download bucket. All downloads created
+    /// from the same `global` therefore draw from one shared allowance.
+    pub fn from_shared(global: Arc<TokenBucket>, per_download_rate: u64) -> Self {
+        CombinedLimiter {
+            global,
+            per_download: Arc::new(TokenBucket::new(per_download_rate)),
+        }
+    }
+
+    /// The shared global bucket (for constructing shared limiters).
+    pub fn global_bucket(&self) -> Arc<TokenBucket> {
+        Arc::clone(&self.global)
     }
 
     pub fn set_global_rate(&self, rate: u64) {
@@ -145,5 +165,24 @@ mod tests {
         let start = Instant::now();
         c.acquire(100).await;
         assert!(start.elapsed() >= Duration::from_millis(600));
+    }
+
+    /// Pin the shared-global-bucket semantics: two limiters built from the
+    /// same `global_bucket()` must draw from ONE allowance. With separate
+    /// buckets, two concurrent 100-byte acquires at 100 B/s both finish in
+    /// ~0.8 s (2 × burst 20 + 80 wait each, in parallel). Shared, they must
+    /// serialise: 200 bytes total at 100 B/s minus 40 burst ≈ 1.6 s.
+    #[tokio::test]
+    async fn shared_global_bucket_is_shared() {
+        let g = Arc::new(TokenBucket::new(100));
+        let a = CombinedLimiter::from_shared(Arc::clone(&g), 0);
+        let b = CombinedLimiter::from_shared(Arc::clone(&g), 0);
+        let start = Instant::now();
+        tokio::join!(a.acquire(100), b.acquire(100));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(1100),
+            "shared bucket must serialise the two acquires, took {elapsed:?}"
+        );
     }
 }

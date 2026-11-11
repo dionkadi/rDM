@@ -312,18 +312,45 @@ pub fn plan_chunks(total: u64, n: usize) -> Vec<ChunkState> {
 /// separate from the chunk `client`. Passing the same client to both
 /// works (and is what the test suite does for in-process servers) but
 /// may surface a `decode body` error on misconfigured mirrors.
+///
+/// **Mirror fallback**: when the primary URL fails to probe (4xx/5xx/
+/// transport error), `download.mirrors` is walked in order and the first
+/// mirror that probes successfully becomes the download's new primary
+/// URL (persisted with the row, so resumes keep using it). Only
+/// probe-time fallback is implemented; a mirror switch *mid-transfer*
+/// is not.
 pub async fn build_plan(
     probe_client: &Client,
     download: &mut Download,
     max_connections: usize,
 ) {
-    match probe(
+    let mut probed = probe(
         probe_client,
         &download.url,
         &download.headers,
         download.auth.as_ref(),
     )
-    .await {
+    .await;
+    if probed.is_err() && !download.mirrors.is_empty() {
+        for mirror in &download.mirrors {
+            log::warn!(
+                "primary probe failed ({}), trying mirror {mirror}",
+                download.error.clone().unwrap_or_default()
+            );
+            match probe(probe_client, mirror, &download.headers, download.auth.as_ref()).await {
+                Ok(p) => {
+                    log::info!("mirror {mirror} probed ok; promoting it to primary url");
+                    download.url = mirror.clone();
+                    probed = Ok(p);
+                    break;
+                }
+                // Remember the last mirror's failure for the error message,
+                // but keep trying the remaining mirrors first.
+                Err(e) => probed = Err(e),
+            }
+        }
+    }
+    match probed {
         Ok(p) => {
             download.can_resume = p.accept_ranges;
             download.content_type = p.content_type.clone();
@@ -393,5 +420,92 @@ mod tests {
             suggest_filename("https://example.com/x", Some("attachment; filename=\"my file.mp4\""), "dl"),
             "my file.mp4"
         );
+    }
+
+    /// A tiny std-net server that answers every request's HEAD with a
+    /// valid file description (used to simulate a reachable mirror).
+    fn spawn_head_server(content_length: u64) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut s = match stream {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                std::thread::spawn(move || {
+                    use std::io::{Read, Write};
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf);
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {content_length}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = s.write_all(resp.as_bytes());
+                });
+            }
+        });
+        port
+    }
+
+    /// When the primary URL fails to probe, `build_plan` must walk
+    /// `mirrors` in order and promote the first reachable one to the
+    /// download's primary URL (the documented mirror-fallback contract).
+    #[tokio::test]
+    async fn build_plan_falls_back_to_reachable_mirror() {
+        let mirror_port = spawn_head_server(4242);
+        // A port with nothing listening: the primary probe must fail.
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+
+        let mut d = Download::new(format!("http://127.0.0.1:{dead}/primary.bin"));
+        d.mirrors = vec![format!("http://127.0.0.1:{mirror_port}/mirror.bin")];
+
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            // 测试必须直连：环境里的 HTTP_PROXY 会劫持对 127.0.0.1 的请求
+            .no_proxy()
+            .build()
+            .unwrap();
+        crate::protocol::build_plan(&client, &mut d, 8).await;
+
+        assert!(
+            d.error.is_none(),
+            "a reachable mirror must rescue the plan, got error {:?}",
+            d.error
+        );
+        assert!(
+            d.url.ends_with("/mirror.bin"),
+            "the working mirror must become the primary url, got {}",
+            d.url
+        );
+        assert_eq!(d.total_size, Some(4242));
+        assert!(d.can_resume);
+        assert!(!d.chunks.is_empty());
+    }
+
+    /// With no mirrors configured, a failed probe keeps the old behaviour:
+    /// the error is recorded on the row and no chunks are planned.
+    #[tokio::test]
+    async fn build_plan_without_mirrors_records_probe_error() {
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+        let mut d = Download::new(format!("http://127.0.0.1:{dead}/primary.bin"));
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .no_proxy()
+            .build()
+            .unwrap();
+        crate::protocol::build_plan(&client, &mut d, 8).await;
+        assert!(d.error.is_some(), "probe failure must be recorded");
+        assert!(d.chunks.is_empty());
+        assert!(d.total_size.is_none());
     }
 }

@@ -32,6 +32,18 @@ impl Storage {
         // makes the writer WAIT for the lock instead (5 s is generous
         // for the short row writes this app does).
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // WAL + synchronous=NORMAL. The engine writes one transaction per
+        // status change plus a progress flush every 1 MiB; in the default
+        // rollback-journal mode every commit fsyncs the main DB file
+        // (~10-20 ms on consumer NVMe), which serialised concurrent
+        // downloads on the storage Mutex and capped a single transfer at
+        // roughly 1 MiB / fsync ≈ 70 MB/s. WAL appends commits to the
+        // -wal log and only fsyncs it on checkpoint; synchronous=NORMAL
+        // keeps durability across *process* crashes (the contract the
+        // progress-persistence tests pin) while dropping the per-commit
+        // fsync that hurt throughput.
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         let s = Storage {
             inner: Arc::new(Mutex::new(conn)),
         };

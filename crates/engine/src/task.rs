@@ -149,14 +149,19 @@ fn build_client(proxy: Option<&str>) -> reqwest::Client {
             );
             h
         });
-    if let Some(p) = proxy {
-        if !p.is_empty() {
-            // Best-effort — invalid URLs (e.g. malformed SOCKS scheme) fall
-            // back to a direct client and surface a runtime error when used.
-            if let Ok(proxy) = reqwest::Proxy::all(p) {
-                builder = builder.proxy(proxy);
-            }
+    // Proxy policy is resolved by the engine itself (None / System / Manual
+    // → `effective_proxy_url`). A `None` / empty here therefore means
+    // "direct, ever" — reqwest by default still honours HTTP_PROXY /
+    // HTTPS_PROXY env vars, so we must opt out explicitly or a user who
+    // picked "no proxy" silently tunnels through the ambient proxy.
+    if let Some(p) = proxy.filter(|p| !p.is_empty()) {
+        // Best-effort — invalid URLs (e.g. malformed SOCKS scheme) fall
+        // back to a direct client and surface a runtime error when used.
+        if let Ok(proxy) = reqwest::Proxy::all(p) {
+            builder = builder.proxy(proxy);
         }
+    } else {
+        builder = builder.no_proxy();
     }
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
 }
@@ -200,12 +205,13 @@ fn build_probe_client(proxy: Option<&str>) -> reqwest::Client {
             );
             h
         });
-    if let Some(p) = proxy {
-        if !p.is_empty() {
-            if let Ok(proxy) = reqwest::Proxy::all(p) {
-                builder = builder.proxy(proxy);
-            }
+    // Same proxy-policy semantics as `build_client`: None/empty → `.no_proxy()`.
+    if let Some(p) = proxy.filter(|p| !p.is_empty()) {
+        if let Ok(proxy) = reqwest::Proxy::all(p) {
+            builder = builder.proxy(proxy);
         }
+    } else {
+        builder = builder.no_proxy();
     }
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
 }
@@ -261,12 +267,20 @@ pub async fn run_download(ctx: Arc<RunContext>, state: Arc<TaskState>) {
         build_plan(&probe_client, &mut local, ctx.max_connections).await;
         {
             let mut d = state.download.lock().unwrap();
+            // Mirror promotion: build_plan may have replaced the primary URL
+            // with the first mirror that probed successfully. Without this
+            // copy-back the promotion is lost and the download keeps
+            // hammering the dead primary.
+            d.url = local.url.clone();
             d.can_resume = local.can_resume;
             d.content_type = local.content_type;
             if d.filename.is_empty() || d.filename == "download.bin" {
                 d.filename = local.filename;
             }
             d.total_size = local.total_size;
+            // Preserve the probe's error message (used by the early-exit
+            // below when nothing could be planned).
+            d.error = local.error.clone();
             if d.chunks.is_empty() {
                 if local.total_size.is_none() && local.chunks.is_empty() {
                     // Unknown size + no ranges → single open-ended connection.
@@ -291,6 +305,25 @@ pub async fn run_download(ctx: Arc<RunContext>, state: Arc<TaskState>) {
                 }
             }
         }
+        // If the probe failed on the primary AND every mirror, nothing was
+        // planned (no size, no chunks) — fail the download now with the
+        // probe's message instead of falling through to the open-ended
+        // path, which would just re-request the same dead URL a second
+        // time and delay the error the user sees.
+        let probe_dead = {
+            let d = state.download.lock().unwrap();
+            d.error.is_some() && d.total_size.is_none() && d.chunks.is_empty()
+        };
+        if probe_dead {
+            let mut d = state.download.lock().unwrap();
+            let msg = d.error.clone().unwrap_or_else(|| "probe failed".into());
+            d.status = DownloadStatus::Error;
+            d.error = Some(msg.clone());
+            let _ = ctx.storage.mark_error(&id, &msg);
+            ctx.emit(DownloadEvent::Error(d.clone()));
+            ctx.scheduler.release_download_state(&id);
+            return;
+        }
     }
     {
         let mut d = state.download.lock().unwrap();
@@ -301,7 +334,14 @@ pub async fn run_download(ctx: Arc<RunContext>, state: Arc<TaskState>) {
 
     // ---- 2. Spawn chunk workers ----
     let per_download_limit = state.download.lock().unwrap().speed_limit.unwrap_or(0);
-    let limiter = Arc::new(CombinedLimiter::new(ctx.global_limiter.rate(), per_download_limit));
+    // Share the manager's *single* global bucket so N concurrent downloads
+    // draw from one allowance (a fresh bucket per download used to let N
+    // downloads reach N × the configured global cap). The per-download
+    // bucket stays private to this download.
+    let limiter = Arc::new(CombinedLimiter::from_shared(
+        ctx.global_limiter.global_bucket(),
+        per_download_limit,
+    ));
 
     let (url, save_path, chunks, headers, auth) = {
         let d = state.download.lock().unwrap();
@@ -549,10 +589,14 @@ pub async fn run_download(ctx: Arc<RunContext>, state: Arc<TaskState>) {
             }
         }
 
-        // Checksum verification.
+        // Checksum verification. The bytes live in `<save_path>.part` at
+        // this point — the final filename does not exist until the rename
+        // below. Verifying `save_path` here used to read a missing file and
+        // fail EVERY checksummed download with "checksum read failed: No
+        // such file or directory". Verify the `.part`, then rename.
         if let Some(cs) = &d.checksum {
             if cs.algorithm.eq_ignore_ascii_case("sha256") {
-                match sha256_of(&save_path) {
+                match sha256_of(&d.part_path()) {
                     Ok(actual) if actual.eq_ignore_ascii_case(&cs.expected) => {}
                     Ok(actual) => {
                         d.status = DownloadStatus::Error;
@@ -1106,8 +1150,9 @@ async fn run_hls_download(
         )
     };
     let client = build_client(proxy.as_deref());
-    let limiter = Arc::new(CombinedLimiter::new(
-        ctx.global_limiter.rate(),
+    // Same shared-global-bucket semantics as the plain path (see run_download).
+    let limiter = Arc::new(CombinedLimiter::from_shared(
+        ctx.global_limiter.global_bucket(),
         per_download_limit,
     ));
 
