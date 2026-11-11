@@ -5,6 +5,11 @@ All notable changes to DM will be documented in this file.
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+Concise, user-facing summaries per release live in
+[`RELEASE_NOTES.md`](RELEASE_NOTES.md); the release tooling prefers that
+file and falls back to the matching section here, so this changelog
+remains the detailed source of truth.
+
 > **Note:** Versions before 1.0.0 (i.e. `0.x.y`) are pre-1.0 and may
 > ship breaking changes between minor versions. Once we hit 1.0.0 we
 > commit to the SemVer stability guarantees.
@@ -54,6 +59,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the capture dialog, an `Authorization`) ran on a fresh client: no
   proxy, no timeouts, default UA, and — for HLS — a new TCP+TLS
   handshake per segment. The builder is now threaded through instead.
+
+### Fixed — a benchmark sweep surfaced four engine-level defects
+
+The engine grew a fault-injecting benchmark harness (see Added below),
+and its very first full run found four real bugs that unit tests had
+missed. All four are fixed here and pinned by tests.
+
+- **The global speed limit applied per download, not globally.** Every
+  spawned download built a fresh rate bucket at the *full* global rate,
+  so four concurrent downloads ran 4× the configured cap (measured
+  29.3 MB/s against an 8 MB/s setting). `CombinedLimiter` now holds its
+  buckets behind `Arc` and `run_download` / `run_hls_download` share the
+  manager's single global bucket (`from_shared`); a live limit change
+  reaches in-flight downloads too. Four concurrent downloads against an
+  8 MB/s cap now measure 8.36 MB/s (+4.6 %, the token bucket's burst
+  allowance).
+- **SHA-256 verification failed on every download that asked for it.**
+  The finalizer verified `save_path` *before* renaming `.part` into
+  place, so it read a file that did not exist yet and every checksummed
+  download ended as `checksum read failed: No such file or directory`.
+  The digest is now computed over the `.part` — whose bytes are complete
+  at that point — and the rename happens only after it matches.
+- **"No proxy" still tunnelled through ambient proxies.** The engine
+  resolved its own proxy policy but never told reqwest to *disable* the
+  system one, so `HTTP_PROXY` / `HTTPS_PROXY` env vars hijacked
+  downloads even with proxy mode None — and a broken env proxy turned
+  every capture into `502 Bad Gateway`. Both clients now call
+  `.no_proxy()` when the resolved policy is none.
+- **Mirror failover was a dead feature.** `set_mirrors` persisted the
+  list but nothing ever read it, even though the field docs promised
+  per-URL failover. `build_plan` now probes the primary, and on failure
+  walks `mirrors` in order, promoting the first mirror that answers to
+  the primary URL (persisted with the row, so resumes keep using it).
+  Fixing this also exposed a second gap: the plan copy-back dropped
+  `url` and `error`, so the promotion was lost and a hopeless probe
+  re-requested the dead URL through the open-ended path — the copy-back
+  now carries both, and a probe that fails everywhere fails the
+  download immediately with the probe's message.
+
+### Changed — storage no longer serialises downloads
+
+- **SQLite opens in WAL mode with `synchronous=NORMAL`.** The engine
+  writes one transaction per status change plus a progress flush every
+  1 MiB; in rollback-journal mode every commit fsynced the database
+  file (~15 ms on the benchmark machine), which serialised all
+  downloads on the storage mutex — a 100-way batch spent roughly its
+  entire 19.6 s makespan inside SQLite — and capped a single transfer
+  at about 1 MiB per fsync ≈ 70 MB/s. WAL keeps the crash-recovery
+  contract (progress survives a killed process; the persistence tests
+  pin it) while dropping the per-commit fsync. Measured on the same
+  harness: hot upserts 68 → 29 300 ops/s, single-stream 85 → 1 576 MB/s,
+  100-way makespan 19.6 s → 1.6 s, and the mysterious "32-connection
+  throughput dip" (31 MB/s against 95 MB/s at 4 connections) is gone —
+  it was the flush serialisation all along.
+
+### Added — a benchmark & stress harness for the engine
+
+- **`cargo run --release -p dm-engine --example bench`** drives the real
+  `DownloadManager` end-to-end against a fault-injecting in-process
+  HTTP server (Range/206, HEAD variants, per-connection throttling,
+  mid-body truncation, missing `Content-Length`, 403/404/405/500,
+  HLS with AES-128) across 12 scenarios — probe latency, chunk scaling
+  (1–32 connections), concurrency (5–100 downloads), queueing, rate
+  limit accuracy, 13 edge cases, small-file churn, storage, a storage
+  A/B, HLS, SHA-256 cost and a 120 s soak with pause/cancel churn —
+  sampling CPU / RSS / disk IO throughout and writing one JSON.
+  `--quick` and `--only <scenario>` keep the iteration loop fast.
+- The two recorded full runs are checked in as reports with charts:
+  [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md) (before the fixes,
+  including the root-cause analyses) and
+  [`FIX_VERIFICATION.md`](FIX_VERIFICATION.md) (after), sourced from
+  `target/bench/results*.json`.
+- Three regression tests pin the new semantics: the shared global
+  bucket serialises two downloads
+  (`shared_global_bucket_is_shared`), a reachable mirror is promoted
+  to the primary URL (`build_plan_falls_back_to_reachable_mirror`),
+  and a probe failure without mirrors keeps the old error path
+  (`build_plan_without_mirrors_records_probe_error`). Engine suite:
+  **109** tests, all green.
 
 ## [0.6.0] - 2026-11-10
 
