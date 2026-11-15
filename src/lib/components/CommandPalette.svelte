@@ -1,7 +1,6 @@
 <script lang="ts">
   import { createEventDispatcher } from "svelte";
-  import { fly, fade } from "svelte/transition";
-  import { cubicOut } from "svelte/easing";
+  import { fade } from "svelte/transition";
   import { showCommandPalette } from "../stores/ui";
   import { downloads } from "../stores/downloads";
   import { fuzzySearch } from "../utils/fuzzySearch";
@@ -89,7 +88,7 @@
 
 {#if $showCommandPalette}
   <div class="backdrop" transition:fade={{ duration: 150 }} on:click={close} role="presentation"></div>
-  <div class="palette" transition:fly={{ y: -10, duration: 220, easing: cubicOut }} role="dialog" aria-modal="true" aria-label="Command palette">
+  <div class="palette" transition:fade={{ duration: 120 }} role="dialog" aria-modal="true" aria-label="Command palette">
     <div class="header">
       <svg class="search-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16zM21 21l-4.35-4.35"/></svg>
       <input
@@ -100,9 +99,19 @@
         autocomplete="off"
         spellcheck="false"
       />
-      <div class="modes">
-        <button class="mode" class:active={mode === "command"} on:click={() => (mode = "command")}>⌘</button>
-        <button class="mode" class:active={mode === "download"} on:click={() => (mode = "download")}>⬇</button>
+      <div class="modes" role="group" aria-label="Palette mode">
+        <button
+          class="mode"
+          class:active={mode === "command"}
+          on:click={() => (mode = "command")}
+          aria-pressed={mode === "command"}
+        >Commands</button>
+        <button
+          class="mode"
+          class:active={mode === "download"}
+          on:click={() => (mode = "download")}
+          aria-pressed={mode === "download"}
+        >Downloads</button>
       </div>
       <kbd class="esc">esc</kbd>
     </div>
@@ -176,8 +185,8 @@
     width: min(640px, 92vw);
     background: var(--color-bg-elevated);
     color: var(--color-text);
-    border: 1px solid var(--border-strong);
-    border-radius: 16px;
+    border: 1px solid var(--color-border-strong);
+    border-radius: var(--radius-lg);
     box-shadow: var(--shadow-modal);
     overflow: hidden;
   }
@@ -185,13 +194,13 @@
     display: flex;
     align-items: center;
     gap: 10px;
-    padding: 14px 16px;
-    border-bottom: 1px solid var(--hair);
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--color-border);
   }
   .search-ico {
     width: 18px;
     height: 18px;
-    color: var(--text-faint);
+    color: var(--color-faint);
     flex: none;
   }
   .header input {
@@ -199,40 +208,43 @@
     background: transparent;
     border: none;
     outline: none;
-    color: var(--text);
-    font-size: 15px;
+    color: var(--color-text);
+    font-size: 14px;
     font-family: inherit;
     padding: 0;
   }
-  .header input::placeholder { color: var(--text-faint); }
+  .header input::placeholder { color: var(--color-faint); }
   .modes {
     display: flex;
     gap: 2px;
     padding: 2px;
-    background: rgba(255, 255, 255, 0.04);
-    border: 1px solid var(--hair);
-    border-radius: 7px;
+    background: var(--color-surface-active);
+    border: 1px solid var(--color-border-2);
+    border-radius: var(--radius-sm);
   }
   .mode {
     background: none;
     border: none;
-    color: var(--text-faint);
+    color: var(--color-muted);
     padding: 3px 8px;
-    border-radius: 5px;
+    border-radius: 4px;
     cursor: pointer;
+    font-family: inherit;
     font-size: 11px;
-    transition: all 0.15s;
+    font-weight: 500;
+    transition: background 0.12s, color 0.12s;
   }
+  .mode:hover { color: var(--color-text); }
   .mode.active {
-    background: var(--color-primary-dim);
-    color: var(--accent);
+    background: var(--color-bg-elevated);
+    color: var(--color-text);
   }
   .esc {
     font-family: var(--font-mono);
-    font-size: 10px;
-    color: var(--text-faint);
-    background: rgba(255, 255, 255, 0.04);
-    border: 1px solid var(--hair);
+    font-size: 11px;
+    color: var(--color-faint);
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
     border-radius: 4px;
     padding: 2px 6px;
   }
@@ -250,43 +262,42 @@
     align-items: center;
     gap: 12px;
     width: 100%;
-    padding: 9px 12px;
+    padding: 8px 12px;
     background: none;
     border: none;
-    border-radius: 8px;
-    color: var(--text);
+    border-radius: var(--radius-sm);
+    color: var(--color-text);
     text-align: left;
     cursor: pointer;
     font-family: inherit;
-    transition: background 0.1s;
+    transition: background 0.12s;
   }
   .result.selected {
     background: var(--color-primary-dim);
   }
   .result:hover {
-    background: rgba(255, 255, 255, 0.04);
+    background: var(--color-surface-hover);
   }
   .ico {
     width: 16px;
     height: 16px;
-    color: var(--muted);
+    color: var(--color-muted);
     flex: none;
   }
   .title {
     flex: 1;
-    font-size: 13.5px;
+    font-size: 13px;
   }
   .cat {
-    font-size: 10.5px;
-    color: var(--text-faint);
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
+    font-size: 11px;
+    color: var(--color-faint);
+    letter-spacing: 0;
   }
   .dl-info { flex: 1; min-width: 0; }
   .dl-name {
-    font-size: 13.5px;
+    font-size: 13px;
     font-weight: 500;
-    color: var(--text);
+    color: var(--color-text);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -294,7 +305,7 @@
   .dl-url {
     font-family: var(--font-mono);
     font-size: 11px;
-    color: var(--text-faint);
+    color: var(--color-faint);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -305,44 +316,43 @@
     gap: 8px;
   }
   .status {
-    font-size: 10px;
+    font-size: 11px;
     font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
+    letter-spacing: 0;
     padding: 2px 7px;
     border-radius: 4px;
-    background: rgba(255, 255, 255, 0.05);
-    color: var(--muted);
+    background: var(--color-surface-active);
+    color: var(--color-muted);
   }
-  .status-downloading { color: var(--accent); background: var(--color-primary-dim); }
-  .status-completed { color: var(--success); background: var(--color-success-dim); }
-  .status-error { color: var(--danger); background: var(--color-danger-dim); }
-  .status-paused { color: var(--muted); }
+  .status-downloading { color: var(--color-primary); background: var(--color-primary-dim); }
+  .status-completed { color: var(--color-success); background: var(--color-success-dim); }
+  .status-error { color: var(--color-danger); background: var(--color-danger-dim); }
+  .status-paused { color: var(--color-muted); }
   .size {
     font-family: var(--font-mono);
     font-size: 11px;
-    color: var(--muted);
+    color: var(--color-muted);
   }
   .empty {
     padding: 30px 20px;
     text-align: center;
-    color: var(--text-faint);
+    color: var(--color-faint);
     font-size: 13px;
   }
   .footer {
     display: flex;
     gap: 14px;
-    padding: 10px 16px;
-    border-top: 1px solid var(--hair);
-    background: rgba(0, 0, 0, 0.15);
+    padding: 8px 14px;
+    border-top: 1px solid var(--color-border);
+    background: var(--color-bg);
     font-size: 11px;
-    color: var(--text-faint);
+    color: var(--color-faint);
   }
   .footer kbd {
     font-family: var(--font-mono);
-    font-size: 9.5px;
-    background: rgba(255, 255, 255, 0.04);
-    border: 1px solid var(--hair);
+    font-size: 11px;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
     border-radius: 3px;
     padding: 1px 5px;
     margin-right: 3px;

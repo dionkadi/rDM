@@ -782,8 +782,11 @@ export function stopEventListener(): void {
 // ── Derived stores ──────────────────────────────────────────────────
 export const counts = derived(downloads, ($downloads) => ({
   all: $downloads.length,
+  // "Active" means bytes are moving now. Queued/paused/scheduled rows
+  // are not active — lumping them in made the status bar claim four
+  // transfers while nothing was on the wire.
   active: $downloads.filter(
-    (d) => !["completed", "error", "canceled"].includes(d.status),
+    (d) => d.status === "downloading" || d.status === "connecting",
   ).length,
   queued: $downloads.filter(
     (d) => d.status === "queued" || d.status === "scheduled",

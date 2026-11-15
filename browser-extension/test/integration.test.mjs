@@ -48,6 +48,9 @@ function bootAll({ popup = false, chrome = {}, elements = {} } = {}) {
     for (const id of [
       "status",
       "err-detail",
+      "host-dot",
+      "host-label",
+      "host-state",
       "open",
       "grab",
       "test",
@@ -305,6 +308,9 @@ test("a missing background is not blamed on the DM host", async () => {
   for (const id of [
     "status",
     "err-detail",
+    "host-dot",
+    "host-label",
+    "host-state",
     "open",
     "grab",
     "test",
@@ -345,6 +351,35 @@ test("a host that refuses the connection points at the probe", async () => {
   assert.match(textOf(els["err-detail"]), /1006/);
 });
 
+// UI_REVIEW #28: the host state belongs in the title row as a dot +
+// label, with one line of detail beneath it — not in a block at the
+// bottom. Both states are pinned separately: the background reconnects
+// eagerly, so driving one boot through "down → up" is not a stable
+// sequence to assert against.
+test("popup: title-row dot reads Disconnected when the host is down", async () => {
+  const { clock, els } = bootAll({ popup: true });
+  await settle(clock);
+  await pollOnce(clock);
+
+  assert.equal(els["host-dot"].className, "host-dot err");
+  assert.equal(textOf(els["host-label"]), "Disconnected");
+  assert.match(els["host-state"].title, /DM host not running/);
+  assert.match(textOf(els.status), /DM host not running/);
+});
+
+test("popup: title-row dot reads Connected once the host answers", async () => {
+  const { clock, ctl, els } = bootAll({ popup: true });
+  await settle(clock);
+  ctl.ws.latest().simulateOpen();
+  await settle(clock);
+  await pollOnce(clock);
+
+  assert.equal(els["host-dot"].className, "host-dot ok");
+  assert.equal(textOf(els["host-label"]), "Connected");
+  assert.match(els["host-state"].title, /DM host connected/);
+  assert.match(textOf(els.status), /DM host connected/);
+});
+
 test("the status never hardcodes a port for the Firefox transport", async () => {
   const clock = createClock(START);
   const ctl = createChromeMock({
@@ -354,7 +389,7 @@ test("the status never hardcodes a port for the Firefox transport", async () => 
   });
   const doc = new FakeDocument();
   const els = {};
-  for (const id of ["status", "err-detail", "open", "grab", "test", "opt-click", "opt-takeover"]) {
+  for (const id of ["status", "err-detail", "host-dot", "host-label", "host-state", "open", "grab", "test", "opt-click", "opt-takeover"]) {
     els[id] = doc.register(id, new FakeElement("div"));
   }
   loadExtension(["background.js", "content.js", "popup.js"], {

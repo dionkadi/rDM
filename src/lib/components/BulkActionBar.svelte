@@ -1,7 +1,6 @@
 <script lang="ts">
   import { createEventDispatcher } from "svelte";
-  import { slide } from "svelte/transition";
-  import { cubicOut } from "svelte/easing";
+  import { fade } from "svelte/transition";
   import {
     selectedIds,
     hasSelection,
@@ -86,12 +85,15 @@
   }
 </script>
 
+<!-- A contextual floating strip, not a second toolbar: it sits just
+     above the status bar so selecting a row never pushes the ledger
+     down or fights the sticky column header. -->
 {#if $hasSelection}
   <div
     class="bulk-bar"
     role="toolbar"
     aria-label="Bulk actions for {count} selected downloads"
-    transition:slide={{ duration: 200, easing: cubicOut }}
+    transition:fade={{ duration: 120 }}
   >
     <div class="left">
       <button
@@ -104,15 +106,15 @@
           <path d="M6 6l12 12M18 6L6 18"/>
         </svg>
       </button>
-      <span class="count">
-        <b>{count}</b> selected
-      </span>
+      <span class="count"><b>{count}</b> selected</span>
       <span class="sep"></span>
       <span class="stat" title="Active transfers in selection">
         <span class="dot" class:active={stats.active > 0}></span>
         {stats.active} active
       </span>
-      <span class="stat">{fmtBytes(stats.downloaded)}{stats.total > 0 ? ` / ${fmtBytes(stats.total)}` : ""}</span>
+      <span class="stat mono" title="Downloaded / total size">
+        {fmtBytes(stats.downloaded)}{stats.total > 0 ? ` / ${fmtBytes(stats.total)}` : ""}
+      </span>
       {#if stats.visible !== $downloads.length}
         <span class="stat faint">of {stats.visible} visible</span>
       {/if}
@@ -175,126 +177,133 @@
 
 <style>
   .bulk-bar {
-    position: sticky;
-    top: 0;
-    z-index: var(--z-sticky, 20);
+    position: fixed;
+    left: 50%;
+    bottom: calc(var(--size-statusbar) + 10px);
+    transform: translateX(-50%);
+    z-index: var(--z-overlay);
     display: flex;
     align-items: center;
     gap: 12px;
-    padding: 10px 14px;
-    margin-bottom: 12px;
-    background: color-mix(in srgb, var(--color-info) 12%, var(--surface));
-    border: 1px solid color-mix(in srgb, var(--color-info) 50%, var(--border));
-    border-radius: 12px;
-    box-shadow: var(--shadow-raised, 0 1px 2px rgba(0, 0, 0, 0.06));
-    backdrop-filter: blur(8px);
+    flex-wrap: wrap;
+    max-width: calc(100vw - 24px);
+    padding: 6px 8px 6px 10px;
+    background: var(--color-bg-elevated);
+    border: 1px solid var(--color-border-strong);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-floating);
   }
   .left {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 9px;
     min-width: 0;
     flex: 1;
   }
   .right {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 2px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
   }
   .x {
     width: 24px;
     height: 24px;
     background: transparent;
-    border: 1px solid var(--hair);
-    border-radius: 6px;
-    color: var(--muted);
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    color: var(--color-muted);
     cursor: pointer;
     display: grid;
     place-items: center;
-    transition: all 0.15s;
+    transition: background 0.12s var(--easing-out), color 0.12s var(--easing-out);
   }
   .x:hover {
-    color: var(--text);
-    background: rgba(255, 255, 255, 0.06);
-    border-color: var(--border-strong);
+    color: var(--color-text);
+    background: var(--color-surface-hover);
   }
   .count {
-    color: var(--text);
-    font-size: 13px;
+    color: var(--color-text);
+    font-size: 12px;
+    white-space: nowrap;
   }
   .count b {
-    color: var(--color-info);
-    font-weight: 700;
+    font-weight: 600;
   }
   .sep {
     width: 1px;
     height: 16px;
-    background: var(--hair-2);
+    background: var(--color-border);
   }
   .stat {
-    font-family: var(--font-mono);
-    font-size: 11.5px;
-    color: var(--muted);
+    font-size: 11px;
+    color: var(--color-muted);
     display: inline-flex;
     align-items: center;
     gap: 5px;
+    white-space: nowrap;
   }
-  .stat.faint { color: var(--text-faint); }
+  .stat.mono {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+  .stat.faint { color: var(--color-faint); }
   .dot {
     width: 6px;
     height: 6px;
     border-radius: 50%;
-    background: var(--text-faint);
+    background: var(--color-faint);
   }
   .dot.active {
-    background: var(--color-success);
-    box-shadow: 0 0 6px var(--color-success);
+    background: var(--color-primary);
   }
 
+  /* Ghost actions: the bar itself is the surface. Six filled buttons
+     inside a floating card read as a second toolbar. */
   .action {
     display: inline-flex;
     align-items: center;
     gap: 5px;
-    padding: 6px 10px;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 7px;
-    color: var(--text);
+    height: 28px;
+    padding: 0 9px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    color: var(--color-muted);
+    font-family: var(--font-ui);
     font-size: 12px;
     font-weight: 500;
     cursor: pointer;
-    transition: all 0.15s;
+    transition:
+      background 0.12s var(--easing-out),
+      color 0.12s var(--easing-out);
   }
   .action:hover {
-    background: rgba(255, 255, 255, 0.06);
-    border-color: var(--border-strong);
+    background: var(--color-surface-hover);
+    color: var(--color-text);
   }
-  /* Merge is only enabled for exactly two finished rows. A disabled
-   * button that looks enabled is worse than no button — the user clicks
-   * it and nothing happens — so make the state unmistakable, and drop
-   * the hover feedback that would otherwise promise an interaction. */
   .action:disabled {
-    opacity: 0.45;
+    opacity: 0.4;
     cursor: not-allowed;
   }
   .action:disabled:hover {
-    background: var(--surface);
-    border-color: var(--border);
+    background: transparent;
+    color: var(--color-muted);
   }
   .action.primary {
-    color: var(--accent);
-    background: var(--color-primary-dim);
-    border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+    color: var(--color-primary);
   }
   .action.primary:hover {
-    background: color-mix(in srgb, var(--accent) 20%, transparent);
+    background: var(--color-primary-dim);
+    color: var(--color-primary);
   }
   .action.danger {
     color: var(--color-danger);
-    border-color: color-mix(in srgb, var(--color-danger) 30%, transparent);
   }
   .action.danger:hover {
-    background: color-mix(in srgb, var(--color-danger) 14%, var(--surface));
+    background: var(--color-danger-dim);
+    color: var(--color-danger);
   }
 
   .limit-wrap {
@@ -302,17 +311,28 @@
   }
   .limit-input {
     width: 160px;
-    padding: 6px 10px;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 7px;
-    color: var(--text);
+    height: 28px;
+    padding: 0 9px;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border-strong);
+    border-radius: var(--radius-sm);
+    color: var(--color-text);
     font-size: 12px;
     font-family: var(--font-mono);
     outline: none;
   }
   .limit-input:focus {
-    border-color: var(--accent);
-    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 20%, transparent);
+    border-color: var(--color-primary);
+    box-shadow: var(--shadow-glow);
+  }
+
+  @media (max-width: 640px) {
+    .bulk-bar {
+      left: 12px;
+      right: 12px;
+      transform: none;
+      max-width: none;
+    }
+    .left { flex-basis: 100%; }
   }
 </style>

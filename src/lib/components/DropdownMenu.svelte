@@ -276,13 +276,12 @@
     min-width: 200px;
     max-height: calc(100vh - 16px);
     overflow-y: auto;
-    padding: 6px;
+    padding: 5px;
     background: var(--color-bg-elevated);
     color: var(--color-text);
     border: 1px solid var(--color-border-strong);
-    border-radius: 12px;
+    border-radius: var(--radius-md);
     box-shadow: var(--shadow-modal);
-    backdrop-filter: blur(16px);
     display: flex;
     flex-direction: column;
     gap: 1px;
@@ -335,13 +334,13 @@
   .item {
     display: flex;
     align-items: center;
-    gap: 9px;
+    gap: 8px;
     padding: 6px 10px;
     background: none;
     border: none;
     border-radius: 6px;
     color: var(--color-text);
-    font-size: 12.5px;
+    font-size: 13px;
     font-weight: 500;
     cursor: pointer;
     text-align: left;
@@ -366,7 +365,7 @@
   .lbl { flex: 1; }
   .kbd {
     font-family: var(--font-mono);
-    font-size: 10px;
+    font-size: 11px;
     color: var(--color-text-faint);
     background: var(--color-surface);
     border: 1px solid var(--color-border);

@@ -472,7 +472,7 @@
   .backdrop {
     position: fixed;
     inset: 0;
-    background: rgba(8, 10, 14, 0.55);
+    background: var(--color-backdrop);
     /* No `backdrop-filter` on purpose: WebKitGTK composites native
      * <select> popups incorrectly over backdrop-blurred layers — the
      * category dropdown rendered detached/unclickable. The dim alone
@@ -491,7 +491,7 @@
     background: var(--color-bg-elevated);
     color: var(--color-text);
     border: 1px solid var(--color-border-strong);
-    border-radius: 14px;
+    border-radius: var(--radius-lg);
     box-shadow: var(--shadow-modal);
     display: flex;
     flex-direction: column;
@@ -507,7 +507,7 @@
     width: 36px;
     height: 36px;
     flex: none;
-    border-radius: 9px;
+    border-radius: 8px;
     background: var(--color-accent-dim);
     color: var(--color-accent);
     display: flex;
@@ -517,12 +517,12 @@
   .icn svg { width: 18px; height: 18px; }
   h2 {
     margin: 0;
-    font-size: 14.5px;
+    font-size: 16px;
     font-weight: 600;
     color: var(--color-text);
   }
   .src {
-    font-size: 11.5px;
+    font-size: 12px;
     color: var(--color-text-muted);
     margin-top: 2px;
     max-width: 360px;
@@ -538,7 +538,7 @@
     color: var(--color-text-muted);
     background: var(--color-surface);
     border: 1px solid var(--color-border);
-    border-radius: 7px;
+    border-radius: 6px;
     padding: 6px 9px;
     max-width: 420px;
   }
@@ -564,11 +564,9 @@
     gap: 5px;
   }
   .lbl {
-    font-size: 11.5px;
+    font-size: 11px;
     font-weight: 600;
-    color: var(--color-text-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
+    color: var(--color-muted);
   }
   .inp, .sel {
     width: 100%;
@@ -576,7 +574,7 @@
     background: var(--color-surface);
     color: var(--color-text);
     border: 1px solid var(--color-border);
-    border-radius: 7px;
+    border-radius: 6px;
     font-size: 13px;
     font-family: inherit;
     outline: none;
@@ -600,9 +598,9 @@
     padding: 6px 10px;
     background: var(--color-surface);
     border: 1px solid var(--color-border);
-    border-radius: 7px;
+    border-radius: 6px;
     color: var(--color-text-muted);
-    font-size: 11.5px;
+    font-size: 12px;
     max-width: 50%;
     overflow: hidden;
   }
@@ -672,16 +670,16 @@
     padding: 12px 18px;
     border-top: 1px solid var(--color-border);
     background: var(--color-surface);
-    border-radius: 0 0 13px 13px;
+    border-radius: 0 0 var(--radius-lg) var(--radius-lg);
   }
   .spacer { flex: 1; }
   .btn {
     padding: 7px 14px;
-    border-radius: 7px;
+    border-radius: 6px;
     border: 1px solid var(--color-border);
     background: var(--color-bg-elevated);
     color: var(--color-text);
-    font-size: 12.5px;
+    font-size: 13px;
     font-weight: 600;
     font-family: inherit;
     cursor: pointer;
@@ -693,14 +691,12 @@
   .btn.ghost { background: transparent; }
   .btn.primary {
     background: var(--color-accent);
-    color: #fff;
+    color: var(--color-inverse);
     border-color: transparent;
   }
-  /* Must re-assert the accent background: the generic `.btn:hover`
-   * rule above has *higher* specificity (0,3,0) than `.btn.primary`
-   * (0,2,0), so on hover it swaps the accent for a translucent
-   * near-white surface while the text stays #fff — the button goes
-   * unreadable. This rule is (0,4,0) and wins. */
+  /* Re-assert the accent background: the generic `.btn:hover` rule has
+   * higher specificity than `.btn.primary` and would otherwise swap the
+   * accent for a grey surface while the inverse text stays put. */
   .btn.primary:hover:not(:disabled) {
     background: var(--color-accent);
     filter: brightness(1.08);

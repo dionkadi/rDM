@@ -3,7 +3,7 @@
   import { cubicOut } from "svelte/easing";
   import type { ProxyMode, Settings, Category } from "../types";
   import { settings, updateSettings, setProxyMode } from "../stores/settings";
-  import { showToast, theme, setTheme, extensionStatus } from "../stores/ui";
+  import { showToast, theme, setTheme, extensionStatus, globalSpeedLimitLabel } from "../stores/ui";
   import * as api from "../api";
 
   // Poll the native-messaging host status while the Settings panel is open.
@@ -103,6 +103,60 @@
   }
 
   let proxyUrlInput: HTMLInputElement | null = null;
+
+  // ── Global bandwidth cap ────────────────────────────────────────
+  // The cap used to be editable only inside the "add URL" disclosure,
+  // where it silently changed the global setting. It now lives here and
+  // the status bar reports it.
+  let limitMB = "";
+  function limitText(bytes: number | null): string {
+    if (bytes == null || bytes <= 0) return "Unlimited";
+    return `${Number((bytes / (1024 * 1024)).toFixed(1))} MB/s`;
+  }
+  $: if ($settings) {
+    const bytes = $settings.speedLimitGlobal;
+    limitMB = bytes && bytes > 0
+      ? String(Number((bytes / (1024 * 1024)).toFixed(1)))
+      : "";
+  }
+
+  async function applyGlobalLimit(mb: number | null) {
+    const bytes = mb == null || mb <= 0 ? null : Math.round(mb * 1024 * 1024);
+    try {
+      await api.setGlobalSpeedLimit(bytes);
+      settings.update((s) => (s ? { ...s, speedLimitGlobal: bytes } : s));
+      globalSpeedLimitLabel.set(limitText(bytes));
+      showToast({
+        kind: "success",
+        title: bytes == null ? "Speed limit cleared" : "Global speed limit set",
+        duration: 1600,
+      });
+    } catch (e) {
+      showToast({ kind: "error", title: "Could not set limit", message: String(e) });
+    }
+  }
+
+  function applyLimitInput() {
+    const v = limitMB.trim();
+    if (v === "") return applyGlobalLimit(null);
+    const mb = Number(v);
+    if (!Number.isFinite(mb) || mb < 0) return;
+    applyGlobalLimit(mb);
+  }
+
+  // ── Engine health (moved out of the status bar) ─────────────────
+  let engineHealth = "";
+  let engineBusy = false;
+  async function checkEngine() {
+    engineBusy = true;
+    try {
+      engineHealth = await api.ping();
+    } catch {
+      engineHealth = "unreachable";
+    } finally {
+      engineBusy = false;
+    }
+  }
 
   // When the user runs "Proxy: manual…" from the command palette, switch to
   // the Network tab and focus the URL field. The window event is dispatched
@@ -257,7 +311,7 @@
   }
 </script>
 
-<div class="drawer" transition:fly={{ x: 420, duration: 320, easing: cubicOut }}>
+<div class="drawer" transition:fly={{ x: 360, duration: 200, easing: cubicOut }}>
   <div class="drawer-head">
     <h2>Settings</h2>
     <button class="close-btn" on:click={onClose} aria-label="Close">
@@ -385,6 +439,32 @@
                 Switch to <em>Manual</em> to edit.
               {/if}
             </span>
+          </div>
+        </section>
+
+        <section class="set-section">
+          <h3>Bandwidth</h3>
+          <p class="hint">A ceiling for the whole app. Per-download limits still win.</p>
+          <div class="field" style="margin-top: 12px">
+            <label for="global-limit">Global speed limit</label>
+            <div class="limit-row">
+              <div class="cap-chips">
+                <button class="chip-btn" class:on={limitMB === ""} on:click={() => applyGlobalLimit(null)}>∞</button>
+                <button class="chip-btn" class:on={limitMB === "5"} on:click={() => applyGlobalLimit(5)}>5 MB/s</button>
+                <button class="chip-btn" class:on={limitMB === "20"} on:click={() => applyGlobalLimit(20)}>20 MB/s</button>
+                <button class="chip-btn" class:on={limitMB === "50"} on:click={() => applyGlobalLimit(50)}>50 MB/s</button>
+              </div>
+              <input
+                id="global-limit"
+                type="number"
+                min="0"
+                placeholder="custom"
+                aria-label="Global speed limit in MB per second"
+                bind:value={limitMB}
+                on:change={applyLimitInput}
+              />
+            </div>
+            <span class="hint">Applies to all downloads, including ones already running.</span>
           </div>
         </section>
 
@@ -593,26 +673,27 @@ cp browser-extension/com.app.dm.native.firefox.json \
       {:else if activeTab === "advanced"}
         <section class="set-section">
           <h3>Data</h3>
+          <p class="hint">Import, export and reset are not implemented yet.</p>
           <div class="set-line">
             <div>
               <div class="lbl">Export settings</div>
               <div class="hint">Save to a JSON file</div>
             </div>
-            <button class="btn btn-ghost btn-sm">Export</button>
+            <button class="btn btn-ghost btn-sm" disabled title="Not implemented yet">Export</button>
           </div>
           <div class="set-line">
             <div>
               <div class="lbl">Import settings</div>
               <div class="hint">Load from a JSON file</div>
             </div>
-            <button class="btn btn-ghost btn-sm">Import</button>
+            <button class="btn btn-ghost btn-sm" disabled title="Not implemented yet">Import</button>
           </div>
           <div class="set-line">
             <div>
               <div class="lbl">Reset to defaults</div>
               <div class="hint">This cannot be undone</div>
             </div>
-            <button class="btn btn-danger btn-sm">Reset</button>
+            <button class="btn btn-danger btn-sm" disabled title="Not implemented yet">Reset</button>
           </div>
         </section>
 
@@ -643,6 +724,21 @@ cp browser-extension/com.app.dm.native.firefox.json \
               Could not load build info: {appInfoError}
             </p>
           {/if}
+          <div class="set-line health">
+            <div>
+              <div class="lbl">Engine health</div>
+              <div class="hint">
+                {#if engineHealth}
+                  Last check: <code>{engineHealth}</code>
+                {:else}
+                  Round-trip to the local engine process.
+                {/if}
+              </div>
+            </div>
+            <button class="btn btn-ghost btn-sm" on:click={checkEngine} disabled={engineBusy}>
+              {engineBusy ? "Checking…" : "Check"}
+            </button>
+          </div>
         </section>
       {/if}
     </div>
@@ -659,7 +755,10 @@ cp browser-extension/com.app.dm.native.firefox.json \
     width: min(720px, 96vw);
     background: var(--color-bg-elevated);
     border-left: 1px solid var(--color-border);
-    box-shadow: -30px 0 80px -30px var(--shadow-modal);
+    /* A shadow token is a full box-shadow list, not a colour — the old
+       `-30px 0 80px -30px var(--shadow-modal)` was invalid and silently
+       dropped. */
+    box-shadow: var(--shadow-modal);
     color: var(--color-text);
     display: flex;
     overflow: hidden;
@@ -672,80 +771,74 @@ cp browser-extension/com.app.dm.native.firefox.json \
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 18px 22px;
+    height: 56px;
+    padding: 0 20px 0 22px;
     border-bottom: 1px solid var(--color-border);
     background: var(--color-bg-elevated);
-    backdrop-filter: blur(12px);
     z-index: 2;
   }
   .drawer-head h2 {
     font-family: var(--font-display);
-    font-weight: 500;
-    font-size: 22px;
+    font-weight: 600;
+    font-size: 16px;
     margin: 0;
   }
   .close-btn {
     background: transparent;
-    border: 1px solid var(--hair);
-    border-radius: 8px;
-    color: var(--muted);
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    color: var(--color-muted);
     cursor: pointer;
     padding: 7px;
     display: grid;
     place-items: center;
-    transition: all 0.15s;
+    transition: background 0.12s, color 0.12s;
   }
   .close-btn:hover {
-    color: var(--text);
-    border-color: var(--border-strong);
-    background: rgba(255, 255, 255, 0.04);
+    color: var(--color-text);
+    background: var(--color-surface-hover);
   }
 
   .drawer-body {
     display: grid;
     grid-template-columns: 200px 1fr;
     width: 100%;
-    margin-top: 60px;
+    margin-top: 56px;
     overflow: hidden;
   }
 
   .tabs {
     display: flex;
     flex-direction: column;
-    padding: 16px 10px;
+    gap: 1px;
+    padding: 12px 8px;
     border-right: 1px solid var(--color-border);
-    background: var(--color-surface);
+    background: var(--color-bg);
     overflow-y: auto;
-    /* When the user reaches the top or bottom of the left-nav scroll
-       region, the browser forwards the wheel event to the next
-       scrollable ancestor — which, without this, is the page behind
-       the drawer. `overscroll-behavior: contain` makes the browser
-       consume the event at the drawer's boundary instead, so the
-       home view stays put. */
     overscroll-behavior: contain;
   }
   .tab {
     display: flex;
     align-items: center;
     gap: 10px;
-    padding: 9px 12px;
+    padding: 8px 10px;
     background: none;
     border: none;
-    border-radius: 8px;
-    color: var(--muted);
+    border-radius: var(--radius-sm);
+    color: var(--color-muted);
     font-family: inherit;
     font-size: 13px;
     font-weight: 500;
     cursor: pointer;
     text-align: left;
-    transition: all 0.15s;
+    transition: background 0.12s, color 0.12s;
   }
   .tab:hover {
-    color: var(--text);
-    background: rgba(255, 255, 255, 0.04);
+    color: var(--color-text);
+    background: var(--color-surface-hover);
   }
   .tab.active {
-    color: var(--accent);
+    color: var(--color-primary);
     background: var(--color-primary-dim);
   }
   .tab svg {
@@ -782,27 +875,27 @@ cp browser-extension/com.app.dm.native.firefox.json \
   .proxy-card {
     background: var(--color-surface);
     border: 1px solid var(--color-border);
-    border-radius: 12px;
-    padding: 14px 12px 12px;
+    border-radius: var(--radius-md);
+    padding: 12px;
     cursor: pointer;
     color: var(--color-text);
     display: flex;
     flex-direction: column;
     align-items: flex-start;
-    gap: 6px;
-    transition: all 0.15s var(--easing-out);
+    gap: 5px;
+    transition:
+      background 0.12s var(--easing-out),
+      border-color 0.12s var(--easing-out);
     text-align: left;
     font-family: inherit;
   }
   .proxy-card:hover {
     border-color: var(--color-border-strong);
     background: var(--color-surface-hover);
-    transform: translateY(-1px);
   }
   .proxy-card.active {
     border-color: var(--color-primary);
     background: var(--color-primary-dim);
-    box-shadow: 0 0 0 1px var(--color-primary-dim) inset;
   }
   .proxy-ico {
     width: 18px;
@@ -818,7 +911,7 @@ cp browser-extension/com.app.dm.native.firefox.json \
     font-weight: 600;
   }
   .proxy-desc {
-    font-size: 11.5px;
+    font-size: 12px;
     color: var(--color-faint);
     line-height: 1.4;
   }
@@ -835,15 +928,17 @@ cp browser-extension/com.app.dm.native.firefox.json \
   .theme-card {
     background: var(--color-surface);
     border: 1px solid var(--color-border);
-    border-radius: 10px;
-    padding: 10px 8px 8px;
+    border-radius: var(--radius-md);
+    padding: 8px;
     cursor: pointer;
     color: var(--color-text);
     display: flex;
     flex-direction: column;
     align-items: center;
     gap: 6px;
-    transition: all 0.15s;
+    transition:
+      background 0.12s var(--easing-out),
+      border-color 0.12s var(--easing-out);
     font-family: inherit;
   }
   .theme-card:hover {
@@ -877,20 +972,20 @@ cp browser-extension/com.app.dm.native.firefox.json \
     border-radius: 2px;
     align-self: stretch;
   }
-  .preview-dark { background: #0b0d12; }
-  .preview-dark .dot { background: #7af0c8; }
-  .preview-dark .bar:first-of-type { background: #2a313e; width: 60%; }
-  .preview-dark .bar:last-of-type { background: #1b2230; width: 80%; }
-  .preview-light { background: #f6f7f9; }
-  .preview-light .dot { background: #0f8a63; }
-  .preview-light .bar:first-of-type { background: #cbd1da; width: 60%; }
-  .preview-light .bar:last-of-type { background: #dee3eb; width: 80%; }
+  .preview-dark { background: #17191e; }
+  .preview-dark .dot { background: #41c9a2; }
+  .preview-dark .bar:first-of-type { background: #2a2f38; width: 60%; }
+  .preview-dark .bar:last-of-type { background: #1e2128; width: 80%; }
+  .preview-light { background: #f4f5f7; }
+  .preview-light .dot { background: #0d7a5e; }
+  .preview-light .bar:first-of-type { background: #e2e5ea; width: 60%; }
+  .preview-light .bar:last-of-type { background: #eaecf0; width: 80%; }
   .preview-split {
-    background: linear-gradient(135deg, #f6f7f9 50%, #0b0d12 50%);
+    background: linear-gradient(135deg, #f4f5f7 50%, #17191e 50%);
   }
-  .preview-split .dot { background: #2d5fda; }
-  .preview-split .bar:first-of-type { background: linear-gradient(90deg, #cbd1da 50%, #2a313e 50%); width: 60%; }
-  .preview-split .bar:last-of-type { background: linear-gradient(90deg, #dee3eb 50%, #1b2230 50%); width: 80%; }
+  .preview-split .dot { background: linear-gradient(90deg, #0d7a5e 50%, #41c9a2 50%); }
+  .preview-split .bar:first-of-type { background: linear-gradient(90deg, #e2e5ea 50%, #2a2f38 50%); width: 60%; }
+  .preview-split .bar:last-of-type { background: linear-gradient(90deg, #eaecf0 50%, #1e2128 50%); width: 80%; }
   .t-label {
     font-size: 12px;
     font-weight: 600;
@@ -903,22 +998,59 @@ cp browser-extension/com.app.dm.native.firefox.json \
     gap: 14px;
     margin-bottom: 12px;
   }
-  .lbl { font-size: 13.5px; color: var(--text); font-weight: 500; }
-  .hint { font-size: 11.5px; color: var(--text-faint); margin-top: 2px; line-height: 1.4; }
+  .lbl { font-size: 13px; color: var(--color-text); font-weight: 500; }
+  .hint { font-size: 12px; color: var(--color-faint); margin-top: 2px; line-height: 1.45; }
+
+  .limit-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .limit-row input,
+  .field .limit-row input {
+    width: 100px;
+    height: 28px;
+    padding: 0 9px;
+  }
+  .cap-chips {
+    display: flex;
+    gap: 4px;
+    flex-wrap: wrap;
+  }
+  .chip-btn {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    height: 28px;
+    padding: 0 9px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--color-border);
+    background: transparent;
+    color: var(--color-muted);
+    cursor: pointer;
+    transition: color 0.12s, border-color 0.12s, background 0.12s;
+  }
+  .chip-btn:hover {
+    color: var(--color-text);
+    border-color: var(--color-border-strong);
+  }
+  .chip-btn.on {
+    color: var(--color-primary);
+    border-color: var(--color-primary-strong);
+    background: var(--color-primary-dim);
+  }
 
   .field { margin-bottom: 14px; }
   .field label {
     display: block;
-    font-size: 12px;
+    font-size: 11px;
     font-weight: 600;
-    color: var(--muted);
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
+    color: var(--color-muted);
     margin-bottom: 6px;
   }
   .field input {
     width: 100%;
-    height: 36px;
+    height: 32px;
   }
   .field-row {
     display: grid;
@@ -934,7 +1066,7 @@ cp browser-extension/com.app.dm.native.firefox.json \
      headroom for "Max concurrent downloads" while the right column's
      "Connections per file" simply takes the same space. */
   .field-row .field label {
-    min-height: 2lh;
+    min-height: 30px;
   }
 
   .switch {
@@ -942,15 +1074,19 @@ cp browser-extension/com.app.dm.native.firefox.json \
     width: 40px;
     height: 22px;
     border-radius: 99px;
-    background: rgba(255, 255, 255, 0.12);
-    border: 1px solid var(--hair);
+    background: var(--color-track);
+    border: 1px solid var(--color-border);
     cursor: pointer;
-    transition: all 0.2s;
+    transition: background 0.15s, border-color 0.15s;
     flex: none;
   }
   .switch.on {
-    background: linear-gradient(150deg, var(--accent), #4fcf9f);
+    background: var(--color-primary);
     border-color: transparent;
+  }
+  .switch:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
   }
   .knob {
     position: absolute;
@@ -960,8 +1096,8 @@ cp browser-extension/com.app.dm.native.firefox.json \
     height: 18px;
     border-radius: 99px;
     background: #fff;
-    transition: all 0.2s;
-    box-shadow: 0 2px 5px rgba(0, 0, 0, 0.4);
+    transition: left 0.15s var(--easing-out);
+    box-shadow: var(--shadow-raised);
   }
   .switch.on .knob { left: 19px; }
 
@@ -978,37 +1114,39 @@ cp browser-extension/com.app.dm.native.firefox.json \
   }
   .cat-row input {
     padding: 7px 9px;
-    font-size: 12.5px;
+    font-size: 13px;
   }
   .del-btn {
     width: 30px;
     height: 30px;
     display: grid;
     place-items: center;
-    background: var(--color-danger-dim);
-    border: 1px solid var(--color-danger-strong);
-    border-radius: 7px;
-    color: var(--color-danger);
+    background: transparent;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    color: var(--color-muted);
     cursor: pointer;
-    transition: all 0.15s;
+    transition: background 0.12s, color 0.12s, border-color 0.12s;
   }
   .del-btn:hover {
-    background: color-mix(in srgb, var(--color-danger) 20%, transparent);
+    background: var(--color-danger-dim);
+    border-color: var(--color-danger-strong);
+    color: var(--color-danger);
   }
   .add-btn {
     margin-top: 10px;
-    padding: 7px 14px;
+    padding: 7px 12px;
     background: transparent;
-    border: 1px dashed var(--border-strong);
-    border-radius: 8px;
-    color: var(--muted);
-    font-size: 12.5px;
+    border: 1px dashed var(--color-border-strong);
+    border-radius: var(--radius-sm);
+    color: var(--color-muted);
+    font-size: 12px;
     cursor: pointer;
     font-family: inherit;
-    transition: all 0.15s;
+    transition: background 0.12s, color 0.12s, border-color 0.12s;
   }
   .add-btn:hover {
-    color: var(--accent);
+    color: var(--color-primary);
     border-color: var(--color-primary-strong);
     background: var(--color-primary-dim);
   }
@@ -1017,40 +1155,49 @@ cp browser-extension/com.app.dm.native.firefox.json \
     margin: 12px 0;
     padding-left: 20px;
     color: var(--muted);
-    font-size: 12.5px;
+    font-size: 13px;
     line-height: 1.7;
   }
   .steps code {
     font-family: var(--font-mono);
-    font-size: 11.5px;
-    background: rgba(255, 255, 255, 0.05);
+    font-size: 11px;
+    background: var(--color-surface-active);
     padding: 1px 5px;
     border-radius: 4px;
-    color: var(--accent);
+    color: var(--color-text);
   }
   .mono-block {
     font-family: var(--font-mono);
-    font-size: 11.5px;
-    background: rgba(0, 0, 0, 0.25);
-    color: var(--text);
+    font-size: 11px;
+    background: var(--color-bg);
+    border: 1px solid var(--color-border-2);
+    color: var(--color-text);
     padding: 10px 12px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     margin: 6px 0 4px;
     overflow-x: auto;
     white-space: pre;
   }
   .status-pill {
-    display: inline-block;
-    padding: 4px 12px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 10px;
     border-radius: 99px;
-    font-size: 11.5px;
-    font-weight: 600;
-    background: rgba(255, 255, 255, 0.05);
-    color: var(--muted);
+    font-size: 11px;
+    font-weight: 500;
+    background: var(--color-surface-active);
+    color: var(--color-muted);
   }
   .status-pill.ok {
     background: var(--color-success-dim);
     color: var(--color-success);
+  }
+  .status-pill .dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
   }
 
   .ext-status {
@@ -1058,7 +1205,7 @@ cp browser-extension/com.app.dm.native.firefox.json \
     gap: 1px;
     background: var(--color-border-2);
     border: 1px solid var(--color-border);
-    border-radius: 10px;
+    border-radius: var(--radius-md);
     overflow: hidden;
     margin: 12px 0 18px;
   }
@@ -1071,12 +1218,12 @@ cp browser-extension/com.app.dm.native.firefox.json \
     background: var(--color-surface);
   }
   .ext-name {
-    font-size: 12.5px;
+    font-size: 13px;
     color: var(--color-muted);
     font-weight: 500;
   }
   .ext-state {
-    font-size: 12.5px;
+    font-size: 13px;
     color: var(--color-text);
     text-align: right;
     max-width: 65%;
@@ -1086,22 +1233,10 @@ cp browser-extension/com.app.dm.native.firefox.json \
   }
   .ext-state.mono {
     font-family: var(--font-mono);
-    font-size: 11.5px;
+    font-size: 12px;
   }
   .ext-state.danger {
     color: var(--color-danger);
-  }
-  .status-pill {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-  }
-  .status-pill .dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: currentColor;
-    box-shadow: 0 0 6px currentColor;
   }
   .status-pill.offline {
     background: var(--color-warning-dim);
@@ -1117,8 +1252,18 @@ cp browser-extension/com.app.dm.native.firefox.json \
   }
   .set-group h4 {
     margin: 16px 0 8px;
-    font-size: 12.5px;
+    font-size: 13px;
     font-weight: 600;
+    color: var(--color-text);
+  }
+  .set-line.health {
+    margin-top: 18px;
+    padding-top: 14px;
+    border-top: 1px solid var(--color-border-2);
+  }
+  .set-line.health code {
+    font-family: var(--font-mono);
+    font-size: 11px;
     color: var(--color-text);
   }
 
@@ -1134,11 +1279,9 @@ cp browser-extension/com.app.dm.native.firefox.json \
     gap: 2px;
   }
   .about-grid .k {
-    font-size: 10.5px;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--text-faint);
-    font-weight: 600;
+    font-size: 11px;
+    color: var(--color-faint);
+    font-weight: 500;
   }
   .about-grid .v {
     font-size: 13px;

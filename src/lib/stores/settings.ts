@@ -2,14 +2,24 @@
 import { writable, get } from "svelte/store";
 import type { ProxyMode, Settings } from "../types";
 import * as api from "../api";
-import { showToast } from "./ui";
+import { showToast, globalSpeedLimitLabel } from "./ui";
 
 export const settings = writable<Settings | null>(null);
+
+/** Human label for a bytes/sec cap; mirrors the presets in the UI. */
+export function speedLimitLabel(bytes: number | null | undefined): string {
+  if (bytes == null || bytes <= 0) return "Unlimited";
+  const mb = bytes / (1024 * 1024);
+  return `${Number(mb.toFixed(mb < 10 ? 1 : 0))} MB/s`;
+}
 
 export async function loadSettings(): Promise<void> {
   try {
     const s = await api.getSettings();
     settings.set(s);
+    // The status bar used to say "Unlimited" after a restart even when
+    // a cap was persisted, because nothing rehydrated its label.
+    globalSpeedLimitLabel.set(speedLimitLabel(s.speedLimitGlobal));
   } catch {
     settings.set(null);
   }
@@ -19,6 +29,9 @@ export async function updateSettings(patch: Partial<Settings>): Promise<void> {
   const current = get(settings) ?? (await api.getSettings());
   const next = { ...current, ...patch };
   settings.set(next);
+  if (patch.speedLimitGlobal !== undefined) {
+    globalSpeedLimitLabel.set(speedLimitLabel(next.speedLimitGlobal));
+  }
   try {
     await api.updateSettings(next);
   } catch (e) {

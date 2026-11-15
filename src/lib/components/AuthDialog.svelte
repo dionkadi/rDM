@@ -340,7 +340,7 @@
     <div class="bd">
       <!-- ── Auth kind ─────────────────────────────────────── -->
       <div class="auth-kind">
-        <label class="lbl">Authorization</label>
+        <span class="lbl">Authorization</span>
         <div class="seg">
           <button
             class="seg-btn"
@@ -516,7 +516,7 @@
   .backdrop {
     position: fixed;
     inset: 0;
-    background: rgba(8, 10, 14, 0.55);
+    background: var(--color-backdrop);
     backdrop-filter: blur(4px);
     z-index: var(--z-modal);
   }
@@ -532,7 +532,7 @@
     background: var(--color-bg-elevated);
     color: var(--color-text);
     border: 1px solid var(--color-border-strong);
-    border-radius: 14px;
+    border-radius: var(--radius-lg);
     box-shadow: var(--shadow-modal);
     display: flex;
     flex-direction: column;
@@ -548,7 +548,7 @@
     width: 36px;
     height: 36px;
     flex: none;
-    border-radius: 9px;
+    border-radius: 8px;
     background: var(--color-accent-dim);
     color: var(--color-accent);
     display: flex;
@@ -558,12 +558,12 @@
   .icn svg { width: 18px; height: 18px; }
   h2 {
     margin: 0;
-    font-size: 14.5px;
+    font-size: 16px;
     font-weight: 600;
     color: var(--color-text);
   }
   .src {
-    font-size: 11.5px;
+    font-size: 12px;
     color: var(--color-text-muted);
     margin-top: 2px;
     max-width: 460px;
@@ -579,11 +579,9 @@
     gap: 14px;
   }
   .lbl {
-    font-size: 11.5px;
+    font-size: 11px;
     font-weight: 600;
-    color: var(--color-text-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
+    color: var(--color-muted);
   }
   .auth-kind {
     display: flex;
@@ -611,7 +609,7 @@
   .seg-btn:hover:not(.active) { background: var(--color-surface-active); color: var(--color-text); }
   .seg-btn.active {
     background: var(--color-accent);
-    color: #fff;
+    color: var(--color-inverse);
   }
   .field { display: flex; flex-direction: column; gap: 5px; }
   .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
@@ -621,7 +619,7 @@
     background: var(--color-surface);
     color: var(--color-text);
     border: 1px solid var(--color-border);
-    border-radius: 7px;
+    border-radius: 6px;
     font-size: 13px;
     font-family: inherit;
     outline: none;
@@ -629,7 +627,7 @@
   }
   /* Reserved for future use; the cookie path override
    * line below uses the `.hint.mono` selector instead. */
-  /* .inp.mono { font-family: var(--font-mono); font-size: 11.5px; } */
+  /* .inp.mono { font-family: var(--font-mono); font-size: 12px; } */
   .inp:focus, .sel:focus {
     border-color: var(--color-accent);
     box-shadow: 0 0 0 3px var(--color-accent-dim);
@@ -639,11 +637,11 @@
     align-items: center;
     gap: 6px;
     padding: 6px 10px;
-    background: var(--color-warning-dim, rgba(255, 180, 0, 0.10));
-    border: 1px solid var(--color-warning-strong, #ffb400);
-    border-radius: 6px;
-    color: var(--color-warning-strong, #ffb400);
-    font-size: 11.5px;
+    background: var(--color-warning-dim);
+    border: 1px solid var(--color-warning-strong);
+    border-radius: var(--radius-sm);
+    color: var(--color-warning);
+    font-size: 12px;
   }
   .hdr-section, .cookie-section {
     display: flex;
@@ -666,7 +664,7 @@
     gap: 6px;
     align-items: center;
   }
-  .hdr-row .k { font-family: var(--font-mono); font-size: 11.5px; }
+  .hdr-row .k { font-family: var(--font-mono); font-size: 12px; }
   .rm {
     background: transparent;
     border: 1px solid var(--color-border);
@@ -685,7 +683,7 @@
     border: 1px solid var(--color-border);
     border-radius: 6px;
     padding: 5px 10px;
-    font-size: 11.5px;
+    font-size: 12px;
     font-weight: 600;
     font-family: inherit;
     cursor: pointer;
@@ -693,27 +691,26 @@
   }
   .mini:hover:not(:disabled) { background: var(--color-surface-active); border-color: var(--color-border-strong); }
   .mini:disabled { opacity: 0.5; cursor: not-allowed; }
-  .mini.primary { background: var(--color-accent); color: #fff; border-color: transparent; }
-  /* Re-asserts the accent: `.mini:hover` (0,3,0) outranks
-   * `.mini.primary` (0,2,0) and would otherwise swap the accent for a
-   * translucent near-white surface while the text stays #fff. */
+  .mini.primary { background: var(--color-accent); color: var(--color-inverse); border-color: transparent; }
+  /* Re-asserts the accent: `.mini:hover` outranks `.mini.primary` and
+   * would otherwise swap it for a grey surface under inverse text. */
   .mini.primary:hover:not(:disabled) {
     background: var(--color-accent);
     filter: brightness(1.08);
   }
   .hint {
     color: var(--color-text-muted);
-    font-size: 11.5px;
+    font-size: 12px;
     margin: 0;
   }
   .hint code {
     font-family: var(--font-mono);
-    font-size: 10.5px;
+    font-size: 11px;
     background: var(--color-surface);
     padding: 0 3px;
     border-radius: 3px;
   }
-  .hint.mono { font-family: var(--font-mono); font-size: 10.5px; word-break: break-all; }
+  .hint.mono { font-family: var(--font-mono); font-size: 11px; word-break: break-all; }
   .cookie-controls {
     display: flex;
     gap: 6px;
@@ -724,7 +721,7 @@
     max-height: 180px;
     overflow: auto;
     border: 1px solid var(--color-border);
-    border-radius: 7px;
+    border-radius: 6px;
     background: var(--color-surface);
     display: flex;
     flex-direction: column;
@@ -736,14 +733,14 @@
     align-items: center;
     padding: 5px 8px;
     border-bottom: 1px solid var(--color-border);
-    font-size: 11.5px;
+    font-size: 12px;
     cursor: pointer;
   }
   .ck-row:last-child { border-bottom: none; }
   .ck-row:hover { background: var(--color-surface-active); }
   .ck-name { font-weight: 600; color: var(--color-text); }
   .ck-value { color: var(--color-text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ck-host { color: var(--color-text-faint); font-family: var(--font-mono); font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ck-host { color: var(--color-text-faint); font-family: var(--font-mono); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ck-secure { color: var(--color-success); }
   .cookie-actions {
     display: flex;
@@ -758,16 +755,16 @@
     padding: 12px 18px;
     border-top: 1px solid var(--color-border);
     background: var(--color-surface);
-    border-radius: 0 0 13px 13px;
+    border-radius: 0 0 var(--radius-lg) var(--radius-lg);
   }
   .spacer { flex: 1; }
   .btn {
     padding: 7px 14px;
-    border-radius: 7px;
+    border-radius: 6px;
     border: 1px solid var(--color-border);
     background: var(--color-bg-elevated);
     color: var(--color-text);
-    font-size: 12.5px;
+    font-size: 13px;
     font-weight: 600;
     font-family: inherit;
     cursor: pointer;
@@ -777,10 +774,9 @@
   .btn:active:not(:disabled) { transform: translateY(1px); }
   .btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .btn.ghost { background: transparent; }
-  .btn.primary { background: var(--color-accent); color: #fff; border-color: transparent; }
-  /* Re-asserts the accent: `.btn:hover` (0,3,0) outranks `.btn.primary`
-   * (0,2,0) and would otherwise swap the accent for a translucent
-   * near-white surface while the text stays #fff. */
+  .btn.primary { background: var(--color-accent); color: var(--color-inverse); border-color: transparent; }
+  /* Re-asserts the accent: `.btn:hover` outranks `.btn.primary` and
+   * would otherwise swap it for a grey surface under inverse text. */
   .btn.primary:hover:not(:disabled) {
     background: var(--color-accent);
     filter: brightness(1.08);
@@ -790,5 +786,5 @@
     font-size: 14px;
     user-select: none;
   }
-  .dirty-tag.active { color: var(--color-warning, #ffb400); }
+  .dirty-tag.active { color: var(--color-warning); }
 </style>

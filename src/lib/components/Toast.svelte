@@ -1,7 +1,5 @@
 <script lang="ts">
-  import { fly, fade } from "svelte/transition";
-  import { cubicOut } from "svelte/easing";
-  import { flip } from "svelte/animate";
+  import { fade } from "svelte/transition";
   import { toasts, dismissToast } from "../stores/ui";
 
   const ICONS = {
@@ -24,9 +22,8 @@
     <div
       class="toast {t.kind}"
       role="status"
-      in:fly={{ y: 20, duration: 220, easing: cubicOut }}
-      out:fade={{ duration: 160 }}
-      animate:flip={{ duration: 200 }}
+      in:fade={{ duration: 120 }}
+      out:fade={{ duration: 120 }}
     >
       <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d={ICONS[t.kind]} />
@@ -50,32 +47,33 @@
 <style>
   .toast-stack {
     position: fixed;
-    bottom: 24px;
-    right: 24px;
+    /* Clear the fixed status bar (32 px) instead of sitting on top of
+       its right-hand metrics. */
+    bottom: calc(var(--size-statusbar) + 12px);
+    right: 16px;
     z-index: var(--z-toast);
     display: flex;
     flex-direction: column-reverse;
-    gap: 10px;
+    gap: 8px;
     pointer-events: none;
-    max-width: 420px;
+    max-width: 400px;
   }
   .toast {
     pointer-events: auto;
     display: flex;
     align-items: flex-start;
-    gap: 12px;
-    padding: 12px 14px;
+    gap: 10px;
+    padding: 10px 12px;
     background: var(--color-bg-elevated);
     color: var(--color-text);
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    box-shadow: var(--shadow-modal);
-    backdrop-filter: blur(12px);
-    min-width: 280px;
+    border: 1px solid var(--color-border-strong);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-floating);
+    min-width: 260px;
   }
   .ico {
-    width: 18px;
-    height: 18px;
+    width: 16px;
+    height: 16px;
     flex: none;
     margin-top: 1px;
   }
@@ -85,38 +83,38 @@
   .toast.info .ico { color: var(--color-info); }
   .body { flex: 1; min-width: 0; }
   .title {
-    font-size: 13.5px;
+    font-size: 13px;
     font-weight: 600;
-    color: var(--text);
+    color: var(--color-text);
   }
   .msg {
-    font-size: 12.5px;
-    color: var(--muted);
+    font-size: 12px;
+    color: var(--color-muted);
     margin-top: 2px;
-    line-height: 1.4;
+    line-height: 1.45;
   }
   .action {
     background: none;
     border: none;
-    color: var(--accent);
-    font-size: 12.5px;
+    color: var(--color-primary);
+    font-size: 12px;
     font-weight: 600;
     cursor: pointer;
     padding: 4px 8px;
-    border-radius: 6px;
-    transition: background 0.15s;
+    border-radius: var(--radius-sm);
+    transition: background 0.12s;
   }
   .action:hover { background: var(--color-primary-dim); }
   .close {
     background: none;
     border: none;
-    color: var(--text-faint);
+    color: var(--color-faint);
     cursor: pointer;
     padding: 4px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     display: grid;
     place-items: center;
-    transition: all 0.15s;
+    transition: background 0.12s, color 0.12s;
   }
-  .close:hover { color: var(--text); background: rgba(255, 255, 255, 0.05); }
+  .close:hover { color: var(--color-text); background: var(--color-surface-hover); }
 </style>

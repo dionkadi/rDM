@@ -12,10 +12,7 @@
    */
   export let segmentProgress: SegmentProgress | null = null;
   export let height: number = 6;
-  export let showShimmer: boolean | undefined = undefined;
 
-  $: isActive = status === "downloading" || status === "connecting";
-  $: shimmer = showShimmer ?? isActive;
   $: hasSegments = chunks.length > 1;
 
   // The in-flight band sits at the end of the *byte* fill, not at the
@@ -31,117 +28,90 @@
         )
       : 0;
 
-  // Per-chunk fill percentages (the chunked path); the HLS path uses
-  // the `segmentProgress` prop instead — do not reuse the name.
-  $: chunkFill = hasSegments
-    ? chunks.map((c) => {
-        const size = c.end - c.start + 1;
-        return Math.min(100, (c.downloaded / size) * 100);
-      })
-    : [] as number[];
+  /**
+   * Chunk boundaries as percentages of the whole file. The meter is one
+   * continuous fill with hairline notches at these positions — the old
+   * implementation drew one bar per chunk, which read as four separate
+   * downloads with gaps between them. Per-chunk detail still lives in
+   * the expanded panel; the row meter answers "how far along, and how
+   * many connections".
+   */
+  $: tickPositions = (() => {
+    if (!hasSegments) return [] as number[];
+    const finite = chunks.filter(
+      (c) => Number.isFinite(c.end) && c.end < Number.MAX_SAFE_INTEGER,
+    );
+    if (finite.length < 2) return [] as number[];
+    const total = Math.max(...finite.map((c) => c.end + 1));
+    if (!total) return [] as number[];
+    const raw = finite
+      .slice(0, -1)
+      .map((c) => Math.min(99.5, Math.max(0.5, ((c.end + 1) / total) * 100)));
+    // More than ~16 ticks in a 140 px column turns into moiré; sample
+    // every nth boundary so the layout still reads as "many connections".
+    const step = Math.ceil(raw.length / 16);
+    return step > 1 ? raw.filter((_, i) => i % step === 0) : raw;
+  })();
 </script>
 
-<div class="bar" style="height: {height}px" class:segmented={hasSegments} role="progressbar" aria-valuenow={progress} aria-valuemin="0" aria-valuemax="100" aria-label="Download progress">
+<div class="bar" style="height: {height}px" role="progressbar" aria-valuenow={progress} aria-valuemin="0" aria-valuemax="100" aria-label="Download progress">
+  <div class="fill {status}" style="width: {fillPct}%"></div>
   {#if hasSegments}
-    {#each chunkFill as seg, i}
-      <div class="seg" style="--pct: {seg}%">
-        <div class="seg-fill" class:shimmer={isActive}></div>
-        {#if i < chunkFill.length - 1}
-          <div class="divider"></div>
-        {/if}
-      </div>
+    {#each tickPositions as t}
+      <span class="tick" style="left: {t}%"></span>
     {/each}
-  {:else}
-    <div
-      class="fill {status}"
-      class:shimmer={shimmer}
-      style="width: {fillPct}%"
-    ></div>
-    {#if activePct > 0}
-      <div class="inflight" style="left: {fillPct}%; width: {activePct}%"></div>
-    {/if}
+  {/if}
+  {#if activePct > 0}
+    <div class="inflight" style="left: {fillPct}%; width: {activePct}%"></div>
   {/if}
 </div>
 
 <style>
+  /* Flat instrument meter: one continuous accent fill, hairline ticks
+     carved at chunk boundaries. No gradient / shimmer / glow. */
   .bar {
     width: 100%;
-    background: rgba(255, 255, 255, 0.06);
-    border-radius: 9999px;
+    background: var(--color-track);
+    border-radius: 1.5px;
     overflow: hidden;
     position: relative;
   }
   .fill {
     height: 100%;
-    border-radius: 9999px;
-    background: linear-gradient(90deg, var(--accent), var(--accent-2));
-    box-shadow: 0 0 14px -2px rgba(122, 240, 200, 0.6);
-    transition: width 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+    background: var(--color-primary);
+    transition: width 0.25s var(--easing-out);
     position: relative;
   }
   .fill.completed {
-    background: linear-gradient(90deg, var(--color-success), #9af0c2);
-    box-shadow: 0 0 14px -2px rgba(116, 224, 164, 0.6);
+    background: var(--color-success);
+    opacity: 0.55;
   }
   .fill.error, .fill.canceled {
-    background: linear-gradient(90deg, var(--color-danger), #ffa6b4);
-    box-shadow: 0 0 14px -2px rgba(255, 122, 143, 0.5);
+    background: var(--color-danger);
+    opacity: 0.6;
   }
   .fill.paused {
-    background: linear-gradient(90deg, var(--text-muted), var(--text-faint));
+    background: var(--color-faint);
+  }
+  .tick {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    background: var(--color-bg);
+    opacity: 0.9;
+    pointer-events: none;
   }
   .inflight {
     position: absolute;
     top: 0;
     bottom: 0;
-    background: var(--accent);
-    opacity: 0.3;
-    border-radius: 9999px;
-    transition: left 0.3s cubic-bezier(0.4, 0, 0.2, 1), width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-  }
-  .fill.shimmer::after {
-    content: "";
-    position: absolute;
-    inset: 0;
-    background: linear-gradient(100deg, transparent 20%, rgba(255, 255, 255, 0.55) 50%, transparent 80%);
-    background-size: 220% 100%;
-    animation: shimmer 1.6s linear infinite;
-  }
-
-  .bar.segmented {
-    display: flex;
-    gap: 1px;
-    background: rgba(255, 255, 255, 0.04);
-  }
-  .seg {
-    flex: 1;
-    position: relative;
-    background: rgba(255, 255, 255, 0.06);
-    overflow: hidden;
-  }
-  .seg-fill {
-    position: absolute;
-    inset: 0;
-    width: var(--pct);
-    background: linear-gradient(90deg, var(--accent), var(--accent-2));
-    box-shadow: 0 0 8px -1px rgba(122, 240, 200, 0.5);
-    transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-  }
-  .seg-fill.shimmer::after {
-    content: "";
-    position: absolute;
-    inset: 0;
-    background: linear-gradient(100deg, transparent 20%, rgba(255, 255, 255, 0.5) 50%, transparent 80%);
-    background-size: 200% 100%;
-    animation: shimmer 1.4s linear infinite;
-  }
-
-  @keyframes shimmer {
-    from { background-position: 220% 0; }
-    to { background-position: -120% 0; }
+    background: var(--color-primary);
+    opacity: 0.35;
+    transition: left 0.25s var(--easing-out), width 0.25s var(--easing-out);
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .fill.shimmer::after, .seg-fill.shimmer::after { animation: none; }
+    .fill, .inflight { transition: none; }
   }
 </style>

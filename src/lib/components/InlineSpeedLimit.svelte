@@ -66,7 +66,7 @@
     class:compact
     class:limited={value != null}
     on:click={open}
-    title={value == null ? "No speed limit" : `Limited to ${label} MB/s — click to change`}
+    title={value == null ? "No speed limit — click to set one" : `Limited to ${label} MB/s — click to change`}
   >
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       {#if value != null}
@@ -77,9 +77,13 @@
         <path d="M12 7v4M12 17h.01" />
       {/if}
     </svg>
-    {#if value != null}
-      <span class="num">{label}<span class="u">M</span></span>
-    {/if}
+    <span class="num">
+      {#if value != null}
+        {label}<span class="u"> MB/s</span>
+      {:else}
+        No limit
+      {/if}
+    </span>
   </button>
 {/if}
 
@@ -88,20 +92,24 @@
     display: inline-flex;
     align-items: center;
     gap: 5px;
-    padding: 4px 9px;
-    background: rgba(255, 255, 255, 0.03);
-    border: 1px solid var(--hair);
-    border-radius: 7px;
-    color: var(--muted);
+    height: 24px;
+    padding: 0 8px;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    color: var(--color-muted);
     font-family: var(--font-mono);
-    font-size: 11.5px;
+    font-size: 11px;
     cursor: pointer;
-    transition: all 0.15s;
+    transition:
+      background 0.12s var(--easing-out),
+      border-color 0.12s var(--easing-out),
+      color 0.12s var(--easing-out);
   }
   .display:hover {
-    color: var(--text);
-    border-color: var(--border-strong);
-    background: rgba(255, 255, 255, 0.05);
+    color: var(--color-text);
+    border-color: var(--color-border-strong);
+    background: var(--color-surface-hover);
   }
   .display.limited {
     color: var(--color-warning);
@@ -109,43 +117,45 @@
     background: var(--color-warning-dim);
   }
   .display.compact {
-    padding: 3px 6px;
-    font-size: 10.5px;
+    height: 22px;
+    padding: 0 6px;
+    font-size: 11px;
   }
   .display svg {
     width: 12px;
     height: 12px;
   }
   .num {
-    font-weight: 600;
+    font-weight: 500;
   }
   .u {
     margin-left: 1px;
-    opacity: 0.7;
+    opacity: 0.65;
   }
   .editor {
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    padding: 3px 8px;
-    background: rgba(255, 255, 255, 0.04);
-    border: 1px solid var(--border-focus);
-    border-radius: 7px;
+    height: 24px;
+    padding: 0 7px;
+    background: var(--color-surface);
+    border: 1px solid var(--color-primary);
+    border-radius: var(--radius-sm);
     box-shadow: var(--shadow-glow);
   }
   .editor input {
-    width: 50px;
+    width: 48px;
     padding: 2px 4px;
     border: none;
     background: transparent;
-    color: var(--text);
+    color: var(--color-text);
     font-family: var(--font-mono);
-    font-size: 11.5px;
+    font-size: 11px;
     outline: none;
   }
   .unit {
     font-family: var(--font-mono);
-    font-size: 10px;
-    color: var(--text-faint);
+    font-size: 11px;
+    color: var(--color-faint);
   }
 </style>

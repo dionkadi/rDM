@@ -115,6 +115,14 @@ const MUTATIONS = [
     pattern: "a missing background is not blamed on the DM host",
   },
   {
+    name: "ui  freeze the title-row dot on 'ok' when the host goes down",
+    file: "popup.js",
+    find: '  hostDot.className = `host-dot ${connected ? "ok" : "err"}`;',
+    replace: '  hostDot.className = "host-dot ok";',
+    test: "test/integration.test.mjs",
+    pattern: "popup: title-row dot",
+  },
+  {
     name: "ship  let a manifest without a service worker reach Chrome",
     file: "scripts/make-chrome-manifest.mjs",
     find: '  out.background = { service_worker: "background.js" };',

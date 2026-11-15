@@ -1,425 +1,133 @@
 # AGENTS.md — DM Download Manager
 
-A guide for AI coding agents (and humans) working in this repo. Read this before touching code.
+Working contract for **AI coding agents and code contributors**. Read this before touching code. Product pitch, install, and usage live in [`README.md`](README.md) — never here.
 
-## What DM is
+## Documentation map — what lives where
 
-**DM** is a cross-platform, IDM-style download manager built with **Tauri 2 (Rust + WebView)**. The Rust half is `src-tauri` plus a UI-agnostic core in `crates/engine`; the UI is a **Svelte 4 + TypeScript + Vite** SPA. A Chromium MV3 browser extension (`browser-extension/`) feeds URLs into the app via a small native-messaging shim (`crates/native-host`).
+| File | Audience | Owns |
+|---|---|---|
+| `README.md` | humans evaluating / using DM | product pitch, install, quick start, usage, releasing, contributing |
+| `AGENTS.md` (this) | agents & contributors in the repo | exact commands, conventions, invariants, gotchas, verification |
+| `docs/UI_DESIGN_PLAN.md` | anyone touching UX | visual system + information-architecture target |
+| `docs/UI_REVIEW.md` | anyone auditing UX | dated issue list, severity/priority, v2.1 change record |
+| `CHANGELOG.md` / `RELEASE_NOTES.md` | users & maintainers | version history, bug narratives |
+| `TODO.md` | contributors | roadmap by maturity tier |
 
-## Repo layout
+Rules: a fact has **one canonical home**; the others link to it. User-facing prose (feature lists, install steps, screenshots, release instructions) is `README.md` only. Commands may appear in both files — verbatim command lines here, narrative there. Never duplicate a story (e.g. "why 0.4.2 broke X") outside `CHANGELOG.md`.
 
-```
-DM/
-├── Cargo.toml                 # Cargo workspace (resolver v2). Members:
-│                              #   crates/engine, crates/native-host, src-tauri
-├── package.json               # `dm-frontend` (Svelte+Vite). Scripts: dev, build, check, tauri
-├── vite.config.ts             # Fixed port 5173, strictPort, host:false (Tauri quirk)
-├── tsconfig.json / tsconfig.node.json
-├── svelte.config.js           # vitePreprocess only
-├── index.html                 # Loads /src/main.ts → mounts <App/> into #app
-├── src/                       # Frontend (Svelte)
-│   ├── main.ts, App.svelte, app.css
-│   └── lib/
-│       ├── api.ts             # Thin invoke(...) wrappers (one per Tauri command)
-│       ├── types.ts           # TS mirrors of Rust model (camelCase JSON)
-│       ├── design-tokens.ts   # Single source of design tokens (CSS-var compatible)
-│       ├── components/        # DownloadRow, FileIcon, ProgressBar, StatusBadge,
-│       │                      # DropdownMenu, InlineSpeedLimit, GlobalSearch,
-│       │                      # CommandPalette, SmartFilters, SettingsTabs,
-│       │                      # StatusBar, Toast (barrel: index.ts)
-│       ├── stores/            # downloads.ts, ui.ts, settings.ts — Svelte writables/derived
-│       ├── hooks/             # useKeyboardShortcuts.ts (global ⌘K + per-view shortcuts)
-│       └── utils/             # fuzzySearch.ts, formatters.ts, env.ts (browser/Mac detection)
-├── src-tauri/                 # Tauri shell (Rust)
-│   ├── Cargo.toml             # depends on dm-engine (path = ../crates/engine)
-│   ├── tauri.conf.json        # identifier "com.dm.downloadmanager", frontendDist=../dist
-│   ├── build.rs               # tauri_build::build()
-│   ├── capabilities/default.json
-│   ├── icons/                 # All platform icon sizes (32..512, .ico/.icns)
-│   └── src/
-│       ├── main.rs            # logging::init() → Builder + plugins + setup (storage,
-│       │                      #   manager, listener, tray) — injects the Tokio spawner
-│       ├── commands.rs        # #[tauri::command] surface → delegates to DownloadManager
-│       ├── events.rs          # Engine DownloadEvent → FrontendEvent (one channel: "download-event")
-│       ├── logging.rs         # `log` crate shim → per-session file under XDG_DATA_HOME,
-│       │                      #   mirrored to stderr; returns a LogGuard with .path()
-│       ├── tray.rs            # Show / Hide / Quit tray menu (best-effort)
-│       └── native_host.rs     # TCP listener on 127.0.0.1:9157 → enqueue URLs;
-│                              #   exposes NativeHostStatus (bound + last_event_unix) for
-│                              #   the Settings → Extensions tab.
-├── crates/
-│   ├── engine/                # UI-agnostic download engine (testable, no Tauri)
-│   │   ├── Cargo.toml         # tokio, reqwest (rustls+stream+cookies+http2), rusqlite
-│   │   │                      #   (bundled), serde, sha2, chrono, uuid, thiserror…
-│   │   ├── src/
-│   │   │   ├── lib.rs         # module list + re-exports
-│   │   │   ├── model.rs       # Download, ChunkState, DownloadStatus, ChecksumSpec,
-│   │   │   │                  #   Settings, Category, ProxyMode, effective_proxy_url()
-│   │   │   ├── manager.rs     # DownloadManager (Arc-cheap clone). Owns tasks, scheduler,
-│   │   │   │                  #   limiter, spawner. With_settings_and_spawner() entry point.
-│   │   │   ├── scheduler.rs   # DownloadScheduler: Semaphore-based slots + per-download conn cap
-│   │   │   ├── limiter.rs     # TokenBucket + CombinedLimiter (global + per-download; more-restrictive wins)
-│   │   │   ├── control.rs     # DownloadControl: AtomicBool pause/cancel + tokio Notify
-│   │   │   ├── protocol.rs    # HEAD/range probe, filename extraction, chunk planning, Content-Range parsing
-│   │   │   ├── chunk.rs       # download_chunk(): one range GET, throttled, honours pause/cancel
-│   │   │   ├── hls.rs         # HLS playlist parsing (master/media, variants, byterange,
-│   │   │   │                  #   EXT-X-MAP, EXT-X-KEY) — pure, unit-tested
-│   │   │   ├── task.rs        # build_client/build_probe_client (raw bytes, custom UA, no
-│   │   │   │                  #   transparent decompression). run_download() pipeline,
-│   │   │   │                  #   plus run_hls_download() (segment walk + optional remux).
-│   │   │   ├── storage.rs     # SQLite (rusqlite bundled). Tables: downloads, history,
-│   │   │   │                  #   categories, settings. delete_download() for hard-removes.
-│   │   │   └── config.rs      # default_categories() + load_or_default()
-│   │   └── tests/integration.rs  # Spawns a local HTTP server, drives DownloadManager end-to-end
-│   │       tests/hls.rs          # Same, for a master/media playlist: bytes, live, AES, remux
-│   └── native-host/           # Standalone bin: dm-native-host (Chrome native-messaging shim)
-│       └── src/main.rs        # read/write 4-byte-LE-prefixed frames, extract_media_urls, forward_url
-├── browser-extension/         # MV3 (manifest_version: 3) extension
-│   ├── manifest.json          # The **Firefox 109+ template** — NOT a unified
-│   │                          #   manifest. `scripts/package.sh` derives the
-│   │                          #   Chromium `.zip` manifest from it. Loading this
-│   │                          #   file directly in Chrome yields no background
-│   │                          #   context at all (see "Manifest shapes" below).
-│   ├── background.js          # MV3 background page. Picks the transport at load:
-│   │                          #   WebSocket ws://127.0.0.1:9157/ for Chromium,
-│   │                          #   chrome.runtime.connectNative for Firefox.
-│   │                          #   No ESM imports — works in both service-worker
-│   │                          #   (Chrome) and event-page (Firefox) contexts.
-│   │                          #   `chrome.runtime.lastError` is captured in the
-│   │                          #   same tick as `connectNative` (Firefox clears it
-│   │                          #   on the next runtime API call).
-│   │                          #   Also owns the cross-frame media log: an
-│   │                          #   observational `webRequest.onHeadersReceived`
-│   │                          #   listener classifies responses by Content-Type
-│   │                          #   per tab, keeps a bounded log in
-│   │                          #   `chrome.storage.session`, and hands it to the
-│   │                          #   content script as `hints` on grab.
-│   ├── content.js             # Two responsibilities, both opt-in:
-│   │                          #   (1) capture-phase click interceptor on `<a>` elements
-│   │                          #       matching MEDIA_RE (or with a `download` attribute)
-│   │                          #       — synchronously preventDefault + forward the URL to
-│   │                          #       the background, so no "canceled" download row is
-│   │                          #       created in the first place. Gated on DM being
-│   │                          #       reachable, on `e.isTrusted`, and on the user's
-│   │                          #       toggle; does NOT stopPropagation, so the page's
-│   │                          #       own handlers keep working;
-│   │                          #   (2) explicit `collect` message handler for the popup's
-│   │                          #       "Grab page media" button. Modifier keys, middle/right
-│   │                          #       click, and non-http(s) URLs bypass the interceptor.
-│   │                          #   Runs at `document_start` so the resource-timing
-│   │                          #   observer is installed before the page's load burst.
-│   ├── popup.html / popup.js  # Host status, the two behaviour switches, "Grab page
-│   │                          #   media" and "Test host connection" buttons (themed;
-│   │                          #   surfaces the actual `chrome.runtime.lastError.message`
-│   │                          #   and a hint, and reports grab results truthfully).
-│   ├── test/                  # Dependency-free regression suite (node:test + a fake
-│   │                          #   chrome.* / DOM / clock). Not shipped. See "Testing"
-│   ├── com.app.dm.native.firefox.json   # Firefox-only host template. `path` is a
-│   │                                    #   placeholder the user must edit.
-│   └── INSTALL.md             # Build + register the native host, per-browser notes
-├── .pkgconfig-shim/           # *.pc shims for libappindicator3 / ayatana-appindicator3
-├── build-with-shim.sh         # Wraps `npm run tauri build`; prepends .pkgconfig-shim to PKG_CONFIG_PATH
-├── coredump/                  # Local Tauri/webview crash dumps (gitignored)
-├── images/                    # README screenshots (gitignored)
-├── dist/                      # Vite build output (gitignored)
-├── target/                    # Cargo workspace target dir (unified at root, gitignored)
-├── UI_DESIGN_PLAN.md          # Detailed IDM-parity design intent (read before UX changes)
-├── notes/session-logs/        # Free-form per-session notes
-└── .pi/tasks/                 # Plannotator / agent harness scratch (gitignored)
-```
+## Moving parts
 
-## Engine architecture (Rust)
+Tauri 2 shell (`src-tauri`) → UI-agnostic Rust engine (`crates/engine`) → Svelte 4 + TS + Vite SPA (`src/`), fed by an MV3 browser extension (`browser-extension/`) through `crates/native-host` and a local TCP/WebSocket bridge (`127.0.0.1:9157`). The user-level picture is the diagram in `README.md`.
 
-The engine is the heart of DM. **`crates/engine` has zero Tauri deps** so it is fast to compile and fully unit-testable.
+## Repo map (non-obvious only)
 
-- **`DownloadManager`** owns every active task (`HashMap<id, TaskEntry>`) plus shared `RunContext` (scheduler + global limiter + storage + event sink + max_connections + proxy + spawner). Cheap to clone (wraps `Arc<Inner>`).
-- **Runtime injection (`Spawner`)** — the engine never calls `tokio::spawn` directly. It stores a `Spawner = Arc<dyn Fn(BoxFuture<'static, ()>) + Send + Sync>` so callers in non-Tokio contexts (e.g. Tauri's default command workers) can hand in their own. `with_settings_and_spawner()` is the entry point the Tauri shell uses; the Tauri side passes `tauri::async_runtime::handle().clone()` so tasks run on Tauri's runtime. The default constructor falls back to `Handle::current()` so the engine tests (which already run on a Tokio runtime) still work.
-- **`DownloadScheduler`** uses two semaphores: global `download_slots` and per-id `per_download` connection map. `set_limits(...)` rebuilds the slot semaphore and clears per-id state on settings change.
-- **`CombinedLimiter`** = global token bucket + per-download bucket; `acquire()` spends from both. `TokenBucket` rate `0` = unlimited; capacity = 0.2s burst.
-- **`DownloadControl`** (`control.rs`) — `AtomicBool` pause/cancel plus a `tokio::sync::Notify`; `wait_while_paused().await` returns true if cancellation was requested. `pause()` and `resume()` also clear any stale `d.error`.
-- **`run_download()`** flow: `acquire_download` slot → mark `Connecting` → probe (HEAD, fallback to range GET) → plan chunks (or single-chunk fallback for unknown size / no-range servers) → `Downloading` → spawn N chunk workers → aggregate progress (throttled every 150ms) → finalise: SHA-256 verify if checksum, mark `Completed`/`Error`/`Canceled`, append to `history` table.
-- **`chunk.rs`** opens the file with `tokio::fs::OpenOptions`, `seek`s to `chunk.resume_offset()`, writes each response buffer through the limiter, polls control flags, and surfaces `ChunkError::Canceled` if the user cancelled.
-- **`storage.rs`** uses `rusqlite` with the **`bundled` feature** (no system SQLite needed). All writes go through `Mutex<Connection>`; tables are created idempotently by `migrate()` on open. `Storage::open_memory()` exists for tests. `Storage::delete_download(&self, id)` issues a `DELETE FROM downloads WHERE id = ?1` and is called by `DownloadManager::remove()` so "Remove" persists across restarts (the append-only `history` row is intentionally left in place).
-- **`protocol.rs`** does filename extraction (RFC 5987 `filename*=UTF-8''...` → quoted `filename=...` → URL path segment → `fallback`), `decide_chunk_count` (~1 chunk per MiB capped at `max_connections`), and `plan_chunks` (inclusive ranges, evenly divided with remainder bytes pushed to earlier chunks).
-- **HTTP client (`task.rs`)** — `build_client` / `build_probe_client` construct reqwest with:
-  - `user_agent(DEFAULT_USER_AGENT)` where `DEFAULT_USER_AGENT = "Mozilla/5.0 (compatible; DM-DownloadManager/0.1; +https://github.com/dm-project/dm)"` plus default `Accept: */*` and `Accept-Language: en-US,en;q=0.9,*;q=0.8`. Bare `reqwest/x.y.z` is 403'd by many CDNs/mirrors.
-  - `.gzip(false).brotli(false).deflate(false)` — transparent decompression is **disabled**. Some servers (notably `mirrors.tuna.tsinghua.edu.cn` directory listings) lie about `Content-Encoding: gzip` while serving non-gzipped bytes, which surfaces as a generic `error decoding response body`. The chunk stream saves the wire bytes verbatim, which is what an IDM-style manager wants anyway.
-  - `proxy = effective_proxy_url()` from `Settings` (or a per-download override on `Download.proxy`).
-- **Proxy model (`model.rs`)** — `ProxyMode` = `None | System | Manual`. `Settings::effective_proxy_url()`:
-  - `None` → `None`.
-  - `System` → reads `HTTPS_PROXY` then `HTTP_PROXY` env vars (lets reqwest's auto-detection handle `NO_PROXY`).
-  - `Manual` → `Settings.proxy` if non-empty.
-  `proxy_mode` uses `#[serde(default)]` so old DB rows deserialize as `System`. Per-download `Download.proxy` always wins over the global one. `DownloadManager::set_global_proxy(mode, url)` is the cheap path that updates just the proxy without touching the rest of `Settings`.
+- **Cargo workspace at repo root** unifies `target/` — the release binary is `target/release/dm-tauri`, not `src-tauri/target/...`.
+- **`browser-extension/manifest.json` is the Firefox 109+ template.** Chromium manifests are derived at package time (`scripts/package.sh` / `dev-unpacked.sh`). Loading the repo folder in Chrome yields **no background context at all** — always ship/load the derived build.
+- `build-with-shim.sh` + `.pkgconfig-shim/` are **required on Fedora 40+** (bundler needs `libappindicator3` `.pc` files the distro no longer ships).
+- `.taurignore` (root) keeps the Tauri CLI file-walker from EMFILE-panicking on `target/` + `node_modules/`. Keep those patterns.
+- Gitignored scratch: `.pi/`, `coredump/`, `dist/`, `images/`, `target/`. Never commit from them.
+- Tauri identifier is **`com.dm.downloadmanager`** (the old `com.dm.app` collided with `.app` on macOS). Do not change without updating the macOS bundle name.
 
-### Status lifecycle
-
-`Queued` → `Connecting` → `Downloading` → (`Paused` ⇄ `Queued`) | `Completed` | `Error` | `Canceled`. The `Scheduled` status parks downloads outside the user's schedule window (see `run_schedule_loop` in `manager.rs` — 15s ticker, pauses active → `Scheduled`, promotes `Scheduled` → `Queued` when the window reopens).
-
-### Events
-
-`manager::DownloadEvent` is converted 1:1 to `events::FrontendEvent` and emitted on Tauri channel **`download-event`** as `{ kind: "added" | "progress" | "statusChanged" | "completed" | "error" | "removed", download: Download }` (the `removed` variant carries `{ id }` only). Frontend listens in `stores/downloads.ts::startEventListener()` and merges into the Svelte store.
-
-## Tauri shell (`src-tauri`)
-
-- **Logging first**: `main.rs` calls `logging::init()` before the Tauri builder so every log line is mirrored to a fresh `~/.local/share/DM/YYYYMMDD-HHMMSS.log` file (with `XDG_DATA_HOME` overrides) **and** to stderr. The returned `LogGuard` exposes `.path()` for "Report a bug" dialogs. The shim is a `log::Log` impl — no new deps, the engine already uses `log`.
-- **Plugins registered**: `clipboard-manager`, `notification`, `autostart` (macOS LaunchAgent).
-- In `setup()`: open SQLite at `dm.sqlite`, construct `DownloadManager::with_settings_and_spawner(...)` injecting a spawner built from `tauri::async_runtime::handle().clone()`, wire the event sink (clone of `AppHandle`, emits via `Emitter`), call `app.manage(manager.clone())`, spawn the native-host TCP listener on `127.0.0.1:9157`, and start the schedule loop.
-- Tray construction is wrapped in `if let Err(e) = ...` and logged; the app keeps running if libayatana-appindicator cannot write its cache.
-- **`commands.rs`** is the entire frontend-facing command surface: `ping`, `add_download`, `list_downloads`, `get_download`, `pause_download`, `resume_download`, `cancel_download`, `remove_download`, `set_speed_limit`, `set_global_speed_limit`, `set_proxy`, `get_settings`, `update_settings`, `save_dir_for`, `notify_on_complete`, `probe_native_host`.
-- `capabilities/default.json` lists the precise plugin permissions granted to the main window.
-- Identifier is **`com.dm.downloadmanager`** (NOT `com.dm.app` — the old id collided with `.app` on macOS).
-
-## Native-messaging bridge (`crates/native-host` + `src-tauri/src/native_host.rs`)
-
-A pure-stdio binary (`dm-native-host`) reads Chrome native-messaging frames (4-byte little-endian length + UTF-8 JSON), runs the HTML through `extract_media_urls` (quoted-URL scan; keeps URLs ending in a media extension, containing `.m3u8`, or containing DASH `manifest`), and `forward_url()` posts `{"url":"..."}\n` to the TCP listener inside the running app. Port defaults to **9157** (override via `DM_NATIVE_HOST_PORT`); the same constant lives in `src-tauri/src/native_host.rs::DEFAULT_PORT`. Two unit tests cover frame round-trip and extraction.
-
-`src-tauri/src/native_host.rs` additionally tracks `NativeHostStatus { bound: AtomicBool, last_event_unix: AtomicU64 }`. The `probe_native_host` Tauri command returns a snapshot; the Settings → Extensions tab polls it every 3s.
-
-The browser extension MV3 background relays URLs from three sources, in priority order: (1) the content script's **capture-phase click interceptor**, which prevents the browser from creating a download row in the first place; (2) the `chrome.downloads.onCreated` safety net for downloads that bypass the content script (e.g. right-click "Save link as", `<a download>` in cross-origin iframes, programmatic `window.location = url`); (3) the popup's manual "Grab" button. Unlike the pre-0.4.2 code, **every one of those paths is gated on the URL actually reaching DM** — see "Nothing is taken from the browser unless DM received it" below.
-
-**Transport selection.** Chromium browsers use a WebSocket to the app's `127.0.0.1:9157` listener; Firefox uses `chrome.runtime.connectNative("com.app.dm.native")` because Firefox upgrades insecure `ws://` to `wss://` and silently fails. Both carry the same payload `{"url"|"urls", "type", "referer", "userAgent"}`.
-
-**Manifest shapes — the source manifest is the Firefox template.** `browser-extension/manifest.json` declares `background.scripts` (an array) and a `browser_specific_settings.gecko` block, because Firefox 109–127 rejects `background.service_worker`. `scripts/package.sh` / `package.ps1` derive the Chromium variant at package time: `background.service_worker: "background.js"`, no gecko block, and `nativeMessaging` stripped.
-
-Do **not** assume Chrome reads `background.scripts` as a service worker — it does not. Before Chrome 121 a Manifest V3 extension declaring `background.scripts` is **refused at load**; from Chrome 121 the key is **ignored**, and since the source manifest declares no `background.service_worker`, loading the repo directory unpacked in Chrome produces **no background context at all** (the popup reports "background not reachable" and nothing works). Chromium builds must come from the released `.zip`. `scripts/verify-package.sh` asserts both manifest shapes.
-
-**The Firefox path needs the `nativeMessaging` permission.** Without it, `chrome.runtime.connectNative` is not a function, the native transport can never connect, and — because the content script used to intercept unconditionally — the only visible symptom was "media links stop working". `manifest.json` declares it; the Chromium `.zip` must not (the WebSocket path doesn't need it, and an unnecessary permission enlarges the install prompt). The same manifest declares `webRequest` (observational only) and injects the content script at `document_start`; `test/manifest.test.mjs` derives the required permission set from the source and fails if the manifest disagrees in either direction, and also asserts the run timing and the absence of `webRequestBlocking`.
-
-**No Chrome extension ID to copy any more.** Chromium talks to DM over WebSocket, so there is no `allowed_origins` host manifest to register and no `REPLACE_WITH_YOUR_CHROME_EXTENSION_ID` placeholder to substitute. Only the Firefox host manifest exists (`com.app.dm.native.firefox.json`, `allowed_extensions: ["dm-grabber@dm-project"]`), and its `path` ships as a placeholder the user must point at the built `dm-native-host` binary. (The `com.app.dm.native.json` / `com.app.dm.native.chrome.json` templates were deleted in 0.4.2 — if you find a doc or README pointing at them, the doc is stale.)
-
-**The native host is a dumb pipe; don't filter URLs by file extension.** The Rust `dm-native-host` binary used to accept only `MEDIA_EXTS` (`.mp4`, `.webm`, `.mkv`, ...) and HLS/DASH manifests, silently dropping everything else — including `.zip`, `.pdf`, `.iso`, `.exe` that the content script finds on a download page. The user would see "I clicked save-as, nothing happened" with no diagnostic. The host now uses a permissive `looks_like_downloadable_url` (must be `http(s)://`, must not be `javascript:` / `data:` / `about:`, must have a non-trivial path) and forwards **every** http(s) URL the extension captures. The Tauri engine's `add_download` is the right place to reject unsupported schemes / 4xx / 5xx — the user gets a real error message there, not a silent drop.
-
-**Content script is opt-in only — no auto-scrape on every page.** The previous version of `content.js` ran `collectMedia()` once on `document_idle` AND kept a `MutationObserver` that re-scanned every 2 s. Every page the user visited (and every DOM change on that page) auto-sent media URLs to DM. The result: opening YouTube, Twitch, a news site with embedded video, or any re-rendering single-page app flooded DM with queued downloads the user never asked for. The current version responds to the `collect` message only — the popup's **Grab page media** button is the *only* trigger. The auto-scrape path is intentionally removed; if a future version wants to add it back, gate it on a user-controlled "auto-grab" preference stored in `chrome.storage.sync`.
-
-**`chrome.downloads.onCreated` is filtered by install time — and the listener must be registered synchronously.** Chrome re-fires `onCreated` for downloads that were already in the user's history at the moment the extension was installed (a documented re-fire to help extensions catch up after a crash). For a download manager, that turns "I just installed DM Grabber" into "DM is now clogged with 200 old downloads I never asked for". The service worker records the install time in `chrome.storage.local` (key `dmInstallTime`) on the very first `onInstalled({reason: "install"})` event and only on that event — updates do **not** reset the timestamp, so the filter continues to ignore pre-update downloads. The filter drops any `DownloadItem` whose `startTime` is missing, unparseable, or before `installTimeMs`.
-
-Two things about that filter are easy to get wrong:
-
-* **The listener is registered at the top level, synchronously.** MV3 requires it: a listener added after an `await` misses the event that woke the worker, and the browser may then stop waking it for that event type at all. The old code deferred registration until `loadInstallTime()` resolved, which is why the safety net was unreliable after a service-worker restart.
-* **`state.installTimeMs` uses `0` to mean "not read yet", and nothing is forwarded while it is 0.** A service worker is routinely woken *by* the download event in question, so `Date.now()` taken at boot is always slightly *later* than that download's `startTime` — using the boot time as a stand-in silently drops legitimate downloads. The handler instead `await`s `loadInstallTime()` and then judges, so a download that woke a cold worker is still forwarded. Don't "simplify" this back to a boot-time default.
-
-**Nothing is taken from the browser unless DM received it.** This is the invariant the whole interception design exists to enforce, and it is what `browser-extension/test/` pins down:
-
-* `onCreated` forwards **first** and only calls `takeOverChromeDownload()` when `send()` returned `true`. Cancelling unconditionally (the 0.4.2 behaviour) destroyed downloads the user had already started whenever DM was down.
-* A click the background can't deliver is handed back with `chrome.downloads.download()`; the resulting `onCreated` is suppressed through an `ignoredUrls` map so the fallback can't ping-pong. Fallback filenames go through `safeFilename()` first — `downloads.download` throws on an invalid name, and throwing there would lose the download we were trying to rescue.
-* The content script caches host liveness (pushed by `broadcastState()` on every transition) and refuses to intercept when DM is unreachable or when the extension runtime was invalidated by a reload. It fails **open**: if in doubt, the browser does the download.
-* When the browser's copy *is* cancelled, the file is removed with `downloads.removeFile()` **only if the item is not `complete`** — a finished file is real data. Note `downloads.erase()` alone never deletes bytes, so without `removeFile` the truncated partial lingers as an orphan.
-
-The popup exposes two `chrome.storage.local` switches (`dmSettings`), both defaulting to on so existing behaviour is unchanged: `interceptOnClick` (media-link clicks) and `takeoverBrowserDownloads` (everything the browser starts on its own). A download manager that silently hijacks every download in a browser profile with no way to opt out is a bug, not a feature.
-
-**Testing.** `browser-extension/test/` runs on `node:test` with **no dependencies** (CI's extension job never runs `npm install`). `test/harness.mjs` builds a fake `chrome.*`, a controllable clock, a minimal DOM and a fake `WebSocket`, then loads the real `background.js` / `content.js` / `popup.js` through `node:vm` into a *shared* context so messages genuinely travel between them. Run it with:
+## Commands (verbatim)
 
 ```bash
-cd browser-extension
-node --test test/*.test.mjs          # the regression suite (104 tests)
-node test/mutation-check.mjs         # re-introduces each fixed bug; every one must be caught (24)
-```
-
-`test/media-detection.test.mjs` is the one that pins the *detection* contract (relative `src`, blob-only players, extensionless `Content-Type` hints, same-origin iframe timelines, buffer eviction, cid grouping, note/reason passthrough, cross-frame end-to-end); `content.test.mjs` / `background.test.mjs` / `integration.test.mjs` cover the click and delivery paths.
-
-`mutation-check.mjs` deliberately rewrites the sources (and restores them in a `finally`), so it is not named `*.test.mjs` and isn't picked up by the normal run. **If you fix a bug here, add a test and a mutation for it** — a regression test that can't fail is decoration.
-
-**Diagnosing "the app is running but the extension won't connect".** The browser reports `close code 1006` for *every* way a WebSocket can fail, so this symptom is undecidable from the extension side alone — do not guess. Establish which layer is broken, in this order:
-
-1. `node browser-extension/scripts/check-host.mjs` — TCP-connects to 127.0.0.1:9157, sends a real Chrome-shaped upgrade request, and verifies the `Sec-WebSocket-Accept`, then exercises a masked close frame. It distinguishes `refused` (nothing listening) from `no-response` (**something listening that never answers the upgrade — the pre-0.4.2 DM build signature**, whose listener only spoke line-delimited JSON) from `bad-accept` (server bug) from `ok`. It sends no URLs to DM. Its `--self-test` runs it against fake listeners of each kind and is wired into CI, because a probe that can't discriminate is worse than none.
-2. If the probe says `ok`, the app side is fine and the problem is in the extension. Check the popup's *specific* message: **`Could not establish connection. Receiving end does not exist.` means there is no background service worker at all** — nearly always because the repo folder was loaded in Chrome instead of a Chromium build. That is not a loud failure (see "Manifest shapes" above), and it cost a real debugging session: build one with `browser-extension/scripts/dev-unpacked.sh` (writes `dist/chrome-unpacked/` with the Chrome-shaped manifest, prints the "Load unpacked" path) or use the released `.zip`. The popup names this case explicitly ("Extension background isn't running") rather than blaming the host; keep it that way, and keep the two cases distinguishable.
-3. To test the extension without building the GUI, `src-tauri/probe-listener/` runs the **real** `ws.rs` listener as a terminal program on port 9158 (it is excluded from the workspace and never ships).
-
-**`scripts/` tooling must survive being invoked through a symlink.** `scripts/package.sh` computes absolute paths with `pwd`, which returns the *logical* path, so on a symlinked checkout (this repo: `/home/tomg/Codes/…` → `/home/tomg/Other/…`) node receives an `argv[1]` that does not equal the resolved `import.meta.url`. The naive `import.meta.url === process.argv[1]` main-module check then **silently does nothing and exits 0** — the build "succeeds" while emitting a manifest Chrome cannot run, which is exactly how a Chromium build with no service worker reached a user. Always use `isMainModule(import.meta.url)` from `scripts/lib/is-main.mjs` (it compares realpaths), and `test/manifest.test.mjs` runs both tooling scripts through a symlink to keep it that way.
-
-Verified against the real code: a browser-shaped client (Chrome's exact headers incl. `Origin`, then a masked text frame with the extension's payload) gets the frame delivered intact, an `{"ok":true}` ack, and a clean close. The Chromium transport's server half is sound — if a user reports it failing, suspect the app build, the extension's background context, or the environment before suspecting `ws.rs`.
-
-**The `media` message type is a hard boundary, not a soft one.** The previous content-script auto-scrape path used to send `{type: "media", urls: [...]}` on every page load / DOM mutation, which flooded DM. The content script no longer auto-sends, and the background's `onMessage` handler now **drops `type === "media"` on the floor** — even if a stale cached content script (or a third-party script) tries to send it, the background refuses. Only `type === "grab"` (the popup button's explicit ask) is accepted. This is a deliberate, documented boundary so the next refactor can't accidentally re-enable passive capture by leaving a "harmless" `media` branch in the handler.
-
-**What "Grab page media" is allowed to look at, and why the order matters.** `collectMedia(hints)` in `content.js` scans, in descending trust: media elements (`currentSrc` → `.src` → the raw attribute) → HLS/DASH hints and downloadable-looking `<a>` links → Open Graph video → same-origin iframes' DOM **and their own `performance` timeline** → the top frame's resource timing → and finally the background's `webRequest` log (`hints`, newest first). Every candidate goes through `absoluteUrl()` first: a relative `<video src="/v/clip.mp4">` is a real media URL, and rejecting it for not matching `^https?:` was why pages "worked after you pressed play but not before" (`currentSrc` is empty until the resource selection algorithm runs). `add()` then drops non-http(s) schemes (`blob:`/`data:` — MSE keeps the real stream out of the DOM), HTML documents (pathname only — a query string may legitimately contain `.html`), and duplicates.
-
-Curation is one logical download, IDM-style: a `.m4s` **pair** (range stripped, signing params kept) → a direct file → a manifest → a lone segment, in that order. The episode grouping is allowed to *reorder and prefer*, never to empty the set: `dominantCid()` only votes among bases we actually hold, an empty intersection falls back to every base, and bases whose cid cannot be parsed are kept because they are not evidence of another episode. Getting this wrong is how a page that was playing fine answered "no media".
-
-**Empty results are diagnostics, not a verdict.** `collectMedia` returns `diag` (`frames`, `players`, `blobPlayers`, `unusablePlayers`, `network`, `hints`, per-source counts) and a `note`; `handleGrab` forwards both plus a machine-readable `reason` (`no_content_script` / `player_without_url` / `filtered_out` / `no_media_observed`). The note used to be dropped on exactly the empty path, which is why "there is a player I cannot name", "the page script isn't running" and "nothing here" all rendered as `no media found on this page`. Keep the three distinguishable.
-
-**The resource-timing buffer keeps the OLDEST entries.** Once it reaches its cap the browser stops recording new ones — it does not evict — so on a long video the requests made while watching are the ones that go missing. That is why the content script runs at `document_start`, mirrors entries into a 400-entry ring via `PerformanceObserver`, and calls `clearResourceTimings()` in the callback. `setResourceTimingBufferSize` alone is not a fix: it only raises the cap and cannot recover what already fell out.
-
-**`window.__playinfo__` is not visible from a content script.** Page expandos live in the page's world; Chrome's isolated world cannot see them and Firefox only exposes them through `window.wrappedJSObject` (`pageGlobal()`). The harness loads both scripts into one vm context, so a test that reads `window.__playinfo__` proves nothing about the browser — assume the source is absent unless `wrappedJSObject` is in play.
-
-**Cross-frame media is observed in the background, not the content script.** A content script only sees its own frame: `performance` is per-window, a cross-origin player iframe exposes neither its DOM nor its timeline, and `all_frames` is deliberately off. So `background.js` keeps an observational `chrome.webRequest.onHeadersReceived` listener (`types: ["media","xmlhttprequest","other"]`, `["responseHeaders"]`, **never** `webRequestBlocking` — Chrome restricts it to policy installs) that classifies responses by `Content-Type`: `video/*`/`audio/*` → `file`, `application/vnd.apple.mpegurl` / `x-mpegurl` / `audio/mpegurl` / `dash+xml` → `manifest`, and `video/mp2t` / `application/octet-stream` → nothing (a fragment, or a CDN that doesn't know). The per-tab log is bounded (120 entries, 30 min TTL, cleared on navigation/tab close) and persisted to `chrome.storage.session` on a 400 ms debounce — the popup wakes a *fresh* worker after the media was played, so an in-memory-only log would be empty exactly when it is needed. Hints are advisory: they widen what `collectMedia` can see, but the content script still decides what to offer.
-
-
-**Captures notify.** A captured URL raises a desktop notification (Tauri `notify` command) *and* an in-app toast, because the `CaptureDialog` is a modal in a window the user is almost certainly not looking at — they just clicked a link in their browser. The notification is skipped when the window already has focus (`document.hasFocus()`), so it never duplicates what's on screen. The focus test belongs in the event listener (`stores/downloads.ts`), not in the dialog: the listener is the only place that knows about focus, and a toast in an unfocused window is not a notification.
-
-**Reloading the extension is required after pulling new code.** Chrome's MV3 service worker is long-lived and **does not pick up file changes on disk** — the user must click **Reload** on the extension card in `chrome://extensions`, or restart Chrome, for new `background.js` / `content.js` to take effect. If the user reports "I pulled the fix but it's still broken", the first thing to check is the service worker's "Inspect views" / "Service worker" link in `chrome://extensions` and confirm the source actually shows the new code.
-
-**The extension **takes over** the browser's download, it doesn't double it.** Two complementary paths:
-
-- **Primary — content-script click interception.** `content.js` registers a `capture: true`, `passive: false` click listener on `document.documentElement`. When the user left-clicks an `<a>` whose URL matches `MEDIA_RE` or that has a `download` attribute, the listener calls `e.preventDefault()` + `e.stopImmediatePropagation()` **synchronously** in the capture phase, *before* the browser's own anchor-click handler runs. The click then never reaches the browser's download machinery, so Firefox/Chrome never creates a download row — there's no "canceled" entry to clean up. The listener then forwards the URL to the background via `chrome.runtime.sendMessage({ type: "download-click" })`, which `send()`s it to the DM host. Modifier keys (Ctrl/Cmd/Shift/Alt/Meta), middle/right-click, and non-`http(s)` URLs bypass the interceptor so the user keeps "open in new tab" / "save as" behaviour when they actually want it.
-- **Fallback — `chrome.downloads.onCreated` + cancel + erase.** For downloads that bypass the click interceptor (right-click "Save link as", programmatic downloads, cross-origin iframes, downloads initiated before the content script attached), `background.js` registers a `chrome.downloads.onCreated` listener that forwards the URL to DM, then `chrome.downloads.cancel(id)` + `chrome.downloads.erase({id, removeFromDisk: false})` to remove the browser's own copy. Without the cancel, the upstream — especially a single-connection CDN mirror — sees two racing connections and may truncate one of them, leaving DM with a partial body that the engine then wrongly auto-completes. With the cancel, DM is the only one talking to the mirror and the body stream is the real file. The `removeFromDisk: false` is intentional: the browser's partial file is not the real file and we don't want to keep it around in the user's Downloads folder.
-
-  Together these two paths cover the practical user flows: the click path never creates a phantom "canceled" entry, and the `onCreated` path handles the cases the click path can't reach. Firefox does not implement `chrome.downloads.onDeterminingFilename` (it's a schema no-op as of Firefox 154), so MV3 extensions can't suppress the download any earlier than the `onCreated` event; the content-script click interceptor is the cleanest workaround for click-initiated downloads.
-
-**Open-ended auto-completion requires a minimum body size.** When the probe couldn't discover `Content-Length` (e.g. the proxy didn't relay it), the engine creates a single chunk with `end = u64::MAX` and treats end-of-stream as completion. **Without a guard, a 879 B body that closes cleanly is marked `Completed`**, which is the user-reported "879 B downloaded, labeled Completed" failure. The engine now requires `d.downloaded >= OPEN_ENDED_MIN_BYTES` (1 KB, set in `task.rs`) before auto-completing an open-ended transfer; below that, the transfer is marked `Error` with a clear "open-ended transfer truncated at N B" message. 1 KB is below the size of any reasonable user-facing download and well above the size of an HTML error page or 302-redirect stub. Regression test: `truncated_body_marks_error_not_completed` in `crates/engine/tests/proxy_strict_range.rs`.
-
-**`fmtBytes` is unit-aware up to YB; open-ended chunks render a hint instead of a fake size.** The byte formatter in `src/lib/utils/formatters.ts` extends its unit array through `YB` and shows `≥1024 YB` for anything larger (so `u64::MAX` no longer renders as the misleading `"16777216.0 TB"` it used to — that came from capping at `TB` and dividing). Additionally, the chunk display in `DownloadRow.svelte` detects open-ended chunks (`chunk.end` not finite or `> Number.MAX_SAFE_INTEGER`) and renders `879 B · unknown total` instead of `879 B / 16 EB`, so the sentinel can never leak into the UI.
-
-## Frontend (`src/`)
-
-- **Composition root** is `App.svelte`. It mounts in `src/main.ts`, wires stores, clipboard monitor, drag-and-drop, global ⌘K shortcuts, the demo data mode, and composes the sidebar + list + status bar from `lib/components/*`. Stores import names: `downloads`, `aggregateSpeed`, `counts`, `totalDownloaded`, `refreshDownloads`, etc.
-- **`lib/api.ts`** — one wrapper per Tauri command. Tauri v2 camelCase keys → snake_case Rust args. Use these wrappers, not raw `invoke()`.
-- **`lib/types.ts`** — TS mirrors of the Rust model in camelCase, plus the `FrontendEvent` discriminated union. Stay in sync with `crates/engine/src/model.rs` and `src-tauri/src/events.rs`.
-- **`lib/design-tokens.ts`** is the single source for color/spacing/radius/etc. Values are CSS-var compatible and consumed by `app.css`.
-- **`lib/stores/`** — `downloads.ts` (state + CRUD + live event subscription + 1Hz speed-monitor tick + smart-folder bucketing), `ui.ts` (sidebar, filters, modals, toasts, clipboard, drag, status-bar metrics, theme), `settings.ts` (persisted, with revert-on-error).
-- **`lib/hooks/useKeyboardShortcuts.ts`** — register a `Shortcut[]`, gets cleaned up on unmount; inputs/textarea skip non-global combos except `Escape`.
-- **`lib/utils/fuzzySearch.ts`** — exact-substring-first scoring, consecutive/word-start bonuses, `<mark>` highlighting. `lib/utils/formatters.ts` — bytes/rate/percent/duration/relative time/date/truncate/url helpers + `debounce`/`throttle`. `lib/utils/env.ts` — `browser` and `isMac` runtime detection.
-- **Theme system**: `[data-theme="dark"|"light"]` is applied to `<html>` by an inline script in `index.html` before paint (no FOUC). Source of truth is `$theme` in `src/lib/stores/ui.ts` (`ThemeKey = "dark"|"light"|"system"`), persisted to `localStorage["dm-theme"]`; `effectiveThemeStore` derives the active theme from the system preference when "system" is selected. Toggle UI lives in `SettingsTabs.svelte` (Appearance tab) with three preview cards. All theme-aware variables are in `app.css` `:root` (dark) and `[data-theme="light"]` (light); non-color tokens stay in a separate `:root` block. The CSS uses `color-scheme: dark/light` to opt native form controls in. The sidebar collapse is responsive via `@media (max-width: 900px)` and the explicit `.shell.collapsed` user toggle.
-- **DropdownMenu positioning**: `DropdownMenu.svelte` uses `position: fixed` with the trigger's measured rect + viewport dims, flips above the trigger when there isn't enough room below, and clamps horizontally into the viewport. It re-measures on resize/scroll while open, uses `requestAnimationFrame` for non-zero `offsetHeight`, applies a 3px deadband, pauses repositioning while the pointer is over the menu, and resets `pos` on close. A CSS triangle caret (`.caret` pseudo-element) always points at the trigger; its horizontal position is clamped to `[14, menuW-14]` so the tip never pokes past the rounded corners.
-- **Overscroll containment in floating panels**: every scrollable region inside a `position: fixed` modal / drawer / popover (Settings' `.tabs` + `.tab-content`, CommandPalette's `.results`, etc.) must declare `overscroll-behavior: contain`. Without it, when the user reaches the top or bottom of the inner scroll region, the browser "scroll-chains" to the next scrollable ancestor — which is the page behind the panel — and the home view scrolls under the modal. `contain` makes the browser consume the event at the panel's boundary.
-- **Modal-aware scroll, not pointer-aware**: while a modal-style panel is open, the wheel must operate **only** on the panel — never on the home view underneath, regardless of where the pointer is. The default browser behaviour is pointer-aware (wheel scrolls whatever's under the cursor; the backdrop then cascades to body). `App.svelte` maintains a `lockCount` refcount that sets `overflow: hidden` (via `setProperty('overflow','hidden','important')`) on both `<html>` and `<body>` whenever `$showSettings || $showCommandPalette`, and restores the previous overflow on close. The refcount lets stacked modals work without leaking a locked body. Belt-and-braces: `onDestroy` drains the count, and a 0→1 transition stashes the existing inline overflow values so we never clobber a non-default one. New modal-style components should add their open flag to the reactive statement; do **not** rely on `pointer-events: none` on the backdrop alone, because wheel events still fire on a non-scrollable backdrop and the cascade reaches the document.
-
-The frontend has a **demo mode** (`$demoMode` store + `startDemoSim`) that simulates progress locally so the UI can be exercised without the Rust backend (handy in plain `vite preview`).
-
-## Build, run, test
-
-```bash
-# Frontend only (no Tauri)
+# Frontend
 npm install
-npm run dev          # Vite on http://localhost:5173 (Tauri expects this exact URL)
-npm run build        # → dist/
-npm run check        # svelte-check, must be 0 errors / 0 warnings
+npm run dev            # Vite on http://localhost:5173 (Tauri expects this exact URL)
+npm run build          # → dist/
+npm run check          # svelte-check — must be 0 errors / 0 warnings
 
-# Engine unit + integration tests
+# Engine tests (unit + integration + HLS)
 cargo test -p dm-engine
-# + the multi-thread integration suite in crates/engine/tests/integration.rs
-# + crates/engine/tests/hls.rs (playlist → segments → concat → remux)
+cargo test -p dm-engine --test integration remove_while_downloading   # CI gate for the remove/cancel race
 
-# Full Tauri build
-./build-with-shim.sh           # Linux (Fedora 40+ etc.): prepends .pkgconfig-shim to PKG_CONFIG_PATH
-# or on stock Debian/Ubuntu:
-npm run tauri build
+# Full build
+./build-with-shim.sh   # Fedora 40+; plain `npm run tauri build` elsewhere
 
-# Native-messaging host standalone
-cargo run -p dm-native-host
+# Extension regression suite (no npm install needed)
+cd browser-extension && node --test test/*.test.mjs    # + node test/mutation-check.mjs (must catch all)
 
-**Releasing.** `scripts/release.sh 0.6.0` bumps every manifest in lockstep
-(`package.json` + lock, `tauri.conf.json`, the three workspace `Cargo.toml`s,
-the extension manifest) and `--no-tag` leaves the commit to you; without it
-the script also commits and tags. The GitHub release body is **not** written
-by hand: `release.yml` runs `scripts/changelog-section.mjs <tag>`, which pulls
-the matching `## [x.y.z]` section out of `CHANGELOG.md` and puts it above the
-install guide. Consequences worth knowing: a tag whose version has no
-changelog section **fails the release** (by design — generic notes hide what
-shipped), the script self-tests in CI and again before every release, and the
-heading may be `## [0.6.0] - date`, `## [0.6.0] — date` or `## 0.6.0` but the
-version must match the tag with or without a leading `v`.
+# Lint the CSS-var surface (silent-failure guard)
+node scripts/check-css-vars.mjs
 
-# Release binary (Cargo workspace unifies target dirs):
-ls target/release/dm-tauri     # ~23 MB stripped, dynamically linked to webkit2gtk-4.1
-
-# Linux bundle artifacts (when `bundle.targets = "all"` in
-# src-tauri/tauri.conf.json, tauri-action produces ALL THREE of these
-# from the Linux matrix job and uploads them to the same release):
-#   src-tauri/target/release/bundle/deb/DM_*_amd64.deb
-#   src-tauri/target/release/bundle/rpm/DM-*-1.x86_64.rpm
-#   src-tauri/target/release/bundle/appimage/DM_*_amd64.AppImage
-# The release.yml `releaseBody` lists them in the Install table.
+# Probe the WebSocket listener without the GUI (dev only, port 9158)
+# src-tauri/probe-listener/ — excluded from the workspace, never ships
 ```
 
-### Fedora 40+ / similar Linux
+**Before claiming done:** `npm run check` clean, `cargo test -p dm-engine` green, and — if you touched extension code — `node --test test/*.test.mjs` green. If you fixed an extension bug, add **both** a regression test and a mutation in `test/mutation-check.mjs`.
 
-`libappindicator3-0.1.pc` and `ayatana-appindicator3-0.1.pc` are no longer shipped. The bundler needs them. The repo carries `.pkgconfig-shim/` with shim `.pc` files that point at the modern `appindicator` library; `build-with-shim.sh` injects that directory into `PKG_CONFIG_PATH` before invoking `npm run tauri build`. **Always use `build-with-shim.sh` on Fedora.**
+## Engine architecture (compressed)
 
-## Conventions & gotchas
+`crates/engine` has **zero Tauri deps**. Read `manager.rs::run_download` + `task.rs` together when behaviour is unclear.
 
-- **Cargo workspace at the repo root** (`Cargo.toml`) unifies `target/` to the workspace root — not `src-tauri/target/...`. Look for the release binary at `target/release/dm-tauri`. `dist/`, `coredump/`, `images/`, and `target/` are all gitignored.
-- **Tauri identifier**: `com.dm.downloadmanager`. Do not change without also updating the macOS bundle name.
-- **Rust mutex rules**: never hold a `std::sync::Mutex` guard across an `.await`. Clone the value out, drop the guard, then await.
-- **Runtime injection**: the engine never calls `tokio::spawn` itself — it goes through the injected `Spawner`. Sync Tauri command handlers are dispatched on a non-Tokio worker thread, so any engine path that spawns a task MUST go through a manager constructed with `with_settings_and_spawner`. The default constructor only works when called from inside a Tokio runtime.
-- **HTTP client quirks**: always use the engine's `build_client`/`build_probe_client` (custom UA, no transparent decompression). A naked `reqwest::Client` will get 403'd by many CDNs and will fail on servers that lie about `Content-Encoding`.
-- **Open-ended chunks (unknown total size)**: when the probe returns no `Content-Length` and no `Accept-Ranges`, the engine creates a single chunk with `end = u64::MAX` and falls back to a **plain `GET` with no `Range:` header** (`chunk.rs::download_chunk`). Many CDN proxies (cdn.akaere.online and similar reverse-proxy fronts) advertise no `Content-Length` on HEAD and then **reject** any `Range:` request with 416 because they don't know the upstream's total size — sending `Range: bytes=0-` to one of these surfaces as `error: 416 Range Not Satisfiable` and the download hard-fails. The fix is to omit the `Range:` header entirely for `end == u64::MAX` chunks, truncate the file, and stream the body from offset 0. Trade-off: open-ended downloads are **not resumable across restarts** (a non-zero `chunk.downloaded` is stale and gets overwritten on the next attempt). The single-connection path is gated on `can_resume = false` already. `ChunkState::size()` returns `u64::MAX` for open-ended chunks to avoid an `add with overflow` panic in `remaining()`.
-- **Proxy precedence**: per-download `Download.proxy` always wins; otherwise the global `Settings.effective_proxy_url()` (None/System/Manual) is used. `set_global_proxy` is the cheap update path; `update_settings` rebuilds more state.
-- **Status throttling**: progress events are emitted at most every 150ms in the engine; the frontend's speed-monitor tick is 1Hz — both numbers are load-bearing for UI performance.
-- **Speed limits**: `0` = unlimited, both at the bucket and at the `CombinedLimiter` level.
-- **Schedule window**: stored as `(hour, minute)` tuples. Wrap past midnight is supported (`start > end` ⇒ window covers the two halves).
-- **Pause/Resume clear stale errors**: `pause()` and `resume()` reset `d.error`. The DownloadRow meta row + expanded panel only render the error pill when `status === "error"`.
-- **Remove must persist, and must not emit a `StatusChanged(canceled)` first**: `DownloadManager::remove()` does **not** call `cancel()` — that path would set `d.status = Canceled`, persist that status to SQLite, and emit a `StatusChanged(d_with_canceled)` event **before** the `Removed(id)` event, which races the frontend's `refreshDownloads()` snapshot and produces a phantom "canceled" row in the UI (the user-reported "canceled ghost"). The fixed flow: set `e.state.control.cancel()` directly to abort in-flight chunk workers, drop the in-memory entry, `Storage::delete_download(id)`, and emit only `Removed(id)` — no `StatusChanged`, no `save_download` of a canceled row. Regression test: `remove_does_not_emit_canceled_status_change` in `crates/engine/src/manager.rs`.
-- **Progress persists while transferring** (`task.rs`): the aggregator flushes the SQLite row on **either** `PROGRESS_FLUSH_INTERVAL` (1 s) **or** `PROGRESS_FLUSH_BYTES` (1 MiB), whichever fires first. The UI throttle (150 ms) and the persistence throttle are independent. A hard kill mid-transfer therefore loses at most ~1 s of progress. The aggregator also issues a final flush on the stream-end path. **Without this flush, "starts at 7% instead of 30%" is the default behaviour** — only status transitions used to persist, and there are no status transitions during steady-state downloading.
-- **Resume math**: chunk workers use `chunk.resume_offset() = chunk.start + chunk.downloaded` to build the `Range:` header. If a chunk is already fully covered (`remaining() == 0`, e.g. one of the eight chunks finished before the kill), the engine **skips spawning it** instead of issuing a malformed `bytes=N-N-1` range. This keeps resume robust against partially-complete chunk layouts.
-- **Persistence surface — what survives a restart**: the on-disk SQLite row is the source of truth for `downloaded`, per-chunk `downloaded`, `status`, `filename`, `save_path`, `total_size`, `speed_limit`, `proxy`, `checksum`, `error`, `content_type`, `can_resume`, and the chunk layout. Settings (global + per-category), categories, and history all live in their own tables. The frontend's Svelte stores are *not* persistent — they rehydrate from `get_settings()` / `list_downloads()` on launch.
-- **Adding a new Tauri command**: define it in `src-tauri/src/commands.rs`, register in `invoke_handler!`, add the corresponding wrapper in `src/lib/api.ts`, mirror any new types in `src/lib/types.ts`, and update capabilities if it needs a plugin permission.
-- **Adding a new download model field**: change `crates/engine/src/model.rs`, update `storage.rs` schema/migration (or `save_download`/`self_row_to_download`), update `src/lib/types.ts`, update any UI consumption, and add or extend the integration test in `crates/engine/tests/integration.rs`. For settings fields, prefer `#[serde(default)]` so old DB rows still load.
-- **Before any UX work**, read `UI_DESIGN_PLAN.md` (288 lines) — it is the canonical IDM-parity target.
-- **`.pi/` is gitignored** — it's Plannotator/agent harness scratch. Don't commit from it.
-- **`.taurignore` (project root) keeps the Tauri CLI's walker from EMFILE-panicking**: the Tauri CLI uses the `ignore` crate (`ignore::WalkBuilder`) to walk the project tree for `tauri dev` file watching and for source-file discovery during `tauri build`. The walker does **not** apply `max_open(1)` back-pressure, so on a project whose `target/` and `node_modules/` together hold tens of thousands of files (this repo's `target/release` alone is 20k+ files), it can exhaust the per-process FD limit and panic with `Too many open files (os error 24)` at `crates/tauri-cli/src/interface/rust.rs` (the `Result::unwrap()` on the walker iterator). The Tauri CLI is a precompiled native Node addon (`node_modules/@tauri-apps/cli-linux-x64-gnu/cli.linux-x64-gnu.node`) so we cannot patch the walker. The supported fix is a project-root `.taurignore` (gitignore-compatible syntax) that excludes `target/`, `**/target/`, `node_modules/`, `dist/` (Tauri reads `dist/` via the `frontendDist` config, not by walking), `coredump/`, `images/`, `notes/`, `.pi/`, and editor metadata. The CLI looks for `.taurignore` in every directory it walks and applies the patterns in addition to its built-in defaults.
+- `DownloadManager` (cheap `Arc` clone) owns tasks + `RunContext` (scheduler, global limiter, storage, event sink, proxy, spawner).
+- **`Spawner` injection** — the engine never calls `tokio::spawn` directly. Tauri commands run on non-Tokio workers; always construct the manager with `with_settings_and_spawner()` (see `src-tauri/src/main.rs::setup`). The default constructor only works inside a Tokio runtime.
+- `DownloadScheduler`: global slot semaphore + per-download connection cap. `CombinedLimiter`: global + per-download token buckets, more-restrictive wins. `0` rate = unlimited.
+- `DownloadControl`: `AtomicBool` pause/cancel + `Notify`; `remove()` sets a `removed` flag (see invariant 2).
+- Status lifecycle: `Queued → Connecting → Downloading → (Paused ⇄ Queued) | Completed | Error | Canceled`; `Scheduled` parks outside the schedule window (15 s ticker in `manager.rs`). `pause()`/`resume()` clear stale `d.error`.
+- Events: `DownloadEvent` → `FrontendEvent` 1:1 on channel **`download-event`** as `{ kind: "added"|"progress"|"statusChanged"|"completed"|"error"|"removed", download }` (`removed` carries only `{ id }`). Frontend merges in `stores/downloads.ts`.
+- Persistence (`storage.rs`, rusqlite **bundled**): tables `downloads`, `history`, `categories`, `settings`. The `status` column holds **JSON-serialized** `DownloadStatus` (`"completed"` with quotes) — compare with `status_as_json`, never a bare SQL string. `Storage::delete_download` is the hard-remove path used by `DownloadManager::remove()`.
+- Proxy precedence: per-download `Download.proxy` → global `Settings.effective_proxy_url()` (`None | System | Manual`). `set_global_proxy` is the cheap update path.
+- **HLS** (`hls.rs` + `task::run_hls_download`): a `.m3u8` is a playlist, never the payload. One master hop to the highest-bandwidth variant; segments fetched concurrently but appended in order; per-segment AES-128; optional ffmpeg remux. Refused with a reason: live playlists, SAMPLE-AES/DRM, encrypted fMP4 init, masters with separate audio renditions. Naming at add time: `.m3u8` → `.ts` (`Download::normalize_media()`), fMP4 → `.mp4`, remux retargets the row. Resume is **per segment** via `<save_path>.part.hls.json` (honoured only when URL + first segment + count still match).
+- **Media merging** (`media.rs`): DASH video+audio halves. `remux()` is `ffmpeg -c copy` with order-independent `-map`, output verified via ffprobe (≥1 video **and** ≥1 audio) or it is deleted and refused. `.ts` segments are never paired. Output name avoids inputs (`<stem>.merged.<ext>` on collision), `.mp4` first then `.mkv` fallback, `kill_on_drop(true)` for the 15-min timeout. ffmpeg is looked up on `PATH`, never bundled. A successful merge calls `set_output_file()` so the row follows the file.
 
-## HLS downloads (`crates/engine/src/hls.rs` + `task::run_hls_download`)
+## Invariants — do not break
 
-A `.m3u8` URL is a **playlist**, not a file. Downloading it verbatim is the reported bug: the queue got a ~300-byte text file (`#EXTM3U … segment_000.ts`) and the row said "Completed". The split is deliberate:
+1. **Nothing is taken from the browser unless DM received it.** `onCreated` forwards **first** and only calls `takeOverChromeDownload()` when `send()` returned `true`. Undeliverable clicks fall back to `chrome.downloads.download()` with `ignoredUrls` ping-pong suppression and `safeFilename()`; the content script fails **open** (browser downloads when in doubt). Browser-side cleanup uses `downloads.removeFile()` only when the item is **not** `complete`.
+2. **`remove()` must not emit `StatusChanged(canceled)`.** It calls `control.remove()` (not `cancel()`), drops the entry, `Storage::delete_download(id)`, emits only `Removed(id)`. The in-flight worker's finalize + progress flushes also bail on the `removed` flag — otherwise the UPSERT resurrects the row and the frontend shows a "canceled ghost". Pinned by `cargo test -p dm-engine --test integration remove_while_downloading` (the lib test `remove_does_not_emit_canceled_status_change` alone is **not** sufficient — it has no worker).
+3. **Content script is opt-in only.** `type: "media"` messages are **dropped on the floor** in `background.js`; only `type: "grab"` (popup button) is accepted. No auto-scrape, no `MutationObserver` re-scan. If auto-grab ever returns it must be behind an explicit user preference.
+4. **`chrome.downloads.onCreated` listener registers synchronously at top level**, filtered by `dmInstallTime` recorded only on `onInstalled({reason:"install"})`. `state.installTimeMs === 0` means "not read yet" — forward nothing until `loadInstallTime()` resolves (never substitute boot time).
+5. **Transparent decompression stays off** (`.gzip(false).brotli(false).deflate(false)`). Some mirrors lie about `Content-Encoding`; the engine saves wire bytes verbatim. Always use `build_client`/`build_probe_client` (custom UA — bare `reqwest/x.y.z` gets 403'd by CDNs).
+6. **Open-ended transfers** (`end == u64::MAX`, no `Content-Length`): send a plain GET with **no `Range:` header** (proxies 416 on ranges they can't satisfy), truncate the file, stream from 0. Not resumable across restarts. Auto-complete requires `downloaded >= OPEN_ENDED_MIN_BYTES` (1 KB) — below that it is `Error: open-ended transfer truncated at N B`. `ChunkState::size()` returns `u64::MAX` (no overflow in `remaining()`).
+7. **Progress persists mid-transfer**: the aggregator flushes SQLite every `PROGRESS_FLUSH_INTERVAL` (1 s) / `PROGRESS_FLUSH_BYTES` (1 MiB) + once at stream end. Without this, "starts at 7% instead of 30%" is the default behaviour.
+8. **Event/serialisation order** when adding fields: `crates/engine/src/model.rs` → `storage.rs` → `src-tauri/src/events.rs` → `src/lib/types.ts` → `src/lib/api.ts` → UI. Settings fields get `#[serde(default)]` so old rows load.
+9. **CSS custom properties must all resolve.** An undefined `var()` silently drops the whole declaration. Short-name aliases (`--surface`, `--border`, `--text-muted`, …) live in the **theme-agnostic** `:root` of `src/app.css` and point at `--color-*` tokens — never inside a single theme block. `scripts/check-css-vars.mjs` is the gate.
+10. **`window.__playinfo__`-style page expandos are invisible to content scripts** (isolated world). Firefox needs `window.wrappedJSObject` (`pageGlobal()`). Cross-frame media is observed in `background.js` via an **observational** `webRequest.onHeadersReceived` (never `webRequestBlocking`), bounded per-tab log persisted to `chrome.storage.session`.
+11. **Resource-timing buffer keeps the OLDEST entries.** Hence `content.js` runs at `document_start`, mirrors into a 400-entry ring via `PerformanceObserver`, and calls `clearResourceTimings()` in the callback.
+12. **Modal scroll containment**: `App.svelte` `lockCount` refcount sets `overflow: hidden !important` on `<html>`+`<body>` while `showSettings || showCommandPalette`; every scrollable region inside a fixed panel declares `overscroll-behavior: contain`. New modal panels must join the reactive statement.
 
-* `hls.rs` — pure parsing: master vs media playlists, `#EXT-X-STREAM-INF` variants, `#EXTINF`, `#EXT-X-BYTERANGE` (implicit offsets resolved), `#EXT-X-MAP` (fMP4), `#EXT-X-KEY`, `#EXT-X-ENDLIST`. Unit tests only, no network.
-* `task::run_hls_download` — fetches the manifest, follows **one** master hop to the highest-bandwidth variant, then fetches segments **concurrently** (`connections_per_download`, capped at `HLS_MAX_PARALLEL`) and appends them to `<save_path>.part` **in playlist order**, honouring the limiter, pause/cancel and progress events.
+## Gotchas (symptom → cause → rule)
 
-**Concurrency is ordered, not racy.** Segments are fetched by up to `concurrency` futures at once and yielded through `StreamExt::buffered`, which polls all of them but hands the results back in order — so the writer only ever appends, and the `.part` is always a valid prefix (which is what the resume sidecar claims). Each in-flight fetch reports its bytes into an `AtomicU64` (`live`), and the row's `downloaded` is `on-disk + live`: reporting only the on-disk counter made progress advance in whole-segment jumps and throughput read 0 B/s between them, which looked exactly like a stalled download.
+- **"Spawn failed" / "no reactor running"** → a path that spawns was reached off the Tokio runtime; route through the injected `Spawner`.
+- **"error decoding response body" / "Invalid gzip header"** → server lying about `Content-Encoding`. Don't re-enable transparent decompression.
+- **403 from Tuna/kernel.org/sourceforge** → call site bypassed `build_client`; route through the engine helpers.
+- **"Remove" not surviving restart** → `Storage::delete_download` isn't called from `DownloadManager::remove`.
+- **Style/border/hover mysteriously missing** → undefined CSS custom property (silent). Run `node scripts/check-css-vars.mjs`.
+- **Progress resets after hard kill** → aggregator `PROGRESS_FLUSH_*` missing; only that block persists `downloaded` mid-transfer.
+- **Resume math**: workers use `chunk.resume_offset() = start + downloaded`; a fully-covered chunk (`remaining() == 0`) is **skipped**, never given a malformed `bytes=N-N-1` range.
+- **Row stuck on "Connecting" during HLS** → the HLS branch must set `Downloading` itself; `run_download` returns before its own transition.
+- **HLS progress jumps / reads 0 B/s** → `downloaded` must be on-disk **+ live** (`AtomicU64` for in-flight fetches).
+- **`fmtBytes`** is unit-aware to `YB` (`≥1024 YB` past that); open-ended chunks render `879 B · unknown total`, never the `u64::MAX` sentinel. `DownloadRow` detects non-finite `chunk.end`.
+- **Tray/indicator build failure on Linux** → run `./build-with-shim.sh`.
+- **Dropdown menu "follows the wrong row"** → stale `transform` or missed `DropdownMenu` reset; it re-measures on resize/scroll, flips above, clamps horizontally, caret clamps to `[14, menuW-14]`.
+- **Scheduler tests time out** → they deliberately use `tokio::time::timeout(100ms, ...)` to assert blocked acquires. Don't widen without understanding the intent.
+- **Extension "won't connect" (WS close 1006 is undecidable)** → layer it: (1) `node browser-extension/scripts/check-host.mjs` distinguishes `refused` / `no-response` (pre-0.4.2 app: line-JSON listener) / `bad-accept` / `ok`; (2) popup error `Receiving end does not exist` = **no background worker** (repo folder loaded in Chrome — build with `scripts/dev-unpacked.sh`); (3) to test without the GUI use `src-tauri/probe-listener/` (real `ws.rs`, port 9158).
+- **"I pulled the fix but it's still broken"** → MV3 service worker doesn't reload from disk; click **Reload** on the extension card (check "Inspect views" shows the new source).
+- **Firefox media links do nothing** → `nativeMessaging` permission missing (it was dropped for a whole release in 0.4.2): `connectNative is not a function` **and** the click was already `preventDefault()`ed. `node --test test/*.test.mjs` catches this.
+- **A download vanished from `chrome://downloads`** → cancelled a browser download DM never received. See invariant 1; mutation `P0-3` reproduces it.
+- **`scripts/*.sh` do nothing on a symlinked checkout** → `import.meta.url === process.argv[1]` fails when `pwd` is logical. Always `isMainModule()` from `scripts/lib/is-main.mjs`; `test/manifest.test.mjs` runs the tooling through a symlink to keep it that way.
+- **Captures must notify** (desktop notification + in-app toast) — skipped only when `document.hasFocus()`, and that focus test lives in the event listener (`stores/downloads.ts`), not the dialog.
+- **`Storage::load_active` must derive both sides of the comparison from the same serializer** — a SQL literal `'completed'` never matches the JSON `"completed"` (historical bug: every finished row came back active and got stuck `Queued`).
 
-**Two timeouts, both per request.** `HLS_RESPONSE_TIMEOUT` bounds "connect + response headers"; `HLS_READ_IDLE_TIMEOUT` bounds silence between two body reads. The old code had neither — only a single `CHUNK_STALL_SECS` (5 min) wrapped around the whole segment — so a CDN edge that accepted the connection and then went quiet showed no progress for minutes. A segment whose body ends before its `Content-Length` is a retry, not a hole in the output.
+## Extension curation contract ("Grab page media")
 
-**The status must leave `Connecting`.** `run_download` sets `Connecting` before it dispatches to the HLS branch, and returns before its own `Downloading` transition — so the branch sets `Downloading` itself once the playlist is parsed and the output file is open. Without that line the row says "Connecting" for the entire transfer (only the finalize path ever touched the status again), which is the "it's stuck on Connecting even while the bytes move" bug.
+`collectMedia(hints)` scans in descending trust: media elements (`currentSrc` → `.src` → raw attribute; run through `absoluteUrl()` — relative `src` is real) → HLS/DASH hints + downloadable `<a>` → Open Graph video → same-origin iframes' DOM **and their `performance` timeline** → top-frame resource timing → background `webRequest` hints (newest first). `add()` drops non-http(s) (`blob:`/`data:`), pathname-only HTML docs, duplicates.
 
-**Segment progress is its own field, not `chunks`.** A chunk is a byte range that resumes from an offset; an HLS segment is a whole request whose bytes must land in playlist order, and a resumed grab is "the first N segments". So the engine publishes `Download.segment_progress: Option<SegmentProgress> { total, done, active }` and the row renders a bucketed cell strip instead of the chunk list. `done` counts only segments already appended to the file; `active` is the concurrency window (`buffered` keeps exactly `concurrency` fetches polled, so `min(concurrency, total - done)` is the honest number), and it is zeroed on completion, cancel and error so a dead row cannot show a permanent "in flight" strip. The field is persisted as JSON, so a restart shows `4 / 10` before the task resumes; rows written before the column existed load as `None`.
+Curation is one logical download, in priority order: `.m4s` pair (range stripped, signing params kept) → direct file → manifest → lone segment. Episode grouping may **reorder/prefer but never empty the set** (`dominantCid()` votes only among held bases; empty intersection falls back to all; unparseable cid bases are kept).
 
-Scope is enforced, not guessed:
+Empty results return `diag` + `note` + machine `reason` (`no_content_script` / `player_without_url` / `filtered_out` / `no_media_observed`) — keep those three distinguishable; never flatten to "no media found".
 
-* **Live** (no `#EXT-X-ENDLIST`) is refused with a reason — it is an endless stream, not a file.
-* **AES-128 is decrypted** (`#EXT-X-KEY`), per segment: keys are fetched once per URI, the IV is the `IV=` attribute or the media sequence number (RFC 8216 §5.2), and the payload is buffered (≤128 MiB), decrypted with `aes`/`cbc` + PKCS#7, then written. Keys can rotate mid-playlist, so the key lives on `Segment`, not the playlist.
-* **SAMPLE-AES** (and any other method) is refused — DM has no DRM story, and writing ciphertext to a `.ts` would be a corrupt "success".
-* **An encrypted fMP4 init section** (`#EXT-X-KEY` *before* `#EXT-X-MAP`) is refused; a clear init is written as-is.
-* **A master with a separate audio rendition** (`#EXT-X-MEDIA:TYPE=AUDIO` + `URI`) is refused — the variant is video-only, and a silent file is worse than an error.
+## Shell & frontend quick rules
 
-**Naming:** `Download::normalize_media()` runs in `DownloadManager::add()` and in the Tauri `add_download`, so every entry point agrees before the row is shown: `.m3u8` → `.ts`. fMP4 playlists (`#EXT-X-MAP`) are renamed to `.mp4` at download time, because concatenating init + fragments *is* an MP4. When ffmpeg is available the `.ts` is remuxed (`-c copy`, `aac_adtstoasc` first and a retry without it for non-AAC audio) and the row is retargeted to the `.mp4`; the `.ts` is kept as the source, same contract as the pair merge. No ffmpeg ⇒ a complete, playable `.ts` and a log line, never a failed download.
-
-**Resume is per segment**, not per byte: `Download.chunks` cannot express "the first 5 segments of this playlist", so a sidecar `<save_path>.part.hls.json` records `{url, first, count, next, bytes}` after every completed segment. It is only honoured when the playlist URL, the first segment URI and the segment count still match (an edited playlist must not splice), and it is discarded if it claims more bytes than the `.part` holds. Deleting the sidecar forces a clean re-download.
-
-Tests live in `tests/hls.rs`: a master+media server proves the concatenated bytes equal the segments (and never the playlist text, and that the 1080p variant won), AES-128 segments decrypt to their plaintext, live/SAMPLE-AES are refused with their reasons, 120-segment and 60-encrypted-segment runs prove order under load, and a real ffmpeg-generated TS proves the remux + row retarget (skipped with a printed note when ffmpeg is absent). `examples/hls_bench.rs` is the throughput harness (`cargo run --release --example hls_bench`): clear / AES-128 / many-small scenarios, each verified against the expected bytes so a fast run can never be a corrupt one.
-
-**`Storage::load_active` compares JSON.** The `status` column holds `serde_json::to_string(&DownloadStatus)` — `"completed"` *with quotes* — so a SQL literal `'completed'` never matched and every finished row came back as "active". `start()` then set it to `Queued` without spawning anything, which is a permanently stuck row after a restart. The filter now derives both values from the same serializer (`status_as_json`), and `load_download(id)` exists for callers that need a finished row (the cancel test, "where did my download go" checks).
-
-## Media merging (`crates/engine/src/media.rs`)
-
-Sites that serve video over **MPEG-DASH** (bilibili and friends) split it into **two independent streams** — video and audio — so "one URL = the video" is simply false for them: downloading one half gives you a picture with no sound, or sound with no picture. `media.rs` is the answer, in two halves:
-
-* `plan(&[urls])` — decide what a capture amounts to: a manifest, a single file, or a `Pair`. Pure and heuristic.
-* `remux(first, second)` — `ffmpeg -c copy` the two into one file (no re-encode: fast and lossless).
-
-**The heuristic is allowed to be approximate because the result is verified.** URL shape genuinely cannot tell a video half from an audio half — bilibili names both `…-1-30280.m4s` / `…-1-30232.m4s`, differing only by a site-specific codec id — so instead of pretending otherwise:
-
-1. `-map 0:v? -map 0:a? -map 1:v? -map 1:a?` takes whatever each input actually contains, which makes the **order of the two inputs irrelevant**. Callers never have to know which file is which; `merge_downloads` accepts either order.
-2. `probe_stream_counts` (ffprobe) checks the output really has ≥1 video **and** ≥1 audio stream.
-3. Only a verified success returns `Ok`. A wrong pairing (e.g. two video-only streams) fails with `Unusable { missing: "audio" }` and **removes its own half-written output** — the one test that guarantees this is `refuses_to_merge_two_videos_instead_of_writing_a_silent_failure`, and it is the reason this feature can ship without asking the user what a DASH representation is.
-
-Other things that will bite you if you change them:
-
-* **`.ts` (HLS segments) are never paired.** They are consecutive pieces of *one* stream, so "merging" two of them concatenates video onto video. A `.m3u8` is expanded by the HLS path above; a `.mpd` is still offered as the manifest file itself (see TODO.md).
-* **The output name avoids the inputs.** A `.mp4` video part merged to `.mp4` would target the very file it is reading, so on collision the name becomes `<stem>.merged.<ext>` — skipping the container instead would silently downgrade an mp4 merge to mkv.
-* **`.mp4` first, `.mkv` on failure.** MKV accepts codecs that MP4 does not, so the fallback turns an avoidable failure into a working file.
-* **`kill_on_drop(true)`** is what makes the 15-minute timeout safe: on timeout the future holding the child is dropped, and that flag turns it into a kill.
-* **ffmpeg is not bundled** (a download manager has no business shipping a media toolkit) and is looked up on `PATH` (`probe_ffmpeg` feeds the UI so the Merge button can be disabled *with a reason* instead of failing after the click). `ffprobe` is used when present but is not required — without it the merge still succeeds, and the UI says "unverified" rather than claiming stream counts it never checked.
-* **A successful merge retargets the row** (`DownloadManager::set_output_file`): the download's output is now the merged file, so the row has to follow it, otherwise the merged file exists on disk with nothing in the UI pointing at it and "Show in folder" opens a part the user may have deleted. The two source files are deliberately left alone — the merge command never deletes.
-
-Tests live in `media.rs` themselves and shell out to a **real ffmpeg** (synthesising clips with `lavfi`, so no fixtures): one test proves a pair merges into a file with both streams, the other proves a bad pairing is refused and leaves nothing behind. They skip with a printed note when ffmpeg is missing; CI installs ffmpeg so there they are a real gate.
+- `main.rs`: `logging::init()` **first** (per-session log under `XDG_DATA_HOME`, `LogGuard.path()` for bug reports), then builder + plugins (`clipboard-manager`, `notification`, `autostart`), then `setup()` (storage → manager → event sink → manage → native-host TCP `127.0.0.1:9157` → schedule loop). Tray failures are logged, not fatal.
+- `commands.rs` is the whole frontend-facing command surface; add there + `invoke_handler!` + `lib/api.ts` wrapper + `lib/types.ts` mirror + capabilities if a plugin permission is needed.
+- Frontend stores are **not** persistent — rehydrate from `get_settings()` / `list_downloads()`. `$theme` (`dark|light|system`) persists to `localStorage["dm-theme"]`; `<html data-theme>` is set pre-paint by an inline script in `index.html`.
+- Progress event throttle: engine 150 ms, frontend speed tick 1 Hz — both load-bearing for UI perf.
+- UX work: read `docs/UI_DESIGN_PLAN.md` first.
 
 ## When you're stuck
 
-- Engine behaviour unclear → read `crates/engine/src/manager.rs::run_download` and `task.rs` together; they tell the same story from different angles.
-- "Spawn failed" / "no reactor running" errors → the path that needs `tokio::spawn` was reached from a non-Tokio thread; route it through the injected `Spawner` (see `src-tauri/src/main.rs::setup`).
-- "error decoding response body" / "Invalid gzip header" mid-download → the server is lying about `Content-Encoding`. Don't re-enable transparent decompression; the engine already disables it and saves raw bytes.
-- 403 on a mirror (Tuna, kernel.org, sourceforge, etc.) with a `reqwest/x.y.z` UA → call site is bypassing `build_client`/`build_probe_client`; route through the engine helpers.
-- Event/serialisation mismatch → compare `crates/engine/src/model.rs`, `src-tauri/src/events.rs`, `src/lib/types.ts`, and `src/lib/api.ts` in that order.
-- "Remove" not surviving a restart → `Storage::delete_download` isn't being called from `DownloadManager::remove`.
-- Canceled row appears after Remove and Resume silently does nothing → two independent halves, and fixing only one leaves the bug half-alive:
-  1. `DownloadManager::remove()` must not call `self.cancel()` (which would set `status='canceled'`, persist it, and emit `StatusChanged`) — it must call `control.remove()` and emit only `Removed(id)`.
-  2. The **in-flight worker** must not report anything either. `DownloadControl::remove()` sets a `removed` flag alongside `cancel`; `run_download`'s finalize block and the aggregator's progress flushes both bail out when it is set. Without that, the worker persists `Canceled` via `Storage::save_download` — an **UPSERT**, so the row the user just deleted is re-inserted and even survives a restart — and emits a `StatusChanged` that the frontend re-inserts as a ghost row, because it has already dropped it on `Removed`. The frontend also tracks removed ids and ignores late events for them (`removedIds` in `stores/downloads.ts`), un-blocking any id the server still knows about.
-  Note the existing lib test `remove_does_not_emit_canceled_status_change` **cannot** catch this: it removes a download that was never started, so there is no worker to unwind. `cargo test -p dm-engine --test integration remove_while_downloading` is the one that actually reproduces it (it is a CI gate for exactly that reason).
-- Any style, border, colour or hover state mysteriously missing → suspect an **undefined CSS custom property** before anything else. It fails silently: the whole declaration is dropped at computed-value time, with nothing in the console, and `svelte-check`/Vite never look inside `var()`. Run `node scripts/check-css-vars.mjs` (also a CI step) — it found 91 dead declarations when it was introduced. Components use a short-name scheme (`--surface`, `--border`, `--text-muted`, `--success`, `--danger`, `--warning`, `--info`, `--color-accent*`, …) mapped onto the canonical `--color-*` tokens in the **theme-agnostic** `:root` in `src/app.css` (Backward-compat aliases). Put new aliases there and never inside a single theme block: custom properties are substituted at use time, so one alias resolves in both themes, whereas a theme-scoped alias breaks the other theme — which is how the capture dialog's "Download" button became white-on-white.
-- "Starts at 7% instead of 30%" / progress lost on a hard kill → the aggregator's `PROGRESS_FLUSH_*` throttle (`task.rs`) is missing or disabled. Confirm the flush block in the `agg` task still calls `ctx.storage.save_download(&d)` on every `PROGRESS_FLUSH_INTERVAL` / `PROGRESS_FLUSH_BYTES` boundary, plus one final flush on stream end. A regression in the aggregator will silently lose progress because no other code path persists `downloaded` mid-transfer.
-- Tray/indicator build failures on Linux → check `.pkgconfig-shim/` and confirm you're running `./build-with-shim.sh`.
-- Dropdown menu "following the wrong row" / "two-position jump" → likely a stale `transform` on the row/actions container or a missed `DropdownMenu` reset; see the `DropdownMenu positioning` section above.
-- Tests failing on connection caps → scheduler tests use `tokio::time::timeout(100ms, ...)` to assert blocked acquires; do not increase the timeout without understanding the test intent.
-- Browser extension: native host not connecting → first check the popup: it prints the real `chrome.runtime.lastError.message`, and `connectNative is not a function` means the `nativeMessaging` permission is missing from the Firefox manifest. Otherwise confirm the Firefox host manifest's `path` points at the release binary (the shipped template is a placeholder) and that the `127.0.0.1:9157` TCP listener in the app is up (Settings → Extensions tab shows the live `bound` + `last_event_unix` from `NativeHostStatus`).
-- Browser extension: media links suddenly do nothing in Firefox → the `nativeMessaging` permission was dropped from the manifest (it was, in 0.4.2, for a whole release). The transport can't connect *and* the link was already `preventDefault()`ed. `node --test browser-extension/test/*.test.mjs` catches this in one second.
-- Browser extension: a download vanished and `chrome://downloads` has no trace → that is the "cancelled a browser download DM never received" bug. `handleCreatedDownload` must not call `takeOverChromeDownload()` unless `send()` returned true; the mutation `P0-3` in `test/mutation-check.mjs` reproduces it.
+1. Engine behaviour → `manager.rs::run_download` + `task.rs` together.
+2. Serialisation mismatch → `model.rs` → `events.rs` → `types.ts` → `api.ts`.
+3. Extension transport → `scripts/check-host.mjs` first, popup error text second, never guess from close code 1006.
+4. Mystery CSS → `scripts/check-css-vars.mjs`, then the theme-agnostic alias block in `app.css`.

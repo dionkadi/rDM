@@ -1,37 +1,48 @@
 <script lang="ts">
-  import { activeFilter, sidebarCollapsed, type FilterKey } from "../stores/ui";
-  import { smartFolders } from "../stores/downloads";
+  import { activeFilter, type FilterKey } from "../stores/ui";
+  import { counts, smartFolders } from "../stores/downloads";
 
   interface Group {
     key: FilterKey;
     label: string;
-    icon: string;
     count: number;
   }
 
+  // Text-only chips. The old 12 px icons repeated the label and turned
+  // the strip into a row of tiny glyphs; density comes from the counts,
+  // not from decoration.
   const FILTERS: Group[] = [
-    { key: "all", label: "All", icon: "M3 4h18v4H3V4zm0 6h18v4H3v-4zm0 6h18v4H3v-4z", count: 0 },
-    { key: "active", label: "Active", icon: "M5 12h14M13 6l6 6-6 6", count: 0 },
-    { key: "queued", label: "Queued", icon: "M12 8v4l3 3", count: 0 },
-    { key: "paused", label: "Paused", icon: "M8 5v14M16 5v14", count: 0 },
-    { key: "completed", label: "Completed", icon: "M20 6L9 17l-5-5", count: 0 },
-    { key: "error", label: "Errors", icon: "M12 8v4m0 4h.01M4.93 19.07h14.14V4.93H4.93z", count: 0 },
+    { key: "all", label: "All", count: 0 },
+    { key: "active", label: "Active", count: 0 },
+    { key: "queued", label: "Queued", count: 0 },
+    { key: "paused", label: "Paused", count: 0 },
+    { key: "completed", label: "Done", count: 0 },
+    { key: "error", label: "Errors", count: 0 },
   ];
 
   const SMART: Group[] = [
-    { key: "video", label: "Video", icon: "M23 7l-7 5 7 5V7zM14 5H3a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2z", count: 0 },
-    { key: "audio", label: "Audio", icon: "M9 18V5l12-2v13M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0zm12-2a3 3 0 1 1-6 0 3 3 0 0 1 6 0z", count: 0 },
-    { key: "archive", label: "Archives", icon: "M21 8v13H3V8M1 3h22v5H1V3zm9 4h4v3h-4V7z", count: 0 },
-    { key: "document", label: "Documents", icon: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6zM14 2v6h6M16 13H8M16 17H8M10 9H8", count: 0 },
-    { key: "image", label: "Images", icon: "M3 5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5zm14 8l-3-3-5 5M9 11a2 2 0 1 0 0-4 2 2 0 0 0 0 4z", count: 0 },
-    { key: "binary", label: "Software", icon: "M8 9l3 3-3 3M16 9l-3 3 3 3M3 4h18v16H3V4z", count: 0 },
+    { key: "video", label: "Video", count: 0 },
+    { key: "audio", label: "Audio", count: 0 },
+    { key: "archive", label: "Archives", count: 0 },
+    { key: "document", label: "Documents", count: 0 },
+    { key: "image", label: "Images", count: 0 },
+    { key: "binary", label: "Software", count: 0 },
   ];
 
-  $: filters = FILTERS.map((f) => {
-    if (f.key === "all") return { ...f, count: $smartFolders ? Object.values($smartFolders).reduce((s, v) => s + v.count, 0) : 0 };
-    if (f.key === "active") return { ...f, count: $smartFolders ? Object.values($smartFolders).filter((_, i) => i < 5).reduce((s, v) => s + v.count, 0) : 0 };
-    return f;
-  });
+  // Single source for every count: the store derives them from the same
+  // list the ledger renders. The previous file counted only All/Active
+  // and computed "Active" from the first five category buckets, which
+  // was both wrong and order-dependent.
+  $: countsByKey = {
+    all: $counts.all,
+    active: $counts.active,
+    queued: $counts.queued,
+    paused: $counts.paused,
+    completed: $counts.completed,
+    error: $counts.errored,
+  } as Record<string, number>;
+
+  $: filters = FILTERS.map((f) => ({ ...f, count: countsByKey[f.key] ?? 0 }));
 
   $: smartGroups = SMART.map((g) => ({
     ...g,
@@ -43,146 +54,98 @@
   }
 </script>
 
-<nav class="nav-section" aria-label="Filters">
-  {#if !$sidebarCollapsed}
-    <div class="nav-label">Filters</div>
-  {/if}
-  <div class="nav-items">
-    {#each filters as f}
+<!-- Horizontal filter strip — replaces the old sidebar nav. Status
+     filters first, smart folders after a separator (only when they
+     have counts). The strip scrolls when it overflows. -->
+<nav class="strip" aria-label="Filters">
+  {#each filters as f}
+    <button
+      class="chip"
+      class:active={$activeFilter === f.key}
+      on:click={() => select(f.key)}
+      aria-pressed={$activeFilter === f.key}
+      title={f.count > 0 ? `${f.label} — ${f.count}` : f.label}
+    >
+      <span class="lbl">{f.label}</span>
+      {#if f.count > 0}<span class="count">{f.count}</span>{/if}
+    </button>
+  {/each}
+  {#if smartGroups.length > 0}
+    <span class="sep" aria-hidden="true"></span>
+    {#each smartGroups as g}
       <button
-        class="nav-item"
-        class:collapsed={$sidebarCollapsed}
-        class:active={$activeFilter === f.key}
-        on:click={() => select(f.key)}
-        aria-pressed={$activeFilter === f.key}
-        title={$sidebarCollapsed ? f.label : undefined}
-        aria-label={f.label}
+        class="chip"
+        class:active={$activeFilter === g.key}
+        on:click={() => select(g.key)}
+        aria-pressed={$activeFilter === g.key}
+        title={`${g.label} — ${g.count}`}
       >
-        <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d={f.icon} />
-        </svg>
-        {#if !$sidebarCollapsed}<span class="lbl">{f.label}</span>{/if}
-        {#if !$sidebarCollapsed}<span class="count">{f.count}</span>{/if}
+        <span class="lbl">{g.label}</span>
+        <span class="count">{g.count}</span>
       </button>
     {/each}
-  </div>
+  {/if}
 </nav>
 
-{#if smartGroups.length > 0}
-  <nav class="nav-section" aria-label="Smart folders">
-    {#if !$sidebarCollapsed}
-      <div class="nav-label">Smart folders</div>
-    {/if}
-    <div class="nav-items">
-      {#each smartGroups as g}
-        <button
-          class="nav-item"
-          class:collapsed={$sidebarCollapsed}
-          class:active={$activeFilter === g.key}
-          on:click={() => select(g.key)}
-          title={$sidebarCollapsed ? g.label : undefined}
-          aria-label={g.label}
-        >
-          <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d={g.icon} />
-          </svg>
-          {#if !$sidebarCollapsed}<span class="lbl">{g.label}</span>{/if}
-          {#if !$sidebarCollapsed}<span class="count">{g.count}</span>{/if}
-        </button>
-      {/each}
-    </div>
-  </nav>
-{/if}
-
 <style>
-  .nav-section { margin-bottom: 18px; }
-  .nav-label {
-    font-size: 10.5px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.12em;
-    color: var(--faint);
-    padding: 0 10px 8px;
-  }
-  .nav-items {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-  }
-  .nav-item {
+  .strip {
     display: flex;
     align-items: center;
-    gap: 10px;
-    padding: 8px 10px;
-    border-radius: 8px;
-    color: var(--muted);
-    font-size: 13px;
-    font-weight: 500;
-    cursor: pointer;
+    gap: 2px;
+    height: var(--size-filterbar);
+    padding: 0 20px;
+    overflow-x: auto;
+    scrollbar-width: none;
+    position: sticky;
+    top: var(--size-topbar);
+    z-index: 190;
+    background: var(--topbar-bg);
+    border-bottom: 1px solid var(--color-border);
+  }
+  .strip::-webkit-scrollbar {
+    display: none;
+  }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 26px;
+    padding: 0 9px;
     border: 1px solid transparent;
-    background: none;
-    transition: all 0.15s;
-    width: 100%;
-    text-align: left;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--color-muted);
     font-family: inherit;
-    position: relative;
-  }
-  .nav-item.collapsed {
-    width: 38px;
-    height: 38px;
-    padding: 0;
-    justify-content: center;
-    margin: 0 auto;
-  }
-  .nav-item:hover {
-    color: var(--text);
-    background: var(--surface-hover);
-  }
-  .nav-item.active {
-    color: var(--text);
-    background: linear-gradient(90deg, var(--color-primary-dim), transparent);
-    border-color: var(--color-primary-strong);
-  }
-  .nav-item.collapsed.active {
-    background: var(--color-primary-dim);
-    border-color: var(--color-primary-strong);
-  }
-  .ico {
-    width: 15px;
-    height: 15px;
-    flex: none;
-    opacity: 0.85;
-  }
-  .lbl {
-    flex: 1;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    font-size: 12px;
+    font-weight: 500;
     white-space: nowrap;
+    cursor: pointer;
+    transition:
+      background var(--duration-fast) var(--easing-out),
+      color var(--duration-fast) var(--easing-out);
+  }
+  .chip:hover {
+    background: var(--color-surface-hover);
+    color: var(--color-text);
+  }
+  .chip.active {
+    background: var(--color-primary-dim);
+    color: var(--color-primary);
   }
   .count {
     font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
     font-size: 11px;
-    color: var(--faint);
-    background: var(--surface-hover);
-    padding: 1px 7px;
-    border-radius: 99px;
-    min-width: 22px;
-    text-align: center;
+    color: var(--color-faint);
+  }
+  .chip.active .count {
+    color: var(--color-primary);
+  }
+  .sep {
+    width: 1px;
+    height: 16px;
+    margin: 0 6px;
+    background: var(--color-border);
     flex: none;
-  }
-  .nav-item.active .count {
-    color: var(--accent);
-    background: color-mix(in srgb, var(--accent) 18%, transparent);
-  }
-  /* When collapsed, surface a small dot indicator for active + nonzero counts */
-  .nav-item.collapsed.active::after {
-    content: "";
-    position: absolute;
-    top: 6px;
-    right: 6px;
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--accent);
   }
 </style>

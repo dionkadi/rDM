@@ -5,7 +5,6 @@
   import type { Download } from "../types";
   import { fmtBytes, fmtRate, fmtDuration, fmtPercent, truncate } from "../utils/formatters";
   import FileIcon from "./FileIcon.svelte";
-  import StatusBadge from "./StatusBadge.svelte";
   import ProgressBar from "./ProgressBar.svelte";
   import DropdownMenu, { type MenuItem } from "./DropdownMenu.svelte";
   import InlineSpeedLimit from "./InlineSpeedLimit.svelte";
@@ -38,6 +37,17 @@
   // app-level drop handler and made the task card itself drag
   // around like a ghost. Reordering stays available through the
   // keyboard (Alt+↑ / Alt+↓), which dispatches `reorder-keyboard`.
+
+  const STATUS_LABELS: Record<string, string> = {
+    downloading: "Downloading",
+    connecting: "Connecting",
+    paused: "Paused",
+    completed: "Done",
+    error: "Error",
+    canceled: "Canceled",
+    queued: "Queued",
+    scheduled: "Scheduled",
+  };
 
   let expanded = false;
   let menuOpen = false;
@@ -97,6 +107,18 @@
     const rem = d.totalSize - d.downloaded;
     if (rem <= 0) return "done";
     return fmtDuration(Math.round(rem / s));
+  }
+
+  function sizeLabel(d: Download): string {
+    // A finished transfer only needs its size once — "219.3 / 219.3 MB"
+    // is noise. In-flight rows show the running / total split.
+    if (d.status === "completed") return fmtBytes(d.totalSize || d.downloaded);
+    if (!d.totalSize) return fmtBytes(d.downloaded);
+    // Share the unit when both sides have the same one, so the
+    // column reads "219.3 / 219.3 MB" instead of truncating.
+    const a = fmtBytes(d.downloaded).split(" ");
+    const b = fmtBytes(d.totalSize).split(" ");
+    return a[1] === b[1] ? `${a[0]} / ${b.join(" ")}` : `${a.join(" ")} / ${b.join(" ")}`;
   }
 
   function buildMenu(d: Download, close: () => void): MenuItem[] {
@@ -160,6 +182,10 @@
   }
 
   function onKeydown(e: KeyboardEvent) {
+    // Ignore keys that originated on the checkbox / action buttons —
+    // otherwise Enter on "Pause" both clicks the button and expands
+    // the row, which looks like a double action.
+    if (e.target !== e.currentTarget) return;
     if (e.key === "Enter") {
       e.preventDefault();
       toggleExpand();
@@ -214,6 +240,9 @@
   }
 </script>
 
+<!-- Ledger row: one line of record with fixed numeric columns;
+     click/Enter expands the detail panel. Grid columns are shared
+     with the column header in App (var(--row-grid) in app.css). -->
 <div
   class="drow status-{download.status}"
   class:expanded
@@ -225,33 +254,114 @@
   on:keydown={onKeydown}
   on:click={onRowClick}
 >
-  <div class="lead">
-    {#if selectable}
-      <input type="checkbox" bind:checked={selected} aria-label="Select download" />
-    {/if}
-    <FileIcon
-      filename={download.filename}
-      url={download.url}
-      progress={pctNum}
-      status={download.status}
-      size={compact ? 40 : 52}
+  {#if selectable}
+    <!-- One-way `checked` (never `bind`): the checkbox must toggle the
+         *store* via a select event, not a local prop — a local mutation
+         is silently reverted on the next parent render, which is how
+         checkboxes appeared to check and then uncheck themselves. -->
+    <input
+      class="cb"
+      type="checkbox"
+      checked={selected}
+      aria-label="Select download"
+      on:click|stopPropagation={() =>
+        dispatch("select", { id: download.id, shift: false, ctrlOrMeta: true })}
     />
+  {:else}
+    <span class="cb-slot"></span>
+  {/if}
+
+  <FileIcon
+    filename={download.filename}
+    url={download.url}
+    size={compact ? 24 : 28}
+  />
+
+  <div class="name" title={download.filename || download.url}>
+    {truncate(download.filename || download.url, 90)}
   </div>
 
-  <div class="main">
-    <div class="title-row">
-      <div class="title">
-        <span class="name" title={download.filename || download.url}>
-          {truncate(download.filename || download.url, 60)}
-        </span>
-        <StatusBadge status={download.status} />
-      </div>
-      <div class="actions">
+  <div class="c-progress">
+    <ProgressBar
+      progress={pctNum}
+      status={download.status}
+      chunks={download.chunks}
+      segmentProgress={download.segmentProgress ?? null}
+      height={download.status === "downloading" || download.status === "connecting" ? 5 : 3}
+    />
+    <span class="pct">{pct}</span>
+  </div>
+
+  <div class="col c-size">{sizeLabel(download)}</div>
+
+  <div class="col c-speed">
+    {#if (download.status === "downloading" || download.status === "connecting") && speed > 0}
+      {fmtRate(speed)}{#if liveStreams > 1}<span class="streams" title="{liveStreams} connections working on this download">×{liveStreams}</span>{/if}
+    {:else}
+      <span class="dim">—</span>
+    {/if}
+  </div>
+
+  <div class="col c-eta">
+    {#if (download.status === "downloading" || download.status === "connecting") && eta && eta !== "done"}
+      {eta}
+    {:else}
+      <span class="dim">—</span>
+    {/if}
+  </div>
+
+  <div class="col c-status">
+    <span class="dot" class:live={download.status === "downloading"}></span>
+    <span class="st-label">{STATUS_LABELS[download.status] ?? download.status}</span>
+  </div>
+
+  <div class="c-actions">
+    {#if download.status === "downloading" || download.status === "connecting" || download.status === "queued" || download.status === "scheduled"}
+      <button class="action-btn" on:click|stopPropagation={() => dispatch("action", { type: "pause", id: download.id })} title="Pause" aria-label="Pause">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 5v14M16 5v14"/></svg>
+      </button>
+    {:else}
+      <button class="action-btn primary" on:click|stopPropagation={() => dispatch("action", { type: "resume", id: download.id })} title="Resume" aria-label="Resume">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 4l14 8-14 8V4z"/></svg>
+      </button>
+    {/if}
+    <button
+      class="action-btn menu-btn"
+      bind:this={menuTrigger}
+      on:click|stopPropagation={() => (menuOpen = !menuOpen)}
+      title="More actions"
+      aria-label="More actions"
+      aria-haspopup="true"
+      aria-expanded={menuOpen}
+    >
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="5" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="19" r="1.5"/></svg>
+    </button>
+    <DropdownMenu
+      items={menuItems}
+      trigger={menuTrigger}
+      open={menuOpen}
+      on:close={() => (menuOpen = false)}
+    />
+    <button
+      class="action-btn expand"
+      on:click|stopPropagation={toggleExpand}
+      aria-label={expanded ? "Collapse details" : "Expand details"}
+      aria-expanded={expanded}
+    >
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class:rot={expanded}>
+        <path d="M6 9l6 6 6-6"/>
+      </svg>
+    </button>
+  </div>
+
+  {#if expanded}
+    <div class="expanded-panel" transition:slide={{ duration: 180, easing: cubicOut }}>
+      <div class="ex-controls">
         <select
           class="priority"
           class:hi={download.priority === 2}
           class:lo={download.priority === 0}
-          value={download.priority}
+          value={download.priority ?? 1}
           on:change={onPriorityChange}
           on:click|stopPropagation
           title="Priority — higher runs first when slots are full"
@@ -265,492 +375,443 @@
           value={download.speedLimit}
           on:change={(e) => dispatch("action", { type: "set-limit", id: download.id, limit: e.detail })}
         />
-        <button class="action-btn" on:click|stopPropagation={() => dispatch("action", { type: "pause", id: download.id })} title="Pause" aria-label="Pause">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 5v14M16 5v14"/></svg>
-        </button>
-        <button class="action-btn primary" on:click|stopPropagation={() => dispatch("action", { type: "resume", id: download.id })} title="Resume" aria-label="Resume">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 4l14 8-14 8V4z"/></svg>
-        </button>
-        <button
-          class="action-btn menu-btn"
-          bind:this={menuTrigger}
-          on:click|stopPropagation={() => (menuOpen = !menuOpen)}
-          title="More actions"
-          aria-label="More actions"
-          aria-haspopup="true"
-          aria-expanded={menuOpen}
-        >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="5" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="19" r="1.5"/></svg>
-        </button>
-        <DropdownMenu
-          items={menuItems}
-          trigger={menuTrigger}
-          open={menuOpen}
-          on:close={() => (menuOpen = false)}
-        />
+        {#if download.error && download.status === "error"}
+          <span class="ex-error-inline" title={download.error}>⚠ {truncate(download.error, 80)}</span>
+        {/if}
       </div>
-    </div>
 
-    <ProgressBar
-      progress={pctNum}
-      status={download.status}
-      chunks={download.chunks}
-      segmentProgress={download.segmentProgress ?? null}
-      height={compact ? 4 : 6}
-    />
-
-    <div class="meta">
-      <span class="seg"><b>{fmtBytes(download.downloaded)}</b>{download.totalSize ? " / " + fmtBytes(download.totalSize) : ""}</span>
-      <span class="seg pct">{pct}</span>
-      {#if (download.status === "downloading" || download.status === "connecting") && speed > 0}
-        <span class="seg speed">{fmtRate(speed)}</span>
-        {#if eta}<span class="seg">eta {eta}</span>{/if}
-      {/if}
-      {#if liveStreams > 1}
-        <span class="seg streams" title="{liveStreams} connections working on this download">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h4M17 12h4M7 8v8M17 8v8M11 6v12"/></svg>
-          {liveStreams} streams
-        </span>
-      {/if}
-      {#if download.category}
-        <span class="seg cat">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7l4-4h4l2 2h8v13H3V7z"/></svg>
-          {download.category}
-        </span>
-      {/if}
-      {#if download.proxy}
-        <span class="seg proxy" title="Per-download proxy: {download.proxy}">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zM2 12h20M12 2a16 16 0 0 1 0 20M12 2a16 16 0 0 0 0 20"/></svg>
-          proxy
-        </span>
-      {/if}
-      {#if download.error && download.status === "error"}
-        <span class="seg error" title={download.error}>⚠ {truncate(download.error, 40)}</span>
-      {/if}
-    </div>
-
-    {#if expanded}
-      <div class="expanded" transition:slide={{ duration: 220, easing: cubicOut }}>
-        {#if download.segmentProgress}
-          {@const sp = download.segmentProgress}
-          <div class="ex-section">
-            <div class="ex-label">
-              Segments
-              <span class="ex-count">{sp.done.toLocaleString()} / {sp.total.toLocaleString()}</span>
-              {#if sp.active > 0}
-                <span class="ex-note">{sp.active} in flight</span>
-              {:else if sp.done >= sp.total}
-                <span class="ex-note">all written</span>
-              {/if}
-            </div>
-            <div class="seg-map" title="One cell per segment (bucketed for long playlists): filled means the bytes are in the output file">
-              {#each segmentCells as cell}
-                <span class="seg-cell" class:active={cell.active}>
-                  <i style="width: {cell.pct}%"></i>
-                </span>
-              {/each}
-            </div>
-            <div class="hint seg-legend">
-              Fetched concurrently, written in playlist order; tinted cells are in flight.
-            </div>
-          </div>
-        {:else}
-          <div class="ex-section">
-            <div class="ex-label">Chunks ({download.chunks.length})</div>
-            {#if download.chunks.length > 0}
-              <div class="chunks">
-                {#each download.chunks as chunk}
-                  {@const isOpenEnded = !Number.isFinite(chunk.end) || chunk.end > Number.MAX_SAFE_INTEGER}
-                  {@const size = isOpenEnded ? 0 : chunk.end - chunk.start + 1}
-                  {@const chunkPct = isOpenEnded ? 0 : (chunk.downloaded / size) * 100}
-                  <div class="chunk">
-                    <div class="chunk-head">
-                      <span>#{chunk.index}</span>
-                      <span>
-                        {fmtBytes(chunk.downloaded)}{#if isOpenEnded}
-                          <span class="open-ended-hint">· unknown total</span>
-                        {:else}
-                          &nbsp;/&nbsp;{fmtBytes(size)}
-                        {/if}
-                      </span>
-                    </div>
-                    <div class="chunk-bar">
-                      <div class="chunk-fill" style="width: {chunkPct}%"></div>
-                    </div>
-                  </div>
-                {/each}
-              </div>
-            {:else}
-              <div class="hint">Single-connection transfer (no chunks)</div>
+      {#if download.segmentProgress}
+        {@const sp = download.segmentProgress}
+        <div class="ex-section">
+          <div class="ex-label">
+            Segments
+            <span class="ex-count">{sp.done.toLocaleString()} / {sp.total.toLocaleString()}</span>
+            {#if sp.active > 0}
+              <span class="ex-note">{sp.active} in flight</span>
+            {:else if sp.done >= sp.total}
+              <span class="ex-note">all written</span>
             {/if}
           </div>
-        {/if}
-
-        <div class="ex-grid">
-          <div class="ex-stat">
-            <span class="k">URL</span>
-            <span class="v mono">{truncate(download.url, 70)}</span>
+          <div class="seg-map" title="One cell per segment (bucketed for long playlists): filled means the bytes are in the output file">
+            {#each segmentCells as cell}
+              <span class="seg-cell" class:active={cell.active}>
+                <i style="width: {cell.pct}%"></i>
+              </span>
+            {/each}
           </div>
-          <div class="ex-stat">
-            <span class="k">Started</span>
-            <span class="v">{new Date(download.createdAt).toLocaleString()}</span>
+          <div class="hint seg-legend">
+            Fetched concurrently, written in playlist order; tinted cells are in flight.
           </div>
-          {#if download.finishedAt}
-            <div class="ex-stat">
-              <span class="k">Finished</span>
-              <span class="v">{new Date(download.finishedAt).toLocaleString()}</span>
+        </div>
+      {:else}
+        <div class="ex-section">
+          <div class="ex-label">Chunks ({download.chunks.length})</div>
+          {#if download.chunks.length > 0}
+            <div class="chunks">
+              {#each download.chunks as chunk}
+                {@const isOpenEnded = !Number.isFinite(chunk.end) || chunk.end > Number.MAX_SAFE_INTEGER}
+                {@const size = isOpenEnded ? 0 : chunk.end - chunk.start + 1}
+                {@const chunkPct = isOpenEnded ? 0 : (chunk.downloaded / size) * 100}
+                <div class="chunk">
+                  <div class="chunk-head">
+                    <span>#{chunk.index}</span>
+                    <span>
+                      {fmtBytes(chunk.downloaded)}{#if isOpenEnded}
+                        <span class="open-ended-hint">· unknown total</span>
+                      {:else}
+                        &nbsp;/&nbsp;{fmtBytes(size)}
+                      {/if}
+                    </span>
+                  </div>
+                  <div class="chunk-bar">
+                    <div class="chunk-fill" style="width: {chunkPct}%"></div>
+                  </div>
+                </div>
+              {/each}
             </div>
-          {/if}
-          {#if download.contentType}
-            <div class="ex-stat">
-              <span class="k">Type</span>
-              <span class="v mono">{download.contentType}</span>
-            </div>
-          {/if}
-          {#if download.checksum}
-            <div class="ex-stat">
-              <span class="k">Checksum</span>
-              <span class="v mono">{download.checksum.algorithm}: {truncate(download.checksum.expected, 20)}…</span>
-            </div>
-          {/if}
-          {#if download.proxy}
-            <div class="ex-stat">
-              <span class="k">Proxy</span>
-              <span class="v mono">{download.proxy}</span>
-            </div>
-          {/if}
-          {#if download.savePath}
-            <div class="ex-stat">
-              <span class="k">Path</span>
-              <span class="v mono">{truncate(download.savePath, 70)}</span>
-            </div>
+          {:else}
+            <div class="hint">Single-connection transfer (no chunks)</div>
           {/if}
         </div>
+      {/if}
 
-        {#if download.error && download.status === "error"}
-          <div class="ex-error" transition:fade={{ duration: 150 }}>
-            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 8v4m0 4h.01M4.93 19.07h14.14V4.93H4.93z"/></svg>
-            {download.error}
+      <div class="ex-grid">
+        <div class="ex-stat">
+          <span class="k">URL</span>
+          <span class="v mono">{truncate(download.url, 70)}</span>
+        </div>
+        <div class="ex-stat">
+          <span class="k">Started</span>
+          <span class="v">{new Date(download.createdAt).toLocaleString()}</span>
+        </div>
+        {#if download.finishedAt}
+          <div class="ex-stat">
+            <span class="k">Finished</span>
+            <span class="v">{new Date(download.finishedAt).toLocaleString()}</span>
+          </div>
+        {/if}
+        {#if download.contentType}
+          <div class="ex-stat">
+            <span class="k">Type</span>
+            <span class="v mono">{download.contentType}</span>
+          </div>
+        {/if}
+        {#if download.checksum}
+          <div class="ex-stat">
+            <span class="k">Checksum</span>
+            <span class="v mono">{download.checksum.algorithm}: {truncate(download.checksum.expected, 20)}…</span>
+          </div>
+        {/if}
+        {#if download.proxy}
+          <div class="ex-stat">
+            <span class="k">Proxy</span>
+            <span class="v mono">{download.proxy}</span>
+          </div>
+        {/if}
+        {#if download.savePath}
+          <div class="ex-stat">
+            <span class="k">Path</span>
+            <span class="v mono">{truncate(download.savePath, 70)}</span>
           </div>
         {/if}
       </div>
-    {/if}
-  </div>
 
-  <button
-    class="expand"
-    on:click|stopPropagation={toggleExpand}
-    aria-label={expanded ? "Collapse details" : "Expand details"}
-    aria-expanded={expanded}
-  >
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class:rot={expanded}>
-      <path d="M6 9l6 6 6-6"/>
-    </svg>
-  </button>
+      {#if download.error && download.status === "error"}
+        <div class="ex-error" transition:fade={{ duration: 150 }}>
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 8v4m0 4h.01M4.93 19.07h14.14V4.93H4.93z"/></svg>
+          {download.error}
+        </div>
+      {/if}
+    </div>
+  {/if}
 </div>
 
 <style>
+  /* Ledger row — one line of record. Grid columns come from the
+     shared --row-grid token (app.css) so the column header in
+     App.svelte stays aligned. Status meaning lives in the status
+     column + meter; no per-row cards, shadows or colored borders. */
   .drow {
     display: grid;
-    grid-template-columns: auto 1fr auto;
-    gap: 14px;
+    grid-template-columns: var(--row-grid);
     align-items: center;
-    padding: 14px 16px;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    margin-bottom: 8px;
-    box-shadow: var(--shadow-raised);
-    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    column-gap: 10px;
+    padding: 0 12px;
+    min-height: var(--size-row);
+    background: transparent;
+    border-bottom: 1px solid var(--color-border-2);
+    transition: background 0.12s var(--easing-out);
     cursor: pointer;
   }
   .drow:hover {
-    border-color: var(--color-border-strong);
     background: var(--color-surface-hover);
-    /* No `transform: translateX(2px)` here — it makes the chevron move
-       by 2 px on hover, which (via the DropdownMenu's scroll handler)
-       re-anchors the menu and produces a visible two-position jump. */
+    /* No `transform` — it makes the menu trigger move on hover, which
+       (via the DropdownMenu's scroll handler) re-anchors the menu and
+       produces a visible two-position jump. */
   }
   .drow.compact {
-    padding: 10px 14px;
+    min-height: var(--size-row-compact);
   }
   .drow.expanded {
-    background: var(--surface-active);
-    border-color: var(--color-primary-strong);
+    background: var(--color-surface);
   }
   .drow.selected {
-    border-color: var(--color-info);
-    background: color-mix(in srgb, var(--color-info) 8%, var(--surface));
-  }
-  /* Drag-and-drop reorder affordances. A 2 px accent line on the
-     edge where the row will land tells the user exactly where
-     the drop will insert. The line fades in within 80 ms so the
-     feedback is fast enough that the user can target a slot
-     mid-drag without overshooting. We avoid a box-shadow on
-     the whole row — it would shift the layout and the user's
-     pointer would no longer line up with the slot they aimed at. */
-  .drow.status-completed {
-    border-color: var(--color-success-strong);
-  }
-  .drow.status-error, .drow.status-canceled {
-    border-color: var(--color-danger-strong);
+    background: var(--color-primary-dim);
+    box-shadow: inset 2px 0 0 var(--color-primary);
   }
 
-  .lead {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-  .lead input[type="checkbox"] {
-    width: 16px;
-    height: 16px;
-    accent-color: var(--accent);
+  /* Checkbox look comes from the shared `input.cb` block in app.css
+     (14px + SVG check) — only the layout slot lives here. */
+  .cb {
+    justify-self: center;
   }
 
-  .main { min-width: 0; }
-
-  .title-row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    justify-content: space-between;
-    margin-bottom: 8px;
-  }
-  .title {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    min-width: 0;
-    flex: 1;
-  }
   .name {
-    font-weight: 600;
-    font-size: 14px;
-    color: var(--text);
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--color-text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+  }
+
+  /* ── Numeric columns — right-aligned tabular readouts ─── */
+  .col {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 11px;
+    color: var(--color-muted);
+    text-align: right;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  .dim {
+    color: var(--color-faint);
+  }
+  .streams {
+    color: var(--color-faint);
+    margin-left: 3px;
+    font-size: 11px;
+  }
 
-  .actions {
+  .c-progress {
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: 8px;
+    min-width: 0;
+  }
+  .c-progress :global(.bar) {
+    flex: 1;
+    min-width: 0;
+  }
+  .pct {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 11px;
+    color: var(--color-muted);
+    width: 44px;
+    text-align: right;
+    flex: none;
+  }
+  /* The meter and the status label already carry the accent on a live
+     row. A third accent number turns the row into a highlighter; the
+     percentage steps up to primary text instead. */
+  .drow.status-downloading .pct,
+  .drow.status-connecting .pct {
+    color: var(--color-text);
+  }
+
+  /* ── Status column ───────────────────────────────────── */
+  .c-status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    justify-content: flex-start;
+    min-width: 0;
+  }
+  .dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex: none;
+    background: var(--color-faint);
+  }
+  .dot.live {
+    background: var(--color-primary);
+    animation: pulse 2s ease-in-out infinite;
+  }
+  .status-downloading .dot { background: var(--color-primary); }
+  .status-connecting .dot { background: var(--color-info); }
+  .status-completed .dot { background: var(--color-success); }
+  .status-error .dot { background: var(--color-danger); }
+  .status-queued .dot { background: var(--color-warning); }
+  .status-scheduled .dot { background: var(--color-info); }
+  .status-paused .dot, .status-canceled .dot { background: var(--color-faint); }
+
+  .st-label {
+    font-size: 11px;
+    color: var(--color-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .status-downloading .st-label { color: var(--color-primary); }
+  .status-error .st-label { color: var(--color-danger); }
+  /* Finished rows recede: the green dot carries the meaning, the
+     label stays quiet so live rows are the only thing that pops. */
+  .status-completed .st-label { color: var(--color-faint); }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.45; }
+  }
+
+  /* ── Hover actions ───────────────────────────────────── */
+  .c-actions {
+    display: flex;
+    align-items: center;
+    gap: 1px;
+    justify-content: flex-end;
     opacity: 0;
-    /* No `transform: translateX(4px)` — the chevron sits inside `.actions`,
-       and any transform here shifts the trigger by 4 px on hover, which
-       causes the open DropdownMenu to re-anchor and produce a visible
-       two-position jump. We keep the opacity fade for a clean reveal. */
-    transition: opacity 0.18s;
+    /* No `transform` — same DropdownMenu re-anchor reason as above. */
+    transition: opacity 0.15s;
     position: relative;
   }
-  .drow:hover .actions, .drow:focus-within .actions, .drow.expanded .actions {
+  .drow:hover .c-actions, .drow:focus-within .c-actions, .drow.expanded .c-actions {
     opacity: 1;
   }
   .action-btn {
-    width: 28px;
-    height: 28px;
+    width: 24px;
+    height: 24px;
     background: transparent;
-    border: 1px solid transparent;
-    border-radius: 7px;
-    color: var(--muted);
+    border: none;
+    border-radius: var(--radius-sm);
+    color: var(--color-muted);
     cursor: pointer;
     display: grid;
     place-items: center;
-    transition: all 0.15s;
+    transition:
+      background 0.12s var(--easing-out),
+      color 0.12s var(--easing-out);
   }
   .action-btn:hover {
-    background: rgba(255, 255, 255, 0.06);
-    color: var(--text);
-    border-color: var(--border);
+    background: var(--color-surface-active);
+    color: var(--color-text);
   }
   .action-btn.primary {
-    color: var(--accent);
-    background: var(--color-primary-dim);
+    color: var(--color-primary);
   }
   .action-btn.primary:hover {
-    background: color-mix(in srgb, var(--accent) 20%, transparent);
+    background: var(--color-primary-dim);
   }
   .action-btn svg {
-    width: 14px;
-    height: 14px;
+    width: 13px;
+    height: 13px;
+  }
+  .action-btn.expand svg {
+    transition: transform 0.15s var(--easing-out);
+  }
+  .action-btn.expand svg.rot {
+    transform: rotate(180deg);
   }
 
-  /* Priority badge: a small 2-letter chip that shows the current
-     priority. We use a `<select>` (not a button) so screen readers
-     announce it as a form control and the keyboard picker works
-     natively. The chip color shifts with the priority level so
-     the user can scan the list and find "high" items at a glance. */
+  /* ── Expanded detail panel (spans all columns) ───────── */
+  .expanded-panel {
+    grid-column: 1 / -1;
+    /* Align the panel's left edge with the filename column:
+       12 (row pad) + 18 (checkbox) + 10 + 28 (tile) + 10. */
+    padding: 4px 0 14px 78px;
+    border-top: 1px solid var(--color-border-2);
+    margin-top: -1px;
+    cursor: default;
+  }
+
+  .ex-controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    padding: 8px 0 4px;
+    max-width: 720px;
+  }
+  /* Keep the inline speed-limit input readout-sized instead of
+     stretching to fill the panel. */
+  .ex-controls :global(input) {
+    width: 120px;
+    flex: none;
+  }
   .priority {
-    height: 22px;
-    padding: 0 6px 0 8px;
-    background: var(--color-primary-dim);
-    border: 1px solid color-mix(in srgb, var(--accent) 20%, transparent);
-    border-radius: 99px;
-    color: var(--accent);
+    height: 24px;
+    width: 74px;
+    padding: 0 18px 0 7px;
+    background-color: transparent;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    color: var(--color-muted);
     font-family: var(--font-mono);
-    font-size: 10.5px;
-    font-weight: 700;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
+    font-size: 11px;
     cursor: pointer;
     outline: none;
     appearance: none;
     -webkit-appearance: none;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%237af0c8' stroke-width='1.6'%3E%3Cpath d='M3 5l3 3 3-3'/%3E%3C/svg%3E");
+    background-image: var(--select-chevron);
     background-repeat: no-repeat;
-    background-position: right 4px center;
+    background-position: right 3px center;
     background-size: 9px 9px;
-    padding-right: 18px;
   }
   .priority:focus {
-    border-color: var(--accent);
-    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent);
+    border-color: var(--color-border-focus);
+    box-shadow: var(--shadow-glow);
   }
   .priority.hi {
-    background-color: var(--color-warning-dim, rgba(255, 180, 0, 0.16));
-    border-color: color-mix(in srgb, #ffb400 40%, transparent);
-    color: #ffb400;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%23ffb400' stroke-width='1.6'%3E%3Cpath d='M3 5l3 3 3-3'/%3E%3C/svg%3E");
+    border-color: var(--color-warning-strong);
+    color: var(--color-warning);
   }
   .priority.lo {
-    background-color: var(--surface);
-    border-color: var(--border);
-    color: var(--text-faint);
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%23808080' stroke-width='1.6'%3E%3Cpath d='M3 5l3 3 3-3'/%3E%3C/svg%3E");
+    color: var(--color-faint);
   }
   .priority option {
-    background: var(--surface);
-    color: var(--text);
+    background: var(--color-surface);
+    color: var(--color-text);
+  }
+  .ex-error-inline {
+    color: var(--color-danger);
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+    flex: 1;
   }
 
-  .meta {
-    display: flex;
-    gap: 14px;
-    flex-wrap: wrap;
-    font-family: var(--font-mono);
-    font-size: 11.5px;
-    color: var(--muted);
-    margin-top: 6px;
-  }
-  .seg {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-  }
-  .seg b {
-    color: var(--text);
-    font-weight: 500;
-  }
-  .pct { color: var(--accent); font-weight: 600; }
-  .speed { color: var(--color-success); }
-  .streams { color: var(--text-faint); }
-  .streams svg, .cat svg, .proxy svg { width: 11px; height: 11px; }
-  .cat { color: var(--text-faint); }
-  .proxy {
-    color: var(--color-info);
-    background: var(--color-info-dim);
-    border-radius: 99px;
-    padding: 1px 7px;
-  }
-  .error { color: var(--color-danger); }
-
-  .expand {
-    width: 26px;
-    height: 26px;
-    background: transparent;
-    border: 1px solid var(--hair);
-    border-radius: 7px;
-    color: var(--muted);
-    cursor: pointer;
-    display: grid;
-    place-items: center;
-    transition: all 0.15s;
-  }
-  .expand:hover {
-    color: var(--text);
-    border-color: var(--border-strong);
-  }
-  .expand svg {
-    width: 14px;
-    height: 14px;
-    transition: transform 0.2s;
-  }
-  .expand svg.rot { transform: rotate(180deg); }
-
-  .expanded {
-    margin-top: 12px;
-    padding-top: 12px;
-    border-top: 1px solid var(--hair-2);
-  }
-
-  .ex-section { margin-bottom: 14px; }
+  .ex-section { margin: 10px 0 12px; }
   .ex-label {
-    font-size: 10.5px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.1em;
-    color: var(--text-faint);
-    margin-bottom: 8px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--color-muted);
+    margin-bottom: 6px;
   }
   .ex-count {
     margin-left: 6px;
-    font-weight: 600;
-    letter-spacing: 0;
-    text-transform: none;
-    color: var(--text);
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-weight: 500;
+    color: var(--color-text);
   }
   .ex-note {
-    margin-left: 8px;
-    font-size: 10px;
-    font-weight: 600;
-    letter-spacing: 0;
-    text-transform: none;
-    color: var(--accent);
+    margin-left: 6px;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--color-primary);
   }
   .seg-map {
     display: flex;
     gap: 1px;
-    height: 18px;
+    height: 14px;
+    max-width: 720px;
   }
   .seg-cell {
     flex: 1 1 0;
     min-width: 0;
-    background: rgba(255, 255, 255, 0.06);
+    background: var(--color-bg-active);
     border-radius: 1px;
     overflow: hidden;
   }
   .seg-cell i {
     display: block;
     height: 100%;
-    background: linear-gradient(90deg, var(--accent), var(--accent-2));
-    transition: width 0.3s;
+    background: var(--color-primary);
+    transition: width 0.25s var(--easing-out);
   }
   .seg-cell.active {
-    background: var(--accent);
-    opacity: 0.55;
+    /* Tint the bucket, keep its fill readable. The old rule painted
+       the whole cell accent at 45% opacity, which faded the fill it
+       was supposed to highlight. */
+    background: var(--color-primary-dim);
   }
-  .seg-legend {
-    margin-top: 8px;
-  }
+  .seg-legend { margin-top: 6px; }
   .chunks {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-    gap: 8px;
+    gap: 6px;
+    max-width: 860px;
   }
   .chunk {
-    background: rgba(255, 255, 255, 0.02);
-    border: 1px solid var(--hair-2);
-    border-radius: 8px;
-    padding: 8px 10px;
+    background: var(--color-bg-active);
+    border: 1px solid var(--color-border-2);
+    border-radius: var(--radius-sm);
+    padding: 6px 8px;
   }
   .chunk-head {
     display: flex;
     justify-content: space-between;
     font-family: var(--font-mono);
-    font-size: 10.5px;
-    color: var(--muted);
-    margin-bottom: 5px;
+    font-variant-numeric: tabular-nums;
+    font-size: 11px;
+    color: var(--color-muted);
+    margin-bottom: 4px;
   }
   /* "unknown total" hint shown next to the running byte count for
      open-ended chunks (where the proxy didn't relay Content-Length
@@ -758,49 +819,48 @@
      size column is hidden in that case so the user never sees
      "879 B / 16777216.0 TB" or similar sentinel-leak. */
   .open-ended-hint {
-    color: var(--text-faint);
+    color: var(--color-faint);
     font-style: italic;
     margin-left: 4px;
   }
   .chunk-bar {
-    height: 4px;
-    background: rgba(255, 255, 255, 0.06);
-    border-radius: 99px;
+    height: 3px;
+    background: var(--color-track);
+    border-radius: 1px;
     overflow: hidden;
   }
   .chunk-fill {
     height: 100%;
-    background: linear-gradient(90deg, var(--accent), var(--accent-2));
-    border-radius: 99px;
-    transition: width 0.3s;
+    background: var(--color-primary);
+    transition: width 0.25s var(--easing-out);
   }
 
   .ex-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-    gap: 8px 16px;
-    margin-top: 8px;
+    gap: 6px 14px;
+    margin-top: 6px;
+    max-width: 860px;
   }
   .ex-stat {
     display: flex;
     flex-direction: column;
-    gap: 2px;
+    gap: 1px;
     min-width: 0;
   }
   .ex-stat .k {
-    font-size: 10.5px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--text-faint);
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--color-faint);
   }
   .ex-stat .v {
-    font-size: 12.5px;
-    color: var(--text);
+    font-size: 12px;
+    color: var(--color-text);
   }
   .ex-stat .v.mono {
     font-family: var(--font-mono);
-    font-size: 11.5px;
+    font-variant-numeric: tabular-nums;
+    font-size: 11px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -809,22 +869,37 @@
   .ex-error {
     display: flex;
     align-items: center;
-    gap: 8px;
-    margin-top: 12px;
-    padding: 10px 12px;
+    gap: 6px;
+    margin-top: 10px;
+    padding: 8px 10px;
+    max-width: 860px;
     background: var(--color-danger-dim);
     border: 1px solid var(--color-danger-strong);
-    border-radius: 9px;
+    border-radius: var(--radius-sm);
     color: var(--color-danger);
-    font-size: 12.5px;
-  }
-
-  .hint {
-    color: var(--text-faint);
     font-size: 12px;
   }
 
+  .hint {
+    color: var(--color-faint);
+    font-size: 12px;
+  }
+
+  /* Drop the least critical columns as the window narrows. */
+  @media (max-width: 1180px) {
+    .c-eta { display: none; }
+    .drow { grid-template-columns: var(--row-grid-no-eta); }
+  }
+  @media (max-width: 980px) {
+    .c-speed, .streams { display: none; }
+    .drow { grid-template-columns: var(--row-grid-no-eta-no-speed); }
+  }
+
+  @media (max-width: 640px) {
+    .expanded-panel { padding-left: 42px; }
+  }
+
   @media (prefers-reduced-motion: reduce) {
-    .drow:hover { transform: none; }
+    .dot.live { animation: none; }
   }
 </style>

@@ -23,14 +23,26 @@ function effectiveTheme(stored: ThemeKey): "dark" | "light" {
   return stored;
 }
 
+// The *rendered* theme is a writable driven by `applyTheme`, not a
+// `derived` of `theme`. With `theme === "system"`, an OS preference flip
+// changes the DOM without ever changing the `theme` store; canvas-backed
+// consumers (SpeedGraph) must still hear about it so they can repaint.
+export const effectiveThemeStore = writable<"dark" | "light">(
+  effectiveTheme(readStoredTheme()),
+);
+
 function applyTheme(theme: "dark" | "light"): void {
-  if (typeof document === "undefined") return;
-  document.documentElement.setAttribute("data-theme", theme);
-  // Also nudge native form controls
-  const meta = document.querySelector<HTMLMetaElement>(
-    'meta[name="color-scheme"]',
-  );
-  if (meta) meta.content = theme;
+  if (typeof document !== "undefined") {
+    document.documentElement.setAttribute("data-theme", theme);
+    // Also nudge native form controls
+    const meta = document.querySelector<HTMLMetaElement>(
+      'meta[name="color-scheme"]',
+    );
+    if (meta) meta.content = theme;
+  }
+  // Notify *after* the DOM is updated: subscribers repaint synchronously,
+  // and canvas colours are resolved from `getComputedStyle` at draw time.
+  effectiveThemeStore.set(theme);
 }
 
 export const theme = writable<ThemeKey>(readStoredTheme());
@@ -53,15 +65,9 @@ if (browser) {
   applyTheme(effectiveTheme(readStoredTheme()));
 }
 
-export const effectiveThemeStore = derived(theme, ($t) => effectiveTheme($t));
-
 export function setTheme(next: ThemeKey): void {
   theme.set(next);
 }
-
-// ── Sidebar ─────────────────────────────────────────────────────────
-export const sidebarCollapsed = writable(false);
-export const sidebarWidth = derived(sidebarCollapsed, ($c) => ($c ? 64 : 248));
 
 // ── Filters / view ──────────────────────────────────────────────────
 export type FilterKey =
@@ -81,14 +87,10 @@ export type FilterKey =
 
 export const activeFilter = writable<FilterKey>("all");
 export const searchQuery = writable("");
-export const sortBy = writable<"recent" | "name" | "size" | "speed">("recent");
-export const viewMode = writable<"comfortable" | "compact">("comfortable");
 
 // ── Modals ──────────────────────────────────────────────────────────
 export const showSettings = writable(false);
-export const showAddDialog = writable(false);
 export const showCommandPalette = writable(false);
-export const showOnboarding = writable(false);
 
 // ── Toasts ──────────────────────────────────────────────────────────
 export interface Toast {

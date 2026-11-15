@@ -1,13 +1,11 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { get } from "svelte/store";
-  import { fly, fade } from "svelte/transition";
+  import { fade } from "svelte/transition";
   import { flip } from "svelte/animate";
-  import { cubicOut } from "svelte/easing";
   import { readText } from "@tauri-apps/plugin-clipboard-manager";
   import {
     DownloadRow,
-    SpeedGraph,
     SmartFilters,
     GlobalSearch,
     CommandPalette,
@@ -23,9 +21,6 @@
   import { setDownloadPriority as setPriority } from "./lib/api";
   import {
     downloads,
-    aggregateSpeed,
-    counts,
-    totalDownloaded,
     refreshDownloads,
     addDownload as addDownloadStore,
     pauseDownload,
@@ -49,8 +44,6 @@
     searchQuery,
     showSettings,
     showCommandPalette,
-    sidebarCollapsed,
-    globalSpeedLimitLabel,
     clipboardUrl,
     clipboardMonitorEnabled,
     dragActive,
@@ -68,7 +61,7 @@
   } from "./lib/stores/ui";
   import { settings, loadSettings } from "./lib/stores/settings";
   import { initKeyboardShortcuts, registerShortcuts } from "./lib/hooks/useKeyboardShortcuts";
-  import { fmtBytes, fmtRate, filenameFromUrl, isUrl, truncate } from "./lib/utils/formatters";
+  import { fmtBytes, filenameFromUrl, isUrl, truncate } from "./lib/utils/formatters";
   import type { Download, ToolInfo } from "./lib/types";
 
   // ── Form state ────────────────────────────────────────────────
@@ -77,9 +70,17 @@
   let checksumAlgo = "sha256";
   let checksumExpected = "";
   let showChecksum = false;
-  let globalLimitMB = "";
+  let showAdvanced = false;
+  /**
+   * Optional cap for the download being added. Empty = unlimited.
+   * This is deliberately per-download: the old control silently
+   * rewrote the *global* limit while the user thought they were
+   * configuring one URL. The global cap now lives in Settings →
+   * Network, where it belongs.
+   */
+  let newLimitMB = "";
   let error = "";
-  let pingResult = "";
+  let isMac = false;
 
   // Checksum algorithms the engine can verify. The engine accepts the
   // common tool spellings too (md5sum, sha-256, …) but the UI offers
@@ -109,6 +110,7 @@
       createdAt: new Date().toISOString(),
       finishedAt: null,
       canResume: true,
+      priority: 1,
       ...o,
     } as Download;
   }
@@ -196,7 +198,6 @@
   // ── Derived ───────────────────────────────────────────────────
   $: filter = $activeFilter;
   $: visible = filterDownloads($downloads, filter, $searchQuery);
-  $: headerTitle = filter === "all" ? "Downloads" : filter[0].toUpperCase() + filter.slice(1);
 
   function filterDownloads(list: Download[], f: FilterKey, q: string): Download[] {
     let out = list;
@@ -211,7 +212,7 @@
   }
   function matchFilter(d: Download, f: FilterKey): boolean {
     switch (f) {
-      case "active": return !["completed", "error", "canceled"].includes(d.status);
+      case "active": return d.status === "downloading" || d.status === "connecting";
       case "queued": return d.status === "queued" || d.status === "scheduled";
       case "paused": return d.status === "paused";
       case "completed": return d.status === "completed";
@@ -236,19 +237,54 @@
   }
 
   // ── Actions ───────────────────────────────────────────────────
-  async function add(u: string, cat?: string | null, checksum?: { algorithm: string; expected: string } | null) {
-    if (!u) return;
+  function limitForNew(): number | null {
+    const v = newLimitMB.trim();
+    if (v === "") return null;
+    const mb = Number(v);
+    if (!Number.isFinite(mb) || mb < 0) return null;
+    return Math.round(mb * 1024 * 1024);
+  }
+
+  function resetAddForm() {
     url = "";
     checksumExpected = "";
     showChecksum = false;
+    newLimitMB = "";
+  }
+
+  async function add(u: string, cat?: string | null, checksum?: { algorithm: string; expected: string } | null) {
+    const target = u.trim();
+    if (!target) return;
+    if (!isUrl(target)) {
+      error = "Enter a complete http(s) URL.";
+      return;
+    }
+    error = "";
+    const rawLimit = newLimitMB.trim();
+    if (rawLimit !== "" && (!Number.isFinite(Number(rawLimit)) || Number(rawLimit) < 0)) {
+      error = "Speed limit must be zero or a positive number of MB/s.";
+      return;
+    }
+    const speedLimit = limitForNew();
     if ($demoMode) {
-      downloads.update((list) => [makeDemoDownload(u, cat ?? null), ...list]);
-      showToast({ kind: "success", title: "Download added", message: filenameFromUrl(u) });
+      const d = makeDemoDownload(target, cat ?? null);
+      d.speedLimit = speedLimit;
+      downloads.update((list) => [d, ...list]);
+      resetAddForm();
+      showToast({ kind: "success", title: "Download added", message: filenameFromUrl(target) });
       return;
     }
     try {
-      await addDownloadStore({ url: u, category: cat ?? null, checksum: checksum ?? null });
-      showToast({ kind: "success", title: "Download added", message: filenameFromUrl(u) });
+      await addDownloadStore({
+        url: target,
+        category: cat ?? null,
+        checksum: checksum ?? null,
+        speedLimit,
+      });
+      // Keep the URL in the field when the engine rejects it, so the
+      // user can correct it instead of re-pasting.
+      resetAddForm();
+      showToast({ kind: "success", title: "Download added", message: filenameFromUrl(target) });
     } catch (e) {
       error = String(e);
       showToast({ kind: "error", title: "Failed to add", message: String(e) });
@@ -260,29 +296,8 @@
     return hex === "" ? null : { algorithm: checksumAlgo, expected: hex };
   }
 
-  function applyLimit(bytes: number | null, label: string) {
-    globalSpeedLimitLabel.set(label);
-    if ($demoMode) return;
-    api.setGlobalSpeedLimit(bytes).catch((e) => (error = String(e)));
-  }
-  function applyLimitMB() {
-    const v = globalLimitMB.trim();
-    if (v === "") {
-      applyLimit(null, "Unlimited");
-      return;
-    }
-    const mb = Number(v);
-    if (isNaN(mb) || mb < 0) return;
-    applyLimit(Math.round(mb * 1024 * 1024), `${mb} MB/s`);
-  }
-  function presetLimit(mb: number | null) {
-    if (mb == null) {
-      globalLimitMB = "";
-      applyLimit(null, "Unlimited");
-    } else {
-      globalLimitMB = String(mb);
-      applyLimit(Math.round(mb * 1024 * 1024), `${mb} MB/s`);
-    }
+  function presetNewLimit(mb: number | null) {
+    newLimitMB = mb == null ? "" : String(mb);
   }
 
   async function onAction(e: CustomEvent) {
@@ -553,16 +568,13 @@
       // other selected rows are left alone.
       toggleSelect(id);
     } else {
-      // Plain click in selection-mode (= row is the only one
-      // selected). Plain click outside selection-mode does
-      // nothing — the row still receives a single-click `action`
-      // event for things like pause/resume.
-      const sel = get(selectedIds) as Set<string>;
-      if (sel.size > 0) {
-        // Replace the selection with just this row.
-        clearSelection();
-        selectOne(id);
-      }
+      // Plain click collapses the selection to just this row — also
+      // when the selection is empty, so a click is never a dead zone.
+      // (This used to do nothing outside "selection mode", which left
+      // the checkbox as the only way in and made plain clicks feel
+      // broken.)
+      clearSelection();
+      selectOne(id);
     }
   }
 
@@ -617,14 +629,6 @@
       await reorderDownloads(newOrder);
     } catch (err) {
       showToast({ kind: "error", title: "Reorder failed", message: String(err) });
-    }
-  }
-
-  async function doPing() {
-    try {
-      pingResult = await api.ping();
-    } catch {
-      pingResult = "offline";
     }
   }
 
@@ -687,11 +691,6 @@
     for (const u of urls) await add(u, newCategory || null);
   }
 
-  // ── Sidebar toggle ────────────────────────────────────────────
-  function toggleSidebar() {
-    sidebarCollapsed.update((c) => !c);
-  }
-
   // ── Lifecycle ─────────────────────────────────────────────────
   // ── Body scroll lock ─────────────────────────────────────────
   //
@@ -747,9 +746,15 @@
   }
 
   onMount(() => {
+    isMac = /Mac|iPhone|iPad/i.test(navigator.platform);
     // Load initial data (fire and forget)
     (async () => {
       try {
+        // Probe the engine first: `refreshDownloads` swallows its own
+        // errors (they surface in the UI error strip), so the demo-mode
+        // fallback must key off a call that actually rejects when the
+        // Tauri backend is absent (plain `npm run dev`).
+        await api.listDownloads();
         await refreshDownloads();
       } catch {
         demoMode.set(true);
@@ -760,7 +765,6 @@
       if ($settings?.clipboardMonitor) startClipboardMonitor();
       startSpeedMonitor();
       await startEventListener();
-      doPing();
       // Which external tools are available. Probed once and lazily
       // tolerated: a failure here only costs the Merge button its
       // "disabled with a reason" state, and the merge command still
@@ -810,10 +814,6 @@
           if ($hasSelection) clearSelection();
         },
       },
-      {
-        key: "[", ctrl: true, meta: true, description: "Toggle sidebar", category: "View",
-        handler: toggleSidebar,
-      },
     ]);
     initKeyboardShortcuts();
     return unregister;
@@ -832,17 +832,16 @@
   });
 </script>
 
-<div
-  class="shell"
-  class:collapsed={$sidebarCollapsed}
-  role="application"
+<main
+  class="app"
+  class:has-selection={$hasSelection}
   on:dragenter={onDragEnter}
   on:dragleave={onDragLeave}
   on:dragover={onDragOver}
   on:drop={onDrop}
 >
-  <!-- ── Sidebar ─────────────────────────────────────────────── -->
-  <aside class="sidebar" aria-label="Main navigation">
+  <!-- ── Top bar ─────────────────────────────────────────────── -->
+  <header class="topbar">
     <div class="brand">
       <div class="mark" aria-hidden="true">
         <svg viewBox="0 0 24 24" fill="none">
@@ -850,129 +849,108 @@
           <path d="M5 19h14" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"/>
         </svg>
       </div>
-      <div class="brand-text">
-        <div class="word">DM</div>
-        <div class="sub">Download Manager</div>
-      </div>
-      <div class="live" class:idle={!$counts.active} title={$counts.active ? "Active transfers" : "Idle"}></div>
+      <div class="word">DM</div>
     </div>
-
-    <div class="search-wrap">
-      <GlobalSearch />
-    </div>
-
-    <SmartFilters />
-
-    <div class="sidebar-footer">
-      <div class="side-stat" class:collapsed={$sidebarCollapsed}>
-        {#if !$sidebarCollapsed}
-          <div class="row"><span class="k">Throughput</span><span class="v">{fmtRate($aggregateSpeed)}</span></div>
-          <div class="row"><span class="k">Downloaded</span><span class="v">{fmtBytes($totalDownloaded)}</span></div>
-          <div class="row"><span class="k">Speed cap</span><span class="v">{$globalSpeedLimitLabel}</span></div>
-        {:else}
-          <div class="row-icons" title="Throughput: {fmtRate($aggregateSpeed)}">
-            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11m0 0l-4-4m4 4l4-4"/><path d="M5 20h14"/></svg>
-            <span class="v">{fmtRate($aggregateSpeed)}</span>
-          </div>
-        {/if}
-      </div>
-      {#if $demoMode}
-        <div class="demo-flag" title="Preview mode · demo data">
-          {#if !$sidebarCollapsed}Preview · demo data{:else}⚠{/if}
-        </div>
-      {/if}
-    </div>
-  </aside>
-
-  <!-- ── Main content ────────────────────────────────────────── -->
-  <main class="main">
-    <header class="topbar">
-      <button class="btn btn-ghost btn-icon" on:click={toggleSidebar} aria-label="Toggle sidebar" title="Toggle sidebar (⌘[)">
-        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+    <GlobalSearch />
+    {#if $searchQuery}
+      <button class="query-chip" on:click={() => searchQuery.set("")} title="Clear search">
+        “{$searchQuery}” ×
       </button>
-      <div>
-        <h1>{headerTitle}</h1>
-        <div class="lead">Segmented transfers · pause &amp; resume · live throughput</div>
-      </div>
-      <div class="spacer"></div>
-      <button class="btn btn-ghost btn-sm" on:click={doPing} title="Ping engine">Ping</button>
-      <span class="chip" style="border-color:transparent;background:transparent;color:var(--muted);font-size:11.5px">{pingResult || "—"}</span>
-      <button class="btn btn-ghost btn-icon" on:click={() => showSettings.set(true)} aria-label="Open settings" title="Settings (⌘,)">
-        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-2.82 1.17V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 8 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 3.6 15H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6h.09A1.65 1.65 0 0 0 11 3.09V3a2 2 0 1 1 4 0v.09A1.65 1.65 0 0 0 16 4.6a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 20.4 9v.09A1.65 1.65 0 0 0 22 11h0a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-      </button>
-    </header>
+    {/if}
+    <div class="spacer"></div>
+    <button class="btn btn-ghost btn-icon" on:click={() => showSettings.set(true)} aria-label="Open settings" title="Settings (⌘,)">
+      <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-2.82 1.17V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 8 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 3.6 15H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6h.09A1.65 1.65 0 0 0 11 3.09V3a2 2 0 1 1 4 0v.09A1.65 1.65 0 0 0 16 4.6a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 20.4 9v.09A1.65 1.65 0 0 0 22 11h0a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+    </button>
+  </header>
 
-    <!-- ── Add hero ──────────────────────────────────────────── -->
-    <section class="panel add-hero">
+  <!-- ── Filter strip (status + smart folders) ───────────────── -->
+  <SmartFilters />
+
+    <!-- ── Add line (bare, one row) ──────────────────────────── -->
+    <div class="add-line">
       <div class="add-row">
         <input
           class="add-input"
-          placeholder="Paste a download link — https://example.com/big-file.iso"
+          placeholder="Paste a URL and press Enter…"
           bind:value={url}
+          on:input={() => (error = "")}
           on:keydown={(e) => e.key === "Enter" && add(url, newCategory || null, currentChecksum())}
         />
-        <button class="btn btn-primary" on:click={() => add(url, newCategory || null, currentChecksum())}>
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 4v11m0 0l-4-4m4 4l4-4"/><path d="M5 20h14"/></svg>
-          Add
-        </button>
-      </div>
-
-      <div class="add-sub">
         <select
           class="cat-select"
           bind:value={newCategory}
           aria-label="Category"
+          title={newCategory ? resolveDirFor(newCategory) : "Save category"}
         >
-          <option value="">Default (no category)</option>
+          <option value="">Default</option>
           {#each $settings?.categories ?? [] as cat}
             <option value={cat.id}>{cat.name}</option>
           {/each}
         </select>
-        {#if newCategory}
-          <span class="dir-hint" title="Resolved save directory">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
-            </svg>
-            <code>{resolveDirFor(newCategory)}</code>
-          </span>
-        {/if}
-        <label class="chk-toggle">
-          <input type="checkbox" bind:checked={showChecksum} />
-          checksum
-        </label>
-        {#if showChecksum}
-          <select
-            class="cat-select"
-            style="flex:0 0 auto;width:auto"
-            bind:value={checksumAlgo}
-            aria-label="Checksum algorithm"
-          >
-            {#each CHECKSUM_ALGOS as algo}
-              <option value={algo.value}>{algo.label}</option>
-            {/each}
-          </select>
-          <input class="grow" style="flex:1 1 160px" placeholder="expected hash (hex)" bind:value={checksumExpected} />
-        {/if}
+        <button
+          class="more-toggle"
+          on:click={() => (showAdvanced = !showAdvanced)}
+          aria-expanded={showAdvanced}
+          title="Checksum, per-download speed limit"
+        >
+          {showAdvanced ? "Less ▴" : "More ▾"}
+        </button>
+        <button
+          class="btn btn-primary"
+          disabled={!isUrl(url.trim())}
+          title={isUrl(url.trim()) ? "Add this URL" : "Enter a complete http(s) URL"}
+          on:click={() => add(url, newCategory || null, currentChecksum())}
+        >
+          Add
+        </button>
       </div>
 
-      <div class="add-sub">
-        <span class="eyebrow" style="align-self:center">Speed cap</span>
-        <div class="cap-chips">
-          <button class="chip-btn" class:on={globalLimitMB === ""} on:click={() => presetLimit(null)}>∞</button>
-          <button class="chip-btn" class:on={globalLimitMB === "5"} on:click={() => presetLimit(5)}>5 MB/s</button>
-          <button class="chip-btn" class:on={globalLimitMB === "20"} on:click={() => presetLimit(20)}>20 MB/s</button>
-          <button class="chip-btn" class:on={globalLimitMB === "50"} on:click={() => presetLimit(50)}>50 MB/s</button>
+      {#if showAdvanced}
+        <div class="add-sub">
+          {#if newCategory}
+            <span class="dir-hint" title="Resolved save directory">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+              </svg>
+              <code>{resolveDirFor(newCategory)}</code>
+            </span>
+          {/if}
+          <label class="chk-toggle">
+            <input type="checkbox" bind:checked={showChecksum} />
+            Checksum
+          </label>
+          {#if showChecksum}
+            <select
+              class="cat-select"
+              style="flex:0 0 auto;width:auto"
+              bind:value={checksumAlgo}
+              aria-label="Checksum algorithm"
+            >
+              {#each CHECKSUM_ALGOS as algo}
+                <option value={algo.value}>{algo.label}</option>
+              {/each}
+            </select>
+            <input class="grow" style="flex:1 1 160px" placeholder="expected hash (hex)" bind:value={checksumExpected} />
+          {/if}
+          <span class="sub-label">Limit this download</span>
+          <div class="cap-chips">
+            <button class="chip-btn" class:on={newLimitMB === ""} on:click={() => presetNewLimit(null)}>∞</button>
+            <button class="chip-btn" class:on={newLimitMB === "5"} on:click={() => presetNewLimit(5)}>5 MB/s</button>
+            <button class="chip-btn" class:on={newLimitMB === "20"} on:click={() => presetNewLimit(20)}>20 MB/s</button>
+            <button class="chip-btn" class:on={newLimitMB === "50"} on:click={() => presetNewLimit(50)}>50 MB/s</button>
+          </div>
+          <input
+            class="grow"
+            style="flex:0 1 120px"
+            type="number"
+            min="0"
+            placeholder="custom"
+            aria-label="Per-download speed limit in MB per second"
+            bind:value={newLimitMB}
+            on:input={() => (error = "")}
+          />
         </div>
-        <input
-          class="grow"
-          style="flex:0 1 150px"
-          type="number"
-          min="0"
-          placeholder="custom MB/s"
-          bind:value={globalLimitMB}
-          on:change={applyLimitMB}
-        />
-      </div>
+      {/if}
 
       {#if $clipboardUrl}
         <div class="add-sub">
@@ -987,32 +965,21 @@
       {#if error}
         <div class="err">{error}</div>
       {/if}
-    </section>
+    </div>
 
-    <!-- ── Throughput ────────────────────────────────────────── -->
-    <section class="panel throughput">
-      <div>
-        <div class="tp-head">
-          <div>
-            <div class="eyebrow">Aggregate throughput</div>
-            <div class="big-rate">{fmtRate($aggregateSpeed).split(" ")[0]}<span class="unit">{fmtRate($aggregateSpeed).split(" ")[1]}</span></div>
-          </div>
-          <div class="tp-stats">
-            <div><span class="tp-num">{$counts.active}</span><span class="tp-lbl">active</span></div>
-            <div><span class="tp-num">{fmtBytes($totalDownloaded)}</span><span class="tp-lbl">downloaded</span></div>
-            <div><span class="tp-num">{$globalSpeedLimitLabel}</span><span class="tp-lbl">cap</span></div>
-          </div>
-        </div>
-        <div class="tp-graph">
-          <SpeedGraph speed={$aggregateSpeed} />
-        </div>
-      </div>
-    </section>
-
-    <!-- ── List ─────────────────────────────────────────────── -->
-    <div class="list-head">
-      <span class="h">{$searchQuery ? `Results for "${$searchQuery}"` : headerTitle}</span>
-      <span class="n">{visible.length} shown · {$downloads.length} total</span>
+    <!-- ── Ledger column header (grid aligned with DownloadRow) ─ -->
+    <div class="col-head" aria-hidden="true">
+      <span></span>
+      <span></span>
+      <span class="ch-name">
+        {#if $searchQuery}Results{:else}Name{/if}
+      </span>
+      <span class="ch">Progress</span>
+      <span class="ch r">Size</span>
+      <span class="ch r c-speed">Speed</span>
+      <span class="ch r c-eta">ETA</span>
+      <span class="ch">Status</span>
+      <span></span>
     </div>
 
     {#if visible.length === 0}
@@ -1027,12 +994,12 @@
           <h3>Nothing here yet</h3>
           <p>Paste a URL above, or drop a link anywhere in the window to start a download.</p>
           <div class="hint-row">
-            <kbd>⌘K</kbd> open search
-            <kbd>⌘N</kbd> new download
+            <kbd>{isMac ? "⌘K" : "Ctrl K"}</kbd> open search
+            <kbd>{isMac ? "⌘N" : "Ctrl N"}</kbd> new download
             <kbd>drop</kbd> any link
           </div>
         {:else}
-          <h3>Empty {filter} list</h3>
+          <h3>Nothing in this view</h3>
           <p>Switch filters or start a new download.</p>
         {/if}
       </div>
@@ -1043,7 +1010,7 @@
         on:action={onBulkAction}
       />
       {#each visible as d, i (d.id)}
-        <div animate:flip={{ duration: 280 }} in:fly={{ y: 8, duration: 280, easing: cubicOut }}>
+        <div animate:flip={{ duration: 180 }}>
           <DownloadRow
             download={d}
             selectable
@@ -1057,8 +1024,7 @@
         </div>
       {/each}
     {/if}
-  </main>
-</div>
+</main>
 
 <!-- ── Settings drawer ───────────────────────────────────────── -->
 {#if $showSettings}
@@ -1090,6 +1056,15 @@
       showToast({ kind: "info", title: `Removed ${done.length} completed` });
     }
   }}
+  on:select-download={(e) => {
+    // The palette's download mode used to dispatch this event into the
+    // void. Filter the ledger to the chosen name so the row is the only
+    // thing on screen (and clear a filter that might hide it).
+    const d = $downloads.find((x) => x.id === e.detail.id);
+    if (!d) return;
+    activeFilter.set("all");
+    searchQuery.set(d.filename || d.url);
+  }}
 />
 
 <!-- ── Toasts ────────────────────────────────────────────────── -->
@@ -1111,7 +1086,7 @@
      and is not persisted to SQLite. -->
 <AuthDialog />
 
-<!-- ── Status bar ────────────────────────────────────────────── -->
+<!-- ── Status bar (aggregate metrics + sparkline) ──────────────── -->
 <StatusBar />
 
 <!-- ── Drop veil ─────────────────────────────────────────────── -->

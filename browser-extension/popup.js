@@ -10,8 +10,9 @@
 //   * The status line said "port 9157" even on the Firefox
 //     native-messaging transport, where there is no port.
 //
-// The status pill shows the *headline*; when the host is down we also
-// surface a more visible error block with the actual
+// The title row shows the host state as a dot + label, with a single
+// line of detail beneath it; when the host is down we also surface a
+// more visible error block with the actual
 // `chrome.runtime.lastError.message` Firefox/Chrome returned. On
 // Firefox that message is usually the generic "No such native
 // application com.app.dm.native" — which means the host manifest
@@ -22,6 +23,9 @@
 // without opening the browser console.
 const status = document.getElementById("status");
 const errDetail = document.getElementById("err-detail");
+const hostDot = document.getElementById("host-dot");
+const hostLabel = document.getElementById("host-label");
+const hostState = document.getElementById("host-state");
 const openBtn = document.getElementById("open");
 const grabBtn = document.getElementById("grab");
 const optClick = document.getElementById("opt-click");
@@ -102,6 +106,33 @@ function headline(connected, kind) {
   if (kind === "background") return "✗ Extension background isn't running.";
   if (kind === "blocked") return "✗ The browser blocked the connection to DM.";
   return "✗ DM host not running.";
+}
+
+/**
+ * The title row carries the host state as a dot *and* a word, so the
+ * connection is legible without reading the one-line detail or relying
+ * on colour alone (docs/UI_DESIGN_PLAN.md §1, §9). `state === null` is
+ * the pre-first-probe case.
+ */
+function setHostState(state, connected, kind) {
+  if (!hostDot || !hostLabel) return;
+  clearChildren(hostLabel);
+  if (!state) {
+    hostDot.className = "host-dot checking";
+    appendText(hostLabel, "Checking…");
+    if (hostState) hostState.title = "Checking host connection";
+    return;
+  }
+  hostDot.className = `host-dot ${connected ? "ok" : "err"}`;
+  const label = connected ? "Connected" : "Disconnected";
+  appendText(hostLabel, label);
+  const detail = connected
+    ? `DM host connected — ${transportLabel(state.transportKind)}.`
+    : headline(false, kind);
+  if (hostState) {
+    hostState.title = detail;
+    hostState.setAttribute("aria-label", `Host status: ${label}. ${detail}`);
+  }
 }
 
 /**
@@ -248,35 +279,39 @@ function setStatus(state, pendingNote) {
 
   if (!state) {
     status.className = "";
+    status.title = "Checking…";
     appendText(status, "Checking…");
+    setHostState(null, false, null);
     return;
   }
 
   const connected = !!state.connected;
   const kind = connected ? null : failureKind(state);
   status.className = pendingNote ? pendingNote.cls : connected ? "ok" : "err";
-  appendText(
-    status,
-    connected
-      ? `✓ DM host connected — ${transportLabel(state.transportKind)}.\n`
-      : `${headline(false, kind)}\n`,
-  );
 
+  // One line under the title: headline, throughput readout and any
+  // transient note share a row. It is ellipsised visually but kept in
+  // full in `title`; the real diagnosis stays in #err-detail.
+  const parts = [
+    connected
+      ? `✓ DM host connected — ${transportLabel(state.transportKind)}.`
+      : headline(false, kind),
+  ];
   if (connected) {
     const sent = state.lastSentCount || 0;
     const ago =
       state.lastSentAt > 0
         ? `${Math.round((Date.now() - state.lastSentAt) / 1000)}s ago`
         : "never";
-    appendText(
-      status,
-      `Sent ${sent} ${sent === 1 ? "request" : "requests"} (last: ${ago}).\n`,
+    parts.push(
+      `Sent ${sent} ${sent === 1 ? "request" : "requests"} (last: ${ago}).`,
     );
   }
-
-  if (pendingNote) {
-    appendText(status, pendingNote.text);
-  }
+  if (pendingNote) parts.push(pendingNote.text);
+  const line = parts.join(" ");
+  appendText(status, line);
+  status.title = line;
+  setHostState(state, connected, kind);
 
   if (connected) {
     // The "Open DM app" button can't actually launch a Tauri app

@@ -2,35 +2,38 @@
   import { onMount, onDestroy } from "svelte";
   import uPlot from "uplot";
   import "uplot/dist/uPlot.min.css";
+  import { effectiveThemeStore } from "./stores/ui";
 
   // Current aggregate speed in bytes/sec, supplied by the parent. The
-  // component samples it once per second into a rolling window and renders the
-  // history as a soft gradient area chart that matches the app's mint accent.
+  // component samples it once per second into a rolling window and
+  // renders it as a quiet sparkline (line only — the meter language of
+  // docs/UI_DESIGN_PLAN.md).
   export let speed = 0;
 
   let el: HTMLDivElement;
   let plot: uPlot | undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
+  let unsubscribeTheme: (() => void) | undefined;
 
   const MAX_POINTS = 90;
   const xs: number[] = [];
   const ys: number[] = [];
 
-  const ACCENT = "#7af0c8";
-
-  function fmtRate(bps: number): string {
-    const kb = bps / 1024;
-    if (kb < 1024) return kb.toFixed(0) + " KB/s";
-    const mb = kb / 1024;
-    if (mb < 1024) return mb.toFixed(2) + " MB/s";
-    return (mb / 1024).toFixed(2) + " GB/s";
+  // uPlot paints into a <canvas>, so a colour captured at mount would
+  // outlive the theme that produced it. `series.stroke` and
+  // `axes[].grid.stroke` accept functions that uPlot re-evaluates on
+  // every draw; resolving the custom properties there keeps the line
+  // and the gridline in sync with `<html data-theme>` — for manual
+  // switches as well as an OS preference flip in "system" mode.
+  function cssColor(name: string, fallback: string): () => string {
+    return () => getComputedStyle(el).getPropertyValue(name).trim() || fallback;
   }
 
   onMount(() => {
-    const width = el.clientWidth || 600;
     const opts: uPlot.Options = {
-      width,
-      height: 150,
+      width: el.clientWidth || 240,
+      height: 28,
+      padding: [2, 0, 0, 0],
       cursor: { show: false },
       scales: { x: { time: false } },
       legend: { show: false },
@@ -38,33 +41,34 @@
         {},
         {
           label: "Speed",
-          stroke: ACCENT,
-          width: 2,
-          fill: (u: uPlot) => {
-            const ctx = u.ctx;
-            const g = ctx.createLinearGradient(0, u.bbox.top, 0, u.bbox.top + u.bbox.height);
-            g.addColorStop(0, "rgba(122,240,200,0.30)");
-            g.addColorStop(1, "rgba(122,240,200,0)");
-            return g;
-          },
+          stroke: cssColor("--color-primary", "#41c9a2"),
+          width: 1.5,
+          fill: undefined,
           points: { show: false },
-          value: (_u: uPlot, v: number | null) => (v == null ? "--" : fmtRate(v)),
         },
       ],
       axes: [
         { show: false },
         {
-          show: true,
-          stroke: "rgba(255,255,255,0.28)",
-          grid: { show: true, stroke: "rgba(255,255,255,0.05)", width: 1 },
-          ticks: { show: false },
-          font: "11px 'JetBrains Mono', monospace",
-          size: 50,
-          values: (_u: uPlot, vals: (string | number | null)[]) =>
-            vals.map((v) => fmtRate(Number(v))),
+          show: false,
+          grid: {
+            show: true,
+            stroke: cssColor(
+              "--color-border-2",
+              "rgba(255,255,255,0.05)",
+            ),
+            width: 1,
+          },
         },
       ],
     };
+    // The colours are already live, but force a repaint on the switch
+    // itself instead of waiting up to a second for the next sample.
+    // Skip the store's initial emission and the empty-data case: the
+    // first sample draws with the current theme on its own.
+    unsubscribeTheme = effectiveThemeStore.subscribe(() => {
+      if (xs.length > 0) plot?.redraw();
+    });
     plot = new uPlot(opts, [[], []], el);
 
     timer = setInterval(() => {
@@ -79,6 +83,7 @@
   });
 
   onDestroy(() => {
+    unsubscribeTheme?.();
     if (timer) clearInterval(timer);
     plot?.destroy();
     plot = undefined;
@@ -95,9 +100,6 @@
   }
   .plot {
     width: 100%;
-    height: 150px;
-  }
-  .plot :global(canvas) {
-    border-radius: 12px;
+    height: 28px;
   }
 </style>

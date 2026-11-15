@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { showCommandPalette, sidebarCollapsed } from "../stores/ui";
+  import { showCommandPalette } from "../stores/ui";
   import { onMount } from "svelte";
 
   let isMac = false;
@@ -12,9 +12,9 @@
   }
 </script>
 
+<!-- Compact command-palette trigger for the top bar. -->
 <button
   class="search-trigger"
-  class:collapsed={$sidebarCollapsed}
   on:click={open}
   aria-label="Open command palette"
   title="Search or run a command…"
@@ -30,27 +30,29 @@
   .search-trigger {
     display: inline-flex;
     align-items: center;
-    gap: 8px;
-    width: 100%;
-    padding: 7px 10px;
-    background: var(--surface-hover);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    color: var(--faint);
+    gap: 7px;
+    width: 240px;
+    height: 28px;
+    padding: 0 8px;
+    background: var(--color-surface-hover);
+    border: 1px solid var(--color-border-2);
+    border-radius: var(--radius-sm);
+    color: var(--color-faint);
     font-family: inherit;
-    font-size: 12.5px;
+    font-size: 12px;
     cursor: pointer;
-    transition: all 0.15s;
+    transition:
+      border-color 0.12s var(--easing-out),
+      color 0.12s var(--easing-out);
     overflow: hidden;
   }
   .search-trigger:hover {
-    background: var(--surface-active);
-    border-color: var(--border-strong);
-    color: var(--muted);
+    border-color: var(--color-border-strong);
+    color: var(--color-muted);
   }
   .ico {
-    width: 14px;
-    height: 14px;
+    width: 13px;
+    height: 13px;
     flex: none;
   }
   .lbl {
@@ -62,29 +64,8 @@
   }
   .hint {
     font-family: var(--font-mono);
-    font-size: 10px;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 1px 5px;
-    color: var(--faint);
+    font-size: 11px;
+    color: var(--color-faint);
     flex: none;
-  }
-  /* Collapsed mode — icon-only pill, square aspect */
-  .search-trigger.collapsed {
-    width: 38px;
-    height: 38px;
-    padding: 0;
-    justify-content: center;
-    margin: 0 auto;
-    border-radius: 10px;
-  }
-  .search-trigger.collapsed .lbl,
-  .search-trigger.collapsed .hint {
-    display: none;
-  }
-  .search-trigger.collapsed .ico {
-    width: 16px;
-    height: 16px;
   }
 </style>
