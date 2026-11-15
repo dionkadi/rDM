@@ -123,6 +123,16 @@ const MUTATIONS = [
     pattern: "popup: title-row dot",
   },
   {
+    name: "ui  drop the prose from Firefox host hints again",
+    file: "popup.js",
+    find:
+      '    if (typeof part === "string") {\n      appendText(parent, part);\n      continue;\n    }',
+    replace:
+      '    if (typeof part === "string") {\n      continue;\n    }',
+    test: "test/integration.test.mjs",
+    pattern: "popup: host hint prose survives every diagnostic branch",
+  },
+  {
     name: "ship  let a manifest without a service worker reach Chrome",
     file: "scripts/make-chrome-manifest.mjs",
     find: '  out.background = { service_worker: "background.js" };',

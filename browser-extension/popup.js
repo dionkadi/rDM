@@ -42,15 +42,28 @@ function appendText(parent, text) {
 }
 
 /**
- * Render an HTML-ish string built from a structured array of
- * `{tag, attrs, text}` nodes into `parent` using safe DOM
- * construction. We use this so the hint strings can mention
- * `<code>...</code>` and `<b>...</b>` for readability without
- * resorting to `innerHTML` (which the project's linter flags as
- * XSS-prone). All `text` values are escaped.
+ * Render an HTML-ish string built from an array of `{tag, attrs, text}`
+ * nodes *and plain strings* into `parent` using safe DOM construction.
+ * We use this so the hint strings can mention `<code>...</code>` and
+ * `<b>...</b>` for readability without resorting to `innerHTML` (which
+ * the project's linter flags as XSS-prone). All text is escaped by
+ * `createTextNode`.
+ *
+ * Strings are text nodes. Several `hintForError` branches mix prose and
+ * `<code>` fragments in the same array; treating a string as a node
+ * object used to call `createElement(undefined)`, which silently dropped
+ * the whole sentence and left empty `<undefined>` elements behind.
  */
 function renderMarkup(parent, parts) {
   for (const part of parts) {
+    if (typeof part === "string") {
+      appendText(parent, part);
+      continue;
+    }
+    if (!part || typeof part !== "object" || typeof part.tag !== "string") {
+      // Fail loudly instead of building a meaningless element.
+      throw new TypeError("renderMarkup: invalid node " + String(part));
+    }
     const el = document.createElement(part.tag);
     if (part.attrs) {
       for (const [k, v] of Object.entries(part.attrs)) {

@@ -84,6 +84,57 @@ async function pollOnce(clock) {
   await clock.advance(2000);
 }
 
+/**
+ * Drive only the popup with a specific background error, so every
+ * `hintForError` branch can be exercised without depending on which
+ * transport the background happened to fall back to. The popup's first
+ * `get-status` probe races this listener registration (cold start), so
+ * we let the 80/200/400 ms retry budget play out before asserting.
+ */
+async function popupWithHostError(lastError) {
+  const clock = createClock(START);
+  const ctl = createChromeMock({ tabs: [{ id: 1, hasContentScript: true }] });
+  const doc = new FakeDocument();
+  const els = {};
+  for (const id of [
+    "status", "err-detail", "host-dot", "host-label", "host-state",
+    "open", "grab", "test", "opt-click", "opt-takeover",
+  ]) {
+    els[id] = doc.register(id, new FakeElement("div"));
+  }
+  loadExtension(["popup.js"], {
+    chrome: ctl,
+    clock,
+    document: doc,
+    location: { href: PAGE, protocol: "https:" },
+    navigator: { userAgent: "UA" },
+  });
+  ctl.chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
+    if (msg && msg.type === "get-status") {
+      reply({
+        state: {
+          connected: false,
+          transportKind: "native",
+          lastSentAt: 0,
+          lastSentCount: 0,
+          lastError,
+        },
+      });
+      return true;
+    }
+    return false;
+  });
+  // Cold-start retries (680 ms) plus the 1.5 s poll tick.
+  await clock.advance(3000);
+  return els;
+}
+
+function collectTags(node, out = []) {
+  if (node.tagName) out.push(node.tagName);
+  for (const child of node.children || []) collectTags(child, out);
+  return out;
+}
+
 function click(doc, href, over = {}) {
   const { anchor, event } = makeClick(href, over);
   doc.documentElement.dispatch("click", event);
@@ -356,6 +407,37 @@ test("a host that refuses the connection points at the probe", async () => {
 // bottom. Both states are pinned separately: the background reconnects
 // eagerly, so driving one boot through "down → up" is not a stable
 // sequence to assert against.
+test("popup: host hint prose survives every diagnostic branch", async () => {
+  // R2-01: four hintForError branches mix plain prose strings with
+  // {tag, text} nodes. renderMarkup used to call createElement(undefined)
+  // on the strings, silently dropping the entire repair instruction and
+  // leaving empty <undefined> elements. Firefox users got a run-together
+  // list of paths instead of a diagnosis.
+  const cases = [
+    [
+      "No such native application com.app.dm.native",
+      /Firefox can't find a valid host manifest/,
+    ],
+    ["Host executable not found", /The host manifest points to a binary/],
+    [
+      "Access denied for native messaging host",
+      /The extension isn't allowed to use this host/,
+    ],
+    ["Host manifest is malformed", /The host manifest is malformed/],
+  ];
+  for (const [message, expected] of cases) {
+    const els = await popupWithHostError(message);
+    const detail = textOf(els["err-detail"]);
+    assert.match(detail, /Browser said: /, message);
+    assert.match(detail, expected, message);
+    assert.equal(
+      collectTags(els["err-detail"]).filter((t) => t === "UNDEFINED").length,
+      0,
+      `${message} must not create <undefined> elements`,
+    );
+  }
+});
+
 test("popup: title-row dot reads Disconnected when the host is down", async () => {
   const { clock, els } = bootAll({ popup: true });
   await settle(clock);

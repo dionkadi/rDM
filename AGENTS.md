@@ -9,7 +9,8 @@ Working contract for **AI coding agents and code contributors**. Read this befor
 | `README.md` | humans evaluating / using DM | product pitch, install, quick start, usage, releasing, contributing |
 | `AGENTS.md` (this) | agents & contributors in the repo | exact commands, conventions, invariants, gotchas, verification |
 | `docs/UI_DESIGN_PLAN.md` | anyone touching UX | visual system + information-architecture target |
-| `docs/UI_REVIEW.md` | anyone auditing UX | dated issue list, severity/priority, v2.1 change record |
+| `docs/UI_REVIEW.md` | anyone auditing UX | first-round dated issue list, severity/priority, v2.1 change record |
+| `docs/UI_REVIEW_ROUND2.md` | anyone auditing UX | second-round issue list (failure paths, keyboard, lifecycle, contrast), reproductions and fix order |
 | `CHANGELOG.md` / `RELEASE_NOTES.md` | users & maintainers | version history, bug narratives |
 | `TODO.md` | contributors | roadmap by maturity tier |
 

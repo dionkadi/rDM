@@ -705,30 +705,30 @@
   // We also stash the previous `overflow` value so we can restore it
   // on close (rather than blindly clearing it — the Tauri webview
   // may have a non-default `overflow` we shouldn't clobber).
+  //
+  // The lock is **idempotent**, not reference-counted. The reactive
+  // statement below re-runs on every change of either store, including
+  // transitions where one panel closes while the other stays open
+  // (e.g. "Open settings" from the palette). A `lockCount++` there
+  // used to leak an unpaired lock and leave the page unscrollable
+  // after all panels were dismissed. Only a real false→true / true→
+  // false change should touch the DOM.
   let prevBodyOverflow = "";
   let prevHtmlOverflow = "";
-  let lockCount = 0;
-  function lockBodyScroll() {
-    if (typeof document === "undefined") return;
-    if (lockCount === 0) {
-      const body = document.body;
-      const html = document.documentElement;
+  let scrollLocked = false;
+  function setBodyScrollLocked(locked: boolean) {
+    if (typeof document === "undefined" || locked === scrollLocked) return;
+    scrollLocked = locked;
+    const body = document.body;
+    const html = document.documentElement;
+    if (locked) {
       prevBodyOverflow = body.style.overflow;
       prevHtmlOverflow = html.style.overflow;
       // `!important` via `setProperty` so a stray per-element rule
       // (e.g. a body class added by an extension) can't override us.
       body.style.setProperty("overflow", "hidden", "important");
       html.style.setProperty("overflow", "hidden", "important");
-    }
-    lockCount++;
-  }
-  function unlockBodyScroll() {
-    if (typeof document === "undefined") return;
-    if (lockCount === 0) return;
-    lockCount--;
-    if (lockCount === 0) {
-      const body = document.body;
-      const html = document.documentElement;
+    } else {
       body.style.removeProperty("overflow");
       html.style.removeProperty("overflow");
       // Fallback in case the rules came from a stylesheet, not
@@ -738,11 +738,7 @@
     }
   }
   $: if (typeof window !== "undefined") {
-    if ($showSettings || $showCommandPalette) {
-      lockBodyScroll();
-    } else {
-      unlockBodyScroll();
-    }
+    setBodyScrollLocked($showSettings || $showCommandPalette);
   }
 
   onMount(() => {
@@ -828,7 +824,7 @@
     // make sure we don't leave the document with `overflow: hidden`
     // — that would render the next launch as a non-scrolling page
     // until the user happens to toggle a panel.
-    while (lockCount > 0) unlockBodyScroll();
+    setBodyScrollLocked(false);
   });
 </script>
 
