@@ -29,10 +29,9 @@
   // downloading one file from a site that needs login",
   // not "every future download uses these credentials".
 
-  import { onMount } from "svelte";
-  import { fly, fade } from "svelte/transition";
-  import { cubicOut } from "svelte/easing";
+  import { fade } from "svelte/transition";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
+  import { focusTrap } from "../utils/focusTrap";
   import type { Download, BrowserKind, CookieImportResult } from "../types";
   import * as api from "../api";
   import { showToast } from "../stores/ui";
@@ -308,21 +307,19 @@
     }
   }
 
-  onMount(() => {
-    // No-op: the form is reset on each `visible` change.
-  });
 </script>
 
 <svelte:window on:keydown={onKeydown} />
 
 {#if visible}
-  <div class="backdrop" transition:fade={{ duration: 150 }} aria-hidden="true"></div>
+  <div class="backdrop" transition:fade={{ duration: 120 }} aria-hidden="true"></div>
   <div
     class="modal"
     role="dialog"
     aria-modal="true"
     aria-labelledby="auth-title"
-    transition:fly={{ y: 12, duration: 200, easing: cubicOut }}
+    use:focusTrap
+    transition:fade={{ duration: 120 }}
   >
     <header class="hd">
       <div class="icn" aria-hidden="true">

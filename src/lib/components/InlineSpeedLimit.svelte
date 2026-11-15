@@ -18,6 +18,10 @@
   }
 
   function commit() {
+    // Enter in a single-input form fires both the keydown handler and
+    // an implicit submit, and removing the form fires blur. Guard so
+    // `set-limit` is only dispatched once.
+    if (!editing) return;
     const v = inputValue.trim();
     if (v === "") {
       dispatch("change", null);
@@ -35,8 +39,10 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
-    if (e.key === "Enter") commit();
-    else if (e.key === "Escape") cancel();
+    if (e.key === "Enter") {
+      e.preventDefault();
+      commit();
+    } else if (e.key === "Escape") cancel();
   }
 
   $: label = value == null ? null : (value / (1024 * 1024)).toFixed(value < 1024 * 1024 ? 0 : 1);
@@ -53,6 +59,7 @@
       type="number"
       min="0"
       step="0.1"
+      aria-label="Speed limit in MB/s"
       placeholder="MB/s"
       bind:value={inputValue}
       on:blur={commit}

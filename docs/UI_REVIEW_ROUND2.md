@@ -139,21 +139,26 @@ $: if (typeof window !== "undefined") {
 | light success / panel | 5.32 | dark category binary | 5.74 |
 | dark faint / bg | 5.82 | focus-visible outline（实心 accent） | 5.30 / 7.75 |
 
-**结论**：§9 的"文字 ≥4.5:1"和"focus-visible 双主题可见"成立；不达标的是 R2-15 所述的**控件边界**（1.2–1.6:1）。上一轮把浅色 `--faint` 提到 `#676E7C` 确实解决了对比不足。
+**结论**：§9 的"文字 ≥4.5:1"和"focus-visible 双主题可见"成立；修复前不达标的是 R2-15 所述的**控件边界**（1.2–1.6:1）。上一轮把浅色 `--faint` 提到 `#676E7C` 确实解决了对比不足。
+
+**阶段 3 修复后复算**：控件边界改用 `--control-border`（别名指向 `--color-faint`），浅色 5.12:1（panel）/ 4.70:1（bg），深色 5.33:1 / 5.82:1；`:focus` 边框改为实心 accent，5.30:1 / 7.75:1。四组全部 ≥3:1，§9 的承诺现在成立。
 
 ## 已验证通过（本轮复跑）
 
 | 检查 | 结果 |
 |---|---|
-| `npm run check`（沙箱需 `NODE_OPTIONS=--unhandled-rejections=warn`） | 0 errors / 0 warnings |
-| `node scripts/check-css-vars.mjs` | OK，715 处 `var()` / 136 个属性 |
-| `node --test test/*.test.mjs` | 106 passed / 0 failed（但有 R2-05 的覆盖盲区） |
-| `git status` | 干净，基线为 `a94937e` |
+| `npm run check`（沙箱需 `NODE_OPTIONS=--unhandled-rejections=warn`） | 0 errors / 0 warnings（三个阶段均复跑） |
+| `node scripts/check-css-vars.mjs` | 阶段 3 后 OK，712 处 `var()` / 130 个属性（删掉死 token 后相应减少） |
+| `node --test test/*.test.mjs` | 阶段 3 后 109 passed / 0 failed，十个 hint 分支全部有断言 |
+| `node test/mutation-check.mjs` | 27/27 caught |
+| `vite build` | 三个阶段均成功（沙箱配置跳过两个 WASM-only import-analysis 插件） |
+| `cargo test -p dm-engine` | 三个阶段均 118 passed / 0 failed |
+| `git status` | 每个阶段提交后干净；审查基线为 `a94937e` |
 | #27 折线换色主机制 | 成立：uPlot `cacheStrokeFill` 每次 `drawSeries` 求值；`applyTheme` 先改 `data-theme` 再 `.set()`；`redraw` 有 `xs.length > 0` 守卫 |
 | #28 状态点主机制 | 成立：两条新回归测试分别钉住断开 / 连接态的 `className`、文字与 `title` |
 | 上一轮 30 项 | 未发现"标为已修但实际未修"的回退 |
 
-未复跑：`cargo test -p dm-engine`（本轮无 Rust 改动，沿用 `a94937e` 提交时的全绿结果）、`vite build`（沙箱 WASM 限制，见 `UI_REVIEW.md` 验证表）、截图级双主题目检（沙箱无法启动 WebView，**仍是最高优先级的未完成验证**）。
+三个阶段均按要求"改完 → 全套验证 → 单独提交"推进，每阶段一个独立 commit（P0 为 `37bc831`，P1 为 `c35184c`，P2 见 `git log`）。`vite build` 在沙箱内使用 `.pi/` 下 gitignored 的临时配置（跳过两个需要 WASM 的 import-analysis 插件），不入库。**截图级双主题目检仍未执行**：沙箱无法启动 WebView，这仍是最高优先级的未完成验证，尤其应验证阶段 3 的焦点陷阱、对话框淡入、`--control-border` 在真实屏幕上的观感。
 
 ## 明确排除的疑点
 
@@ -181,8 +186,19 @@ $: if (typeof window !== "undefined") {
 |---|---|---|---|
 | 1 | P0：R2-01、R2-02 | 已修 | `svelte-check` 0/0；CSS vars OK；扩展 107/107；变异 26/26；`vite build` 82 modules；`cargo test -p dm-engine` 118 passed / 0 failed |
 | 2 | P1：R2-03 – R2-06 | 已修 | `svelte-check` 0/0；CSS vars OK；扩展 109/109；变异 27/27；`vite build`；`cargo test -p dm-engine` 118 passed；额外运行时验证计数/清理逻辑 |
-| 3 | P2：R2-07 – R2-17 | 待处理 | — |
+| 3 | P2：R2-07 – R2-17 | 已修 | `svelte-check` 0/0；CSS vars OK（712/130）；扩展 109/109；变异 27/27；`vite build`；`cargo test -p dm-engine` 118 passed；控件边界对比度复算全部 ≥3:1 |
 
 **阶段 1 实现要点**：`renderMarkup` 现在把字符串当文本节点、并对非法节点抛 `TypeError`；新增一个覆盖四个坏分支的回归测试与一条变异。`App.svelte` 的滚动锁从 `lockCount` 引用计数改为幂等的 `scrollLocked` 布尔，只有 false↔true 才动 DOM，`onDestroy` 用 `setBodyScrollLocked(false)` 兜底。
 
 **阶段 2 实现要点**：`updateSettings` 失败时同步复位限速标签；`refreshDownloads` 全量替换后 prune 选择集，`ui.ts` 注释改为明确的"跨筛选保留、随权威列表清理"语义。chip 计数与 smart folders 改由 `searchScope`（仅按搜索文本收窄）派生，状态栏继续用全库 `counts`；删除不可达的 `scheduled` FilterKey/case 与无人读取的 `counts.canceled` / `counts.scheduled`，§5 补上口径说明。fake DOM 现在对非法 tag 抛错，十个 `hintForError` 出口全部有断言，并新增一条针对该防线的变异。运行时验证：库内 4 行、搜索 `pdf` 后 chip 为 `All 1 / Done 1`，状态栏仍为 `All 4`。
+
+**阶段 3 实现要点**：
+- R2-07：删掉 `SpeedGraph` 里因 `axes.show:false` 永不执行的 `grid` 配置，组件注释与 §7 改为只承诺折线换色。
+- R2-08：`#host-state` 改为 `role="group"`（generic `<span>` 上的 `aria-label` 会被 AT 忽略），`aria-describedby` 指向可聚焦 `tabindex="0"` 的 `#status`；`setHostState` 统一处理 `!state` 分支，且只在文本真的变化时改写 ARIA 属性，避免 1.5 s 轮询重复播报。
+- R2-09 / R2-10：新增 `src/lib/utils/focusTrap.ts`，两个对话框与命令面板共用（焦点移入、Tab 陷阱、关闭后焦点恢复）；Auth/Capture 的 `fly` 改 `fade` 120 ms，backdrop 注释与实现对齐；命令面板不再劫持 Tab，模式切换统一走 `setMode()` 重置 `selectedIndex`，输入框补 `aria-label`。
+- R2-11 / R2-12 / R2-13 / R2-14：行支持 Space；`InlineSpeedLimit` 加 `editing` 守卫 + `preventDefault` + input 可访问名称；Toast 去掉嵌套 live region；`error` / `isLoading` 两个死 store 删除，刷新失败改为一次性 Toast，校验错误加 `role="alert"`。
+- R2-15：新增别名 `--control-border: var(--color-faint)` 用于输入/复选框边界，`:focus` 边框改实心 accent；§9 区分"控件边界 ≥3:1"与"装饰发丝线豁免"。
+- R2-16 / R2-17：删除零引用且已漂移的 `design-tokens.ts`、`.list-head`、`--divider-on-surface`、`--border-focus`、`globalSpeedLimit`、`clipboardMonitorEnabled`、`isMac` 及 6 个未使用工具函数；`initKeyboardShortcuts()` 的注销函数在 `onDestroy` 生效。模块级 `theme.subscribe` 属单例设计，保留。
+- 因 `setHostState` 重构，同步更新了 `mutation-check.mjs` 中该变异的匹配串，避免 stale pattern。
+
+**仍未处理**：截图级双主题目检（沙箱无 WebView）；`trash` 动作是否依赖 `Removed` 事件、Capture/Auth/dropveil 的背景滚动、列头 sticky 偏移对 38 px 的硬编码依赖，三者列为待确认。

@@ -73,7 +73,6 @@
 
   --status-bar-bg: #1a1d23;
   --topbar-bg: #17191e;
-  --divider-on-surface: rgba(255, 255, 255, 0.07);
 
   /* Native <select> chevron — a data URI cannot inherit currentColor,
      so both themes carry their own stroke value. */
@@ -148,7 +147,6 @@
 
   --status-bar-bg: #eef0f3;
   --topbar-bg: #f4f5f7;
-  --divider-on-surface: rgba(17, 20, 26, 0.08);
   --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%235f6673' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
 
   color-scheme: light;
@@ -225,6 +223,10 @@
   --text: var(--color-text);
   --muted: var(--color-muted);
   --faint: var(--color-faint);
+  /* Boundaries that identify a control must reach 3:1 (WCAG 1.4.11).
+     Decorative hairlines stay on --color-border; inputs/checkboxes use
+     this one, which inherits the theme's AA-compliant faint text colour. */
+  --control-border: var(--color-faint);
   --hair: var(--color-border);
   --hair-2: var(--color-border-2);
   --accent: var(--color-primary);
@@ -234,7 +236,6 @@
   --surface-active: var(--color-surface-active);
   --border: var(--color-border);
   --border-strong: var(--color-border-strong);
-  --border-focus: var(--color-border-focus);
   --text-muted: var(--color-muted);
   --text-faint: var(--color-faint);
   --color-text-muted: var(--color-muted);
@@ -390,7 +391,7 @@ input.cb,
   width: 14px;
   height: 14px;
   margin: 0;
-  border: 1px solid var(--color-border-strong);
+  border: 1px solid var(--control-border);
   border-radius: 3px;
   background: transparent;
   cursor: pointer;
@@ -516,7 +517,7 @@ input,
 select,
 textarea {
   background: var(--color-surface-solid);
-  border: 1px solid var(--color-border);
+  border: 1px solid var(--control-border);
   border-radius: var(--radius-sm);
   padding: 8px 11px;
   outline: none;
@@ -534,7 +535,7 @@ textarea::placeholder {
 input:focus,
 select:focus,
 textarea:focus {
-  border-color: var(--color-border-focus);
+  border-color: var(--color-primary);
   box-shadow: var(--shadow-glow);
 }
 select {
@@ -586,7 +587,7 @@ select {
 }
 .add-input:focus {
   background: var(--color-surface);
-  border-color: var(--color-border-focus);
+  border-color: var(--color-primary);
 }
 .add-sub {
   display: flex;
@@ -637,7 +638,7 @@ select {
   background-position: right 6px center;
 }
 .cat-select:focus {
-  border-color: var(--color-border-focus);
+  border-color: var(--color-primary);
   box-shadow: var(--shadow-glow);
 }
 .dir-hint {
@@ -805,29 +806,6 @@ select {
 }
 
 /* ── List ─────────────────────────────────────────────────── */
-.list-head {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  margin: 14px 2px 8px;
-}
-.list-head .h {
-  font-family: var(--font-display);
-  font-weight: 600;
-  font-size: 14px;
-}
-.list-head .n {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--color-faint);
-}
-.list-head .toolbar {
-  margin-left: auto;
-  display: flex;
-  gap: 4px;
-  align-items: center;
-}
-
 .empty {
   text-align: center;
   padding: 64px 20px;

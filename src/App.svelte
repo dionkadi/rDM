@@ -45,7 +45,6 @@
     showSettings,
     showCommandPalette,
     clipboardUrl,
-    clipboardMonitorEnabled,
     dragActive,
     demoMode,
     showToast,
@@ -642,11 +641,9 @@
   }
   function startClipboardMonitor() {
     stopClipboardMonitor();
-    clipboardMonitorEnabled.set(true);
     clipTimer = setInterval(checkClipboard, 2000);
   }
   function stopClipboardMonitor() {
-    clipboardMonitorEnabled.set(false);
     if (clipTimer) clearInterval(clipTimer);
     clipTimer = null;
   }
@@ -773,7 +770,7 @@
     })();
 
     // Global keyboard shortcuts
-    const unregister = registerShortcuts([
+    const unregisterShortcuts = registerShortcuts([
       {
         key: "k", ctrl: true, meta: true, description: "Open command palette", category: "Navigation",
         handler: () => showCommandPalette.update((v) => !v),
@@ -812,8 +809,13 @@
         },
       },
     ]);
-    initKeyboardShortcuts();
-    return unregister;
+    // initKeyboardShortcuts installs a window-level keydown listener;
+    // keep its disposer so teardown (and HMR) doesn't stack listeners.
+    const unregisterGlobal = initKeyboardShortcuts();
+    return () => {
+      unregisterShortcuts();
+      unregisterGlobal();
+    };
   });
 
   onDestroy(() => {
@@ -960,7 +962,7 @@
       {/if}
 
       {#if error}
-        <div class="err">{error}</div>
+        <div class="err" role="alert">{error}</div>
       {/if}
     </div>
 

@@ -186,7 +186,9 @@
     // otherwise Enter on "Pause" both clicks the button and expands
     // the row, which looks like a double action.
     if (e.target !== e.currentTarget) return;
-    if (e.key === "Enter") {
+    if (e.key === "Enter" || e.key === " " || e.key === "Spacebar") {
+      // `role="button"` promises both Enter and Space; without the
+      // Space branch the row only scrolls the page on a keypress.
       e.preventDefault();
       toggleExpand();
       return;

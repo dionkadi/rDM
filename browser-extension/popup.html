@@ -211,12 +211,21 @@
   <body>
     <div class="head">
       <h3><span class="logo" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v9m0 0l-3.4-3.4M12 13l3.4-3.4"/><path d="M5 19h14"/></svg></span>DM Grabber</h3>
-      <span id="host-state" class="host-state" title="Checking host connection">
+      <span
+        id="host-state"
+        class="host-state"
+        role="group"
+        aria-label="Host connection status"
+        aria-describedby="status"
+        title="Checking host connection"
+      >
         <span id="host-dot" class="host-dot checking" aria-hidden="true"></span>
         <span id="host-label">Checking…</span>
       </span>
     </div>
-    <p id="status" title="Checking…">Checking…</p>
+    <!-- The ellipsised line keeps its full text in `title` and is
+         focusable so keyboard/AT users can read it without hovering. -->
+    <p id="status" tabindex="0" title="Checking…">Checking…</p>
     <div id="err-detail" class="err-detail"></div>
     <button id="grab" class="primary">Grab page media</button>
     <div class="link-row">

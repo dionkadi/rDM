@@ -130,21 +130,28 @@ function headline(connected, kind) {
 function setHostState(state, connected, kind) {
   if (!hostDot || !hostLabel) return;
   clearChildren(hostLabel);
-  if (!state) {
-    hostDot.className = "host-dot checking";
-    appendText(hostLabel, "Checking…");
-    if (hostState) hostState.title = "Checking host connection";
-    return;
+  let dotClass = "checking";
+  let label = "Checking…";
+  let detail = "Checking host connection";
+  if (state) {
+    dotClass = connected ? "ok" : "err";
+    label = connected ? "Connected" : "Disconnected";
+    detail = connected
+      ? `DM host connected — ${transportLabel(state.transportKind)}.`
+      : headline(false, kind);
   }
-  hostDot.className = `host-dot ${connected ? "ok" : "err"}`;
-  const label = connected ? "Connected" : "Disconnected";
+  hostDot.className = `host-dot ${dotClass}`;
   appendText(hostLabel, label);
-  const detail = connected
-    ? `DM host connected — ${transportLabel(state.transportKind)}.`
-    : headline(false, kind);
   if (hostState) {
-    hostState.title = detail;
-    hostState.setAttribute("aria-label", `Host status: ${label}. ${detail}`);
+    // `#host-state` has role="group", so naming is allowed (a bare
+    // <span> is generic and its aria-label would be ignored). Only
+    // rewrite the attributes when the text actually changes — the
+    // popup polls every 1.5 s and must not re-announce a steady state.
+    const aria = `Host status: ${label}. ${detail}`;
+    if (hostState.title !== detail) hostState.title = detail;
+    if (hostState.getAttribute("aria-label") !== aria) {
+      hostState.setAttribute("aria-label", aria);
+    }
   }
 }
 

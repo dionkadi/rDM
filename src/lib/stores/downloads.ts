@@ -48,8 +48,6 @@ export function clearCaptures(): void {
 export const downloads = writable<Download[]>([]);
 export const speedMap = writable<Record<string, number>>({});
 export const aggregateSpeed = writable(0);
-export const isLoading = writable(false);
-export const error = writable("");
 
 // ── Live speed tracking ────────────────────────────────────────────
 const prevMap: Record<string, number> = {};
@@ -82,8 +80,12 @@ export function stopSpeedMonitor(): void {
 }
 
 // ── CRUD operations ────────────────────────────────────────────────
+// A failed refresh used to write into an `error` store nobody read.
+// Surface the first failure as a toast and stay quiet until a refresh
+// succeeds again, so a stopped engine cannot spam notifications.
+let refreshFailed = false;
+
 export async function refreshDownloads(): Promise<void> {
-  isLoading.set(true);
   try {
     const list = await api.listDownloads();
     // The server list is authoritative: if an id we were blocking for
@@ -124,11 +126,18 @@ export async function refreshDownloads(): Promise<void> {
     import("./ui").then((ui) =>
       ui.pruneSelection(new Set(visible.map((d) => d.id))),
     );
-    error.set("");
+    refreshFailed = false;
   } catch (e) {
-    error.set(String(e));
-  } finally {
-    isLoading.set(false);
+    if (!refreshFailed) {
+      refreshFailed = true;
+      void import("./ui").then((ui) =>
+        ui.showToast({
+          kind: "error",
+          title: "Couldn't refresh downloads",
+          message: String(e),
+        }),
+      );
+    }
   }
 }
 
@@ -151,7 +160,7 @@ export async function addDownload(opts: {
     await api.addDownload(opts);
     await refreshDownloads();
   } catch (e) {
-    error.set(String(e));
+    // The caller (add form / capture dialog) shows the error toast.
     throw e;
   }
 }
@@ -197,7 +206,7 @@ export async function addPairedDownloads(opts: {
     await refreshDownloads();
     return { firstId: first.id, secondId: second.id };
   } catch (e) {
-    error.set(String(e));
+    // The capture dialog shows the error toast.
     throw e;
   }
 }

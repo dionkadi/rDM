@@ -222,9 +222,10 @@ its grid column exactly (a 26 px column holding a 28 px tile caused a
 - **Status bar** (32 px): `active · ↓rate · ↓downloaded · limit · done/errors`.
   Labels use the UI face at 11 px; only the values use the readout face. Speed is
   neutral text, not a second green. With zero active rows the rate reads `—` and
-  the sparkline is omitted. The sparkline resolves its line/grid colours from
-  theme tokens at draw time, so a theme switch (including an OS preference flip
+  the sparkline is omitted. The sparkline resolves its line colour from the
+  theme token at draw time, so a theme switch (including an OS preference flip
   in `system` mode) repaints it immediately rather than leaving the old accent.
+  Both axes stay hidden — a grid stroke on a hidden axis is never drawn.
   Right side: demo flag when applicable. Truncates gracefully under 720 px.
 - **Selection bar**: floats 10 px above the status bar, max `calc(100vw - 24px)`,
   opaque `panel`, radius 12, `floating` shadow. Ghost 28 px actions; Resume is the
@@ -255,8 +256,11 @@ its grid column exactly (a 26 px column holding a 28 px tile caused a
   without glow; radius 8 for option cards.
 - **Extension popup** (300 px): title row = brand mark + `DM Grabber` on the
   left and the host state as a dot + word (`Connected` / `Disconnected` /
-  `Checking…`) on the right; one ellipsised status line beneath it, with the full
-  text in `title`. Primary button `Grab page media` (full-width, flat accent,
+  `Checking…`) on the right; the title row is a `role="group"` with an
+  accessible name, and one ellipsised status line sits beneath it. That line
+  keeps its full text in `title` and is focusable (`tabindex="0"`), so keyboard
+  and assistive-tech users can reach it without hovering. Primary button
+  `Grab page media` (full-width, flat accent,
   inverse text); host re-check / test as text buttons; two switch rows (no
   fieldset legend); error detail expands inline directly under the status line —
   there is no status block at the bottom. Same tokens as the app;
@@ -277,7 +281,11 @@ its grid column exactly (a 26 px column holding a 28 px tile caused a
 ## 9. Accessibility floor
 
 - Focus-visible ring = 2 px `accent` outline offset 2 (visible on both themes).
-- Contrast ≥ 4.5:1 for text, ≥ 3:1 for UI borders on both themes.
+- Contrast ≥ 4.5:1 for text; ≥ 3:1 for **control boundaries** that identify
+  an input or checkbox (`--control-border`, aliased to `--color-faint`, is
+  ~5:1 on both themes). Purely decorative hairline dividers stay at
+  `--color-border` and are exempt from WCAG 1.4.11. The focus-visible
+  outline uses the solid accent (5.30:1 light / 7.75:1 dark).
 - All icon buttons keep `aria-label`; rows keep `role="button"` + key handlers.
   Child controls stop Enter from bubbling to the row.
 - The status bar is **not** an `aria-live` region: it updates every second and
@@ -290,7 +298,7 @@ its grid column exactly (a 26 px column holding a 28 px tile caused a
 | File | Change |
 |---|---|
 | `src/app.css` | token rewrite (semantic palette, category hues, track/chevron, shell sizes), solid sticky chrome, ledger grid, 11 px labels |
-| `src/lib/design-tokens.ts` | sync to `app.css` (single source of truth = `app.css`; this file is the JS mirror) |
+| ~~`src/lib/design-tokens.ts`~~ | removed: zero references and drifted from `app.css` (breakpoints, row size, glow). `app.css` is the only token source |
 | `src/App.svelte` | bare add line + URL validation, per-download limit, filter semantics, floating selection room, no row entry animation |
 | `src/lib/stores/downloads.ts` | `counts.active` = bytes moving (downloading + connecting) |
 | `src/lib/stores/settings.ts` | hydrate/sync the global limit label |

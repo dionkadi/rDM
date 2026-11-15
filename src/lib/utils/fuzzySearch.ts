@@ -86,35 +86,3 @@ function scoreString(text: string, query: string): { score: number; matches: num
   return { score, matches };
 }
 
-export function highlightMatches(text: string, matches: number[]): string {
-  if (matches.length === 0) return escapeHtml(text);
-  const set = new Set(matches);
-  let out = "";
-  let inMatch = false;
-  for (let i = 0; i < text.length; i++) {
-    const isMatch = set.has(i);
-    if (isMatch && !inMatch) {
-      out += "<mark>";
-      inMatch = true;
-    } else if (!isMatch && inMatch) {
-      out += "</mark>";
-      inMatch = false;
-    }
-    out += escapeHtml(text[i]);
-  }
-  if (inMatch) out += "</mark>";
-  return out;
-}
-
-function escapeHtml(s: string): string {
-  return s.replace(/[&<>"']/g, (c) => {
-    const map: Record<string, string> = {
-      "&": "&amp;",
-      "<": "&lt;",
-      ">": "&gt;",
-      '"': "&quot;",
-      "'": "&#39;",
-    };
-    return map[c] || c;
-  });
-}

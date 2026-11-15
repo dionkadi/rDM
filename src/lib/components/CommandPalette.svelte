@@ -5,6 +5,7 @@
   import { downloads } from "../stores/downloads";
   import { fuzzySearch } from "../utils/fuzzySearch";
   import { fmtBytes } from "../utils/formatters";
+  import { focusTrap } from "../utils/focusTrap";
 
   const dispatch = createEventDispatcher();
 
@@ -18,7 +19,6 @@
   }
 
   let query = "";
-  let inputEl: HTMLInputElement;
   let selectedIndex = 0;
   let mode: "command" | "download" = "command";
 
@@ -45,12 +45,16 @@
       { id: "proxy-none", title: "Proxy: disable", category: "Network", icon: "M18 6L6 18M6 6l12 12", action: () => dispatch("action", { type: "set-proxy", mode: "none" }) },
       { id: "proxy-system", title: "Proxy: use system", category: "Network", icon: "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zM2 12h20", action: () => dispatch("action", { type: "set-proxy", mode: "system" }) },
       { id: "proxy-manual", title: "Proxy: manual…", category: "Network", icon: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z", action: () => dispatch("action", { type: "set-proxy", mode: "manual" }) },
-      { id: "search-downloads", title: "Search downloads…", category: "Navigation", icon: "M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16zM21 21l-4.35-4.35", action: () => { mode = "download"; } },
+      { id: "search-downloads", title: "Search downloads…", category: "Navigation", icon: "M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16zM21 21l-4.35-4.35", action: () => setMode("download") },
     ];
   }
 
-  $: if ($showCommandPalette) {
-    setTimeout(() => inputEl?.focus(), 50);
+  /** Switching modes changes the result set; a stale index would leave
+   *  no highlighted row and make Enter a no-op. Reset it with the query. */
+  function setMode(next: "command" | "download") {
+    mode = next;
+    query = "";
+    selectedIndex = 0;
   }
 
   function close() {
@@ -62,7 +66,7 @@
 
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === "Escape") {
-      if (mode === "download") { mode = "command"; query = ""; e.preventDefault(); }
+      if (mode === "download") { setMode("command"); e.preventDefault(); }
       else close();
     } else if (e.key === "ArrowDown") {
       e.preventDefault();
@@ -79,22 +83,22 @@
         dispatch("select-download", { id: downloadResults[selectedIndex].item.id });
         close();
       }
-    } else if (e.key === "Tab") {
-      e.preventDefault();
-      mode = mode === "command" ? "download" : "command";
     }
+    // Tab is intentionally left alone: the explicit Commands / Downloads
+    // buttons switch modes, and `use:focusTrap` keeps Tab inside the
+    // dialog instead of silently repurposing it.
   }
 </script>
 
 {#if $showCommandPalette}
   <div class="backdrop" transition:fade={{ duration: 150 }} on:click={close} role="presentation"></div>
-  <div class="palette" transition:fade={{ duration: 120 }} role="dialog" aria-modal="true" aria-label="Command palette">
+  <div class="palette" use:focusTrap transition:fade={{ duration: 120 }} role="dialog" aria-modal="true" aria-label="Command palette">
     <div class="header">
       <svg class="search-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16zM21 21l-4.35-4.35"/></svg>
       <input
-        bind:this={inputEl}
         bind:value={query}
         on:keydown={handleKeydown}
+        aria-label={mode === "command" ? "Type a command" : "Search downloads"}
         placeholder={mode === "command" ? "Type a command or search…" : "Search downloads…"}
         autocomplete="off"
         spellcheck="false"
@@ -103,13 +107,13 @@
         <button
           class="mode"
           class:active={mode === "command"}
-          on:click={() => (mode = "command")}
+          on:click={() => setMode("command")}
           aria-pressed={mode === "command"}
         >Commands</button>
         <button
           class="mode"
           class:active={mode === "download"}
-          on:click={() => (mode = "download")}
+          on:click={() => setMode("download")}
           aria-pressed={mode === "download"}
         >Downloads</button>
       </div>

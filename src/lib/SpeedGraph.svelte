@@ -20,11 +20,12 @@
   const ys: number[] = [];
 
   // uPlot paints into a <canvas>, so a colour captured at mount would
-  // outlive the theme that produced it. `series.stroke` and
-  // `axes[].grid.stroke` accept functions that uPlot re-evaluates on
-  // every draw; resolving the custom properties there keeps the line
-  // and the gridline in sync with `<html data-theme>` — for manual
-  // switches as well as an OS preference flip in "system" mode.
+  // outlive the theme that produced it. `series.stroke` accepts a
+  // function that uPlot re-evaluates on every draw; resolving the
+  // custom property there keeps the line in sync with `<html
+  // data-theme>` — for manual switches as well as an OS preference
+  // flip in "system" mode. Both axes are hidden, so there is no grid
+  // stroke to keep in sync (a grid config here used to be dead code).
   function cssColor(name: string, fallback: string): () => string {
     return () => getComputedStyle(el).getPropertyValue(name).trim() || fallback;
   }
@@ -47,20 +48,7 @@
           points: { show: false },
         },
       ],
-      axes: [
-        { show: false },
-        {
-          show: false,
-          grid: {
-            show: true,
-            stroke: cssColor(
-              "--color-border-2",
-              "rgba(255,255,255,0.05)",
-            ),
-            width: 1,
-          },
-        },
-      ],
+      axes: [{ show: false }, { show: false }],
     };
     // The colours are already live, but force a repaint on the switch
     // itself instead of waiting up to a second for the next sample.

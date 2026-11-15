@@ -117,8 +117,8 @@ const MUTATIONS = [
   {
     name: "ui  freeze the title-row dot on 'ok' when the host goes down",
     file: "popup.js",
-    find: '  hostDot.className = `host-dot ${connected ? "ok" : "err"}`;',
-    replace: '  hostDot.className = "host-dot ok";',
+    find: '    dotClass = connected ? "ok" : "err";',
+    replace: '    dotClass = "ok";',
     test: "test/integration.test.mjs",
     pattern: "popup: title-row dot",
   },

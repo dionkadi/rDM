@@ -21,9 +21,9 @@
   // modals.
 
   import { onMount } from "svelte";
-  import { fly, fade } from "svelte/transition";
-  import { cubicOut } from "svelte/easing";
+  import { fade } from "svelte/transition";
   import type { Category, CapturedUrl } from "../types";
+  import { focusTrap } from "../utils/focusTrap";
   import {
     captureQueue,
     popCapture,
@@ -324,18 +324,18 @@
 <svelte:window on:keydown={onKeydown} />
 
 {#if current}
-  <!-- Backdrop. `role="button"` + `tabindex` make it dismissable
-       with click *or* keyboard. We intentionally do NOT close the
-       dialog on backdrop click — the user might miss a capture if
-       they click the wrong pixel. The "Skip" button is the explicit
-       dismiss path. -->
-  <div class="backdrop" transition:fade={{ duration: 150 }} aria-hidden="true"></div>
+  <!-- Inert backdrop: it is deliberately not a button, and a backdrop
+       click does NOT dismiss the dialog — the user might miss a capture
+       if they click the wrong pixel. "Skip" is the explicit dismiss path,
+       and `use:focusTrap` keeps keyboard focus inside the dialog. -->
+  <div class="backdrop" transition:fade={{ duration: 120 }} aria-hidden="true"></div>
   <div
     class="modal"
     role="dialog"
     aria-modal="true"
     aria-labelledby="cd-title"
-    transition:fly={{ y: 12, duration: 200, easing: cubicOut }}
+    use:focusTrap
+    transition:fade={{ duration: 120 }}
   >
     <header class="hd">
       <div class="icn" aria-hidden="true">

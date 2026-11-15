@@ -55,41 +55,9 @@ export function fmtDuration(sec: number | null | undefined): string {
   return `${d}d ${h % 24}h`;
 }
 
-export function fmtTime(hours: number, minutes: number): string {
-  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
-}
-
-export function fmtRelativeTime(
-  date: string | Date | null | undefined,
-): string {
-  if (!date) return "—";
-  const d = typeof date === "string" ? new Date(date) : date;
-  const diff = Date.now() - d.getTime();
-  if (diff < 60_000) return "just now";
-  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
-  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
-  return `${Math.floor(diff / 86_400_000)}d ago`;
-}
-
-export function fmtDate(date: string | Date | null | undefined): string {
-  if (!date) return "—";
-  const d = typeof date === "string" ? new Date(date) : date;
-  return d.toLocaleString(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
 export function truncate(str: string, maxLen: number): string {
   if (str.length <= maxLen) return str;
   return str.slice(0, maxLen - 1) + "…";
-}
-
-export function pad2(n: number): string {
-  return n.toString().padStart(2, "0");
 }
 
 export function filenameFromUrl(u: string): string {
@@ -110,39 +78,4 @@ export function extOf(name: string): string {
 
 export function isUrl(s: string): boolean {
   return /^https?:\/\/\S+$/i.test(s.trim());
-}
-
-export function debounce<T extends (...args: any[]) => unknown>(
-  fn: T,
-  ms: number,
-): (...args: Parameters<T>) => void {
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  return (...args) => {
-    if (timer) clearTimeout(timer);
-    timer = setTimeout(() => fn(...args), ms);
-  };
-}
-
-export function throttle<T extends (...args: any[]) => unknown>(
-  fn: T,
-  ms: number,
-): (...args: Parameters<T>) => void {
-  let last = 0;
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  return (...args) => {
-    const now = Date.now();
-    if (now - last >= ms) {
-      last = now;
-      fn(...args);
-    } else {
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(
-        () => {
-          last = Date.now();
-          fn(...args);
-        },
-        ms - (now - last),
-      );
-    }
-  };
 }

@@ -120,13 +120,11 @@ export function dismissToast(id: string): void {
 
 // ── Clipboard monitoring ───────────────────────────────────────────
 export const clipboardUrl = writable("");
-export const clipboardMonitorEnabled = writable(false);
 
 // ── Drag & drop ────────────────────────────────────────────────────
 export const dragActive = writable(false);
 
 // ── Status bar metrics ────────────────────────────────────────────
-export const globalSpeedLimit = writable<number | null>(null);
 export const globalSpeedLimitLabel = writable<string>("Unlimited");
 
 // ── Demo mode ─────────────────────────────────────────────────────

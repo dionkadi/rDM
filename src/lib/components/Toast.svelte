@@ -19,9 +19,10 @@
 
 <div class="toast-stack" role="region" aria-label="Notifications" aria-live="polite">
   {#each $toasts as t (t.id)}
+    <!-- The stack is the single live region (§9). A nested role="status"
+         adds a second implicit aria-live and can announce each toast twice. -->
     <div
       class="toast {t.kind}"
-      role="status"
       in:fade={{ duration: 120 }}
       out:fade={{ duration: 120 }}
     >
