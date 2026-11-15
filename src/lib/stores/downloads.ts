@@ -3,6 +3,7 @@
 import { writable, derived, get } from "svelte/store";
 import type { CapturedUrl, Download, FrontendEvent } from "../types";
 import * as api from "../api";
+import { searchQuery } from "./ui";
 
 // ── Capture queue (IDM-style) ───────────────────────────────────
 //
@@ -116,6 +117,13 @@ export async function refreshDownloads(): Promise<void> {
       visible.push(d);
     }
     downloads.set(visible);
+    // The server list is authoritative. A row can disappear without a
+    // `Removed` event (restart, server-side cleanup, another client),
+    // and the removed-event handler is the only other place that prunes
+    // the selection. Prune here too, or bulk actions fire at ghost ids.
+    import("./ui").then((ui) =>
+      ui.pruneSelection(new Set(visible.map((d) => d.id))),
+    );
     error.set("");
   } catch (e) {
     error.set(String(e));
@@ -780,23 +788,45 @@ export function stopEventListener(): void {
 }
 
 // ── Derived stores ──────────────────────────────────────────────────
-export const counts = derived(downloads, ($downloads) => ({
-  all: $downloads.length,
-  // "Active" means bytes are moving now. Queued/paused/scheduled rows
-  // are not active — lumping them in made the status bar claim four
-  // transfers while nothing was on the wire.
-  active: $downloads.filter(
-    (d) => d.status === "downloading" || d.status === "connecting",
-  ).length,
-  queued: $downloads.filter(
-    (d) => d.status === "queued" || d.status === "scheduled",
-  ).length,
-  paused: $downloads.filter((d) => d.status === "paused").length,
-  completed: $downloads.filter((d) => d.status === "completed").length,
-  errored: $downloads.filter((d) => d.status === "error").length,
-  canceled: $downloads.filter((d) => d.status === "canceled").length,
-  scheduled: $downloads.filter((d) => d.status === "scheduled").length,
-}));
+function countStatuses(list: Download[]) {
+  return {
+    all: list.length,
+    // "Active" means bytes are moving now. Queued/paused/scheduled rows
+    // are not active — lumping them in made the status bar claim four
+    // transfers while nothing was on the wire.
+    active: list.filter(
+      (d) => d.status === "downloading" || d.status === "connecting",
+    ).length,
+    queued: list.filter(
+      (d) => d.status === "queued" || d.status === "scheduled",
+    ).length,
+    paused: list.filter((d) => d.status === "paused").length,
+    completed: list.filter((d) => d.status === "completed").length,
+    errored: list.filter((d) => d.status === "error").length,
+  };
+}
+
+/** Whole-library counts for the status bar (never affected by search). */
+export const counts = derived(downloads, countStatuses);
+
+/**
+ * The scope the filter strip counts against: the library narrowed by the
+ * search text only. Status/category filters are applied *after* this, so
+ * switching chips never zeroes the other chips, and a search that leaves
+ * one row visible no longer reads "All 6 · Active 2".
+ */
+export const searchScope = derived(
+  [downloads, searchQuery],
+  ([$downloads, $query]) => {
+    const q = $query.trim().toLowerCase();
+    if (!q) return $downloads;
+    return $downloads.filter((d) =>
+      (d.filename || d.url).toLowerCase().includes(q),
+    );
+  },
+);
+
+export const scopedCounts = derived(searchScope, countStatuses);
 
 export const totalDownloaded = derived(downloads, ($downloads) =>
   $downloads.reduce((s, d) => s + (d.downloaded || 0), 0),
@@ -809,7 +839,7 @@ export const hasActive = derived(downloads, ($downloads) =>
 );
 
 // ── Smart folders (file type groupings) ────────────────────────────
-export const smartFolders = derived(downloads, ($downloads) => {
+export const smartFolders = derived(searchScope, ($downloads) => {
   const buckets: Record<
     string,
     { count: number; downloaded: number; total: number }

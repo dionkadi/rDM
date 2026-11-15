@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { activeFilter, type FilterKey } from "../stores/ui";
-  import { counts, smartFolders } from "../stores/downloads";
+  import { activeFilter, searchQuery, type FilterKey } from "../stores/ui";
+  import { scopedCounts, smartFolders } from "../stores/downloads";
 
   interface Group {
     key: FilterKey;
@@ -29,18 +29,19 @@
     { key: "binary", label: "Software", count: 0 },
   ];
 
-  // Single source for every count: the store derives them from the same
-  // list the ledger renders. The previous file counted only All/Active
-  // and computed "Active" from the first five category buckets, which
-  // was both wrong and order-dependent.
+  // Chips count the current *search scope*, not the whole library —
+  // otherwise a search leaving one row visible still reads "All 6".
+  // The status bar keeps using the whole-library `counts` store.
   $: countsByKey = {
-    all: $counts.all,
-    active: $counts.active,
-    queued: $counts.queued,
-    paused: $counts.paused,
-    completed: $counts.completed,
-    error: $counts.errored,
+    all: $scopedCounts.all,
+    active: $scopedCounts.active,
+    queued: $scopedCounts.queued,
+    paused: $scopedCounts.paused,
+    completed: $scopedCounts.completed,
+    error: $scopedCounts.errored,
   } as Record<string, number>;
+
+  $: scopeLabel = $searchQuery.trim() ? " in search results" : "";
 
   $: filters = FILTERS.map((f) => ({ ...f, count: countsByKey[f.key] ?? 0 }));
 
@@ -64,7 +65,7 @@
       class:active={$activeFilter === f.key}
       on:click={() => select(f.key)}
       aria-pressed={$activeFilter === f.key}
-      title={f.count > 0 ? `${f.label} — ${f.count}` : f.label}
+      title={f.count > 0 ? `${f.label} — ${f.count}${scopeLabel}` : f.label}
     >
       <span class="lbl">{f.label}</span>
       {#if f.count > 0}<span class="count">{f.count}</span>{/if}
@@ -78,7 +79,7 @@
         class:active={$activeFilter === g.key}
         on:click={() => select(g.key)}
         aria-pressed={$activeFilter === g.key}
-        title={`${g.label} — ${g.count}`}
+        title={`${g.label} — ${g.count}${scopeLabel}`}
       >
         <span class="lbl">{g.label}</span>
         <span class="count">{g.count}</span>

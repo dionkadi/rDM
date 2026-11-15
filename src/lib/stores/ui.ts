@@ -77,7 +77,6 @@ export type FilterKey =
   | "paused"
   | "completed"
   | "error"
-  | "scheduled"
   | "video"
   | "audio"
   | "archive"
@@ -166,9 +165,13 @@ export function recordNativeHostEvent(): void {
 
 // ── Selection (bulk operations) ────────────────────────────────
 //
-// `selectedIds` is a Svelte store holding the *visible* selection —
-// the ids the user has explicitly picked in the current view. It is
-// intentionally a `Set` so toggle/add/remove are O(1) and so the
+// `selectedIds` is a Svelte store holding the ids the user explicitly
+// picked. The scope is the *download list*, not the current view:
+// changing a status/category filter or typing a search deliberately
+// keeps the selection, so a bulk action still applies to everything the
+// user picked. Ids are pruned when the authoritative list no longer
+// contains them (Removed events and full refreshes), never on a filter
+// change. It is a `Set` so toggle/add/remove are O(1) and so the
 // "select all" / "clear" operations don't iterate to dedupe.
 //
 // The set is *ephemeral* (not persisted to localStorage): a

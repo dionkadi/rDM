@@ -665,6 +665,10 @@ export class FakeDocument {
     return Array.isArray(found) ? (found[0] ?? null) : null;
   }
   createElement(tag) {
+    // A real DOM silently creates an <undefined> element for a bad tag,
+    // which is exactly how the popup's hint regression hid behind a
+    // green suite. Make it loud so the regression tests can catch it.
+    if (typeof tag !== "string" || !tag) throw new TypeError("document.createElement: invalid tag " + String(tag));
     return new FakeElement(tag);
   }
   createTextNode(text) {

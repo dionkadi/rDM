@@ -159,7 +159,11 @@ Decisions (v2.1, supersedes the sidebar layout of the first pass):
 - **No sidebar.** Status + smart-folder filters become one horizontal
   chip strip (scrolls when full); categories join it only when they
   have counts. Counts live **only** here — the column header no longer
-  repeats "N shown / N total". Search is a topbar trigger for the command palette.
+  repeats "N shown / N total". Chip counts describe the **current search
+  scope** (library narrowed by the search text, before any status or
+  category filter), so a search that leaves one row visible cannot still
+  read "All 6"; the status bar keeps whole-library aggregates. Search is
+  a topbar trigger for the command palette.
 - **Full-bleed shell, solid chrome.** The ledger owns the window width.
   Topbar, filter strip and status bar are opaque with hairline borders; no
   backdrop blur on scrolling chrome. The column header sticks under the

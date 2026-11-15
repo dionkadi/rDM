@@ -180,7 +180,9 @@ $: if (typeof window !== "undefined") {
 | 阶段 | 范围 | 状态 | 阶段验证 |
 |---|---|---|---|
 | 1 | P0：R2-01、R2-02 | 已修 | `svelte-check` 0/0；CSS vars OK；扩展 107/107；变异 26/26；`vite build` 82 modules；`cargo test -p dm-engine` 118 passed / 0 failed |
-| 2 | P1：R2-03 – R2-06 | 待处理 | — |
+| 2 | P1：R2-03 – R2-06 | 已修 | `svelte-check` 0/0；CSS vars OK；扩展 109/109；变异 27/27；`vite build`；`cargo test -p dm-engine` 118 passed；额外运行时验证计数/清理逻辑 |
 | 3 | P2：R2-07 – R2-17 | 待处理 | — |
 
 **阶段 1 实现要点**：`renderMarkup` 现在把字符串当文本节点、并对非法节点抛 `TypeError`；新增一个覆盖四个坏分支的回归测试与一条变异。`App.svelte` 的滚动锁从 `lockCount` 引用计数改为幂等的 `scrollLocked` 布尔，只有 false↔true 才动 DOM，`onDestroy` 用 `setBodyScrollLocked(false)` 兜底。
+
+**阶段 2 实现要点**：`updateSettings` 失败时同步复位限速标签；`refreshDownloads` 全量替换后 prune 选择集，`ui.ts` 注释改为明确的"跨筛选保留、随权威列表清理"语义。chip 计数与 smart folders 改由 `searchScope`（仅按搜索文本收窄）派生，状态栏继续用全库 `counts`；删除不可达的 `scheduled` FilterKey/case 与无人读取的 `counts.canceled` / `counts.scheduled`，§5 补上口径说明。fake DOM 现在对非法 tag 抛错，十个 `hintForError` 出口全部有断言，并新增一条针对该防线的变异。运行时验证：库内 4 行、搜索 `pdf` 后 chip 为 `All 1 / Done 1`，状态栏仍为 `All 4`。

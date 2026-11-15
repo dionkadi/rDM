@@ -217,7 +217,8 @@
       case "paused": return d.status === "paused";
       case "completed": return d.status === "completed";
       case "error": return d.status === "error";
-      case "scheduled": return d.status === "scheduled";
+      // `scheduled` rows are folded into `queued` — a separate chip was
+      // never reachable through the UI, so the FilterKey was removed.
       case "video": case "audio": case "archive": case "document": case "image": case "binary":
         return isFileType(d, f);
       default: return true;

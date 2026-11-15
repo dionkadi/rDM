@@ -35,8 +35,13 @@ export async function updateSettings(patch: Partial<Settings>): Promise<void> {
   try {
     await api.updateSettings(next);
   } catch (e) {
-    // Revert on error
+    // Revert on error — including the status-bar label, which was set
+    // optimistically above. Without this the engine keeps the old cap
+    // while the status bar keeps claiming the new one until restart.
     settings.set(current);
+    if (patch.speedLimitGlobal !== undefined) {
+      globalSpeedLimitLabel.set(speedLimitLabel(current.speedLimitGlobal));
+    }
     throw e;
   }
 }

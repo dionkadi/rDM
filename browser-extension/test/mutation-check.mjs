@@ -133,6 +133,15 @@ const MUTATIONS = [
     pattern: "popup: host hint prose survives every diagnostic branch",
   },
   {
+    name: "ui  let the fake DOM silently accept an invalid tag again",
+    file: "test/harness.mjs",
+    find:
+      '    if (typeof tag !== "string" || !tag) throw new TypeError("document.createElement: invalid tag " + String(tag));\n',
+    replace: "",
+    test: "test/integration.test.mjs",
+    pattern: "fake DOM rejects invalid tags",
+  },
+  {
     name: "ship  let a manifest without a service worker reach Chrome",
     file: "scripts/make-chrome-manifest.mjs",
     find: '  out.background = { service_worker: "background.js" };',

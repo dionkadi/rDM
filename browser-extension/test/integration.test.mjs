@@ -438,6 +438,43 @@ test("popup: host hint prose survives every diagnostic branch", async () => {
   }
 });
 
+test("fake DOM rejects invalid tags so popup rendering bugs cannot hide", () => {
+  // R2-05: the harness used to turn createElement(undefined) into a
+  // harmless <UNDEFINED> element, so a rendering bug could pass the
+  // whole suite. It must fail loudly instead.
+  const doc = new FakeDocument();
+  assert.throws(() => doc.createElement(undefined), /invalid tag/);
+  assert.throws(() => doc.createElement(""), /invalid tag/);
+});
+
+test("popup: every remaining host hint branch still renders guidance", async () => {
+  // R2-05: the other six exits of hintForError/getStatus were never
+  // asserted either. Keep all ten branches pinned so a future edit
+  // cannot quietly break one transport and leave the others green.
+  const cases = [
+    [
+      "Could not establish connection. Receiving end does not exist.",
+      /service worker never started/,
+    ],
+    ["WebSocket ctor failed: blocked", /browser refused to open the WebSocket/],
+    [
+      "chrome.runtime.connectNative is not a function",
+      /missing the nativeMessaging/,
+    ],
+    ["close code 1006", /check-host\.mjs/],
+    ["an error the popup does not recognise", /Browser said:/],
+    ["", /The host process never reported a status/],
+  ];
+  for (const [message, expected] of cases) {
+    const els = await popupWithHostError(message);
+    assert.match(
+      textOf(els["err-detail"]),
+      expected,
+      message || "(empty lastError)",
+    );
+  }
+});
+
 test("popup: title-row dot reads Disconnected when the host is down", async () => {
   const { clock, els } = bootAll({ popup: true });
   await settle(clock);
