@@ -75,7 +75,7 @@ Engine internals, event shapes, and invariants live in [`AGENTS.md`](AGENTS.md).
 
 - **Rust** stable (1.74+ recommended; edition 2021).
 - **Node.js 18+** and **npm**.
-- **Tauri 2 system deps** for your platform — see <https://tauri.app/start/prerequisites/>. On Linux that is `libwebkit2gtk-4.1-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev` and `patchelf` (exactly what `.github/workflows/release.yml` installs).
+- **Tauri 2 system deps** for your platform — see <https://tauri.app/start/prerequisites/>. On Linux the Tauri-specific ones are `libwebkit2gtk-4.1-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev` and `patchelf`; `.github/workflows/release.yml` lists the full set including the C toolchain.
 
 ### Run the frontend alone (demo mode, no Rust)
 
