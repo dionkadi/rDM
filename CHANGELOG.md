@@ -16,6 +16,81 @@ remains the detailed source of truth.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.8.0] - 2026-11-16
+
+### Changed — the window is a ledger now
+
+- **The sidebar is gone; the list owns the window.** Status and smart-folder
+  filters became one horizontal chip strip, the add flow became a bare
+  one-line input (URL + category + `More` + Add, with Add disabled until the
+  URL is complete), and rows became a single 40 px line of record in fixed
+  numeric columns — name, meter + %, size, speed, ETA, status. A sticky
+  column header keeps the numerics aligned, and the two least critical
+  columns (ETA, then Speed) drop out at 1180 / 980 px instead of everything
+  truncating a little.
+- **Chip counts describe the search scope, not the library.** Since the
+  strip is the only place counts exist, "All 6" over a single visible search
+  hit was a lie; the chips now count the library narrowed by the search text
+  while the status bar keeps the whole-library aggregates.
+- **The meter shows the segmentation.** One flat accent bar with hairline
+  ticks carved at chunk boundaries (plus a translucent band for in-flight
+  segments), so a 16-connection download reads as one object from a distance
+  and as sixteen up close. HLS rows add a per-segment map with a
+  `done / total` count.
+- **Aggregates moved to the status bar**: rate, sparkline, downloaded total,
+  the read-only global cap, and the done/error counts. The sidebar stats
+  block, the throughput hero and the activity strip are gone — and because
+  the global cap is no longer an add-field, configuring one URL can't
+  throttle the whole app.
+- **Selection is contextual**: selecting rows raises a compact bar just
+  above the status bar, over the tail of the list, instead of pushing the
+  ledger down.
+- **One token system, two themes.** Surfaces, hairlines and category hues
+  are all `--color-*` semantics resolved through `data-theme`; light-theme
+  tints, control boundaries and the sparkline stroke are derived rather than
+  hard-coded, and `scripts/check-css-vars.mjs` fails the build on a `var()`
+  that doesn't resolve.
+- **The extension popup follows the same system**: a title row with a status
+  dot, one line of state, an inline error detail that keeps the diagnostic
+  prose next to the raw code, and the two behaviour switches.
+
+### Fixed — the two UI audit rounds (30 + 17 findings)
+
+Every item is catalogued with a reproduction in
+[`docs/UI_REVIEW.md`](docs/UI_REVIEW.md) and
+[`docs/UI_REVIEW_ROUND2.md`](docs/UI_REVIEW_ROUND2.md). The user-visible
+ones:
+
+- **A popup error detail dropped its prose** and showed only the `<code>`
+  fragments — the one screen whose job is explaining a failure explained
+  nothing.
+- **Closing a dialog could freeze scrolling for good.** The body lock was
+  reference-counted while the reactive statement that drove it was
+  level-triggered, so the palette's "Open settings" path (settings opening
+  while the palette was still up) counted twice and left the page
+  `overflow: hidden` after both closed.
+- **A rejected speed limit left the old cap in the status bar**, because the
+  optimistic label was never rolled back with the settings object.
+- **Removed rows stayed in the selection**, so a bulk action could still
+  target a download that no longer existed.
+- **Tab was hijacked inside the command palette** to switch modes; it now
+  moves focus like everywhere else, and the palette/dialogs trap and restore
+  focus instead of dropping it on `<body>`.
+- **Announcements were duplicated or missing**: the toast nested
+  `role="status"` inside a live region, and the add-row validation error had
+  no `role="alert"` at all.
+- **The status-bar sparkline ignored theme changes** — its stroke and fill
+  were resolved once at construction; they are resolved per draw now, which
+  is also what the OS-preference flip needs.
+- **Control boundaries sat at 1.2–1.6:1** against their surface (text was
+  fine, borders weren't); inputs and checkboxes now use a dedicated
+  `--control-border` at 4.7–5.8:1.
+- Rows answer Space as well as Enter, the in-row speed limit can't submit
+  twice, and the dead `design-tokens.ts` mirror, `.list-head`, `--border-focus`
+  and six unused formatters are gone.
+
 ### Added — multi-algorithm checksum verification
 
 - **Checksums now support MD5, SHA-1, SHA-256 and SHA-512** (previously
@@ -51,6 +126,30 @@ remains the detailed source of truth.
   update never arrive. All event-emitting commands are now `async`
   (they run on the async runtime thread pool), which removes the
   re-entrancy entirely.
+
+### Documentation
+
+- **The build instructions described a wrapper that never existed.**
+  `README.md` and `AGENTS.md` both told you to run `./build-with-shim.sh`
+  (plus a `.pkgconfig-shim/` directory) on Fedora 40+; neither file has ever
+  been in the repository — `git log` has no record of them. The instructions
+  now name `npm run tauri build` and the actual Linux system packages.
+- **A plain `cargo build --release` is not a production build**, and the docs
+  now say why: `tauri`'s build script derives dev mode from the
+  `custom-protocol` feature, so that binary loads `devUrl`
+  (`localhost:5173`) and never reads `dist/`. This is also why the shipped
+  binary can look like an old UI after a rebuild.
+- **The release body pipeline is now enforced from both ends.**
+  `scripts/changelog-section.mjs` gained `--require-notes` (so
+  `scripts/release.sh` refuses to bump a version whose curated
+  `RELEASE_NOTES.md` section is missing instead of silently publishing the
+  long history), its error messages now name the file they actually failed
+  on, and the release workflow's extension table quotes the real artifact
+  names (`dm-grabber-0.8.0.zip`, not `dm-grabber-v0.8.0.zip`) and no longer
+  claims Chromium needs a native-messaging host.
+- The invariant list was corrected where the code had moved on — the modal
+  scroll lock is an idempotent boolean, not the `lockCount` refcount it
+  documented.
 
 ## [0.7.0] - 2026-11-11
 
@@ -165,9 +264,9 @@ missed. All four are fixed here and pinned by tests.
   sampling CPU / RSS / disk IO throughout and writing one JSON.
   `--quick` and `--only <scenario>` keep the iteration loop fast.
 - The two recorded full runs are checked in as reports with charts:
-  [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md) (before the fixes,
-  including the root-cause analyses) and
-  [`FIX_VERIFICATION.md`](FIX_VERIFICATION.md) (after), sourced from
+  [`docs/bench/BENCHMARK_REPORT.md`](docs/bench/BENCHMARK_REPORT.md) (before
+  the fixes, including the root-cause analyses) and
+  [`docs/FIX_VERIFICATION.md`](docs/FIX_VERIFICATION.md) (after), sourced from
   `target/bench/results*.json`.
 - Three regression tests pin the new semantics: the shared global
   bucket serialises two downloads
@@ -590,7 +689,7 @@ interception was unconditional, only *delivery* was conditional.
 When the DM app was closed, a click on a `.zip` link did nothing at
 all, and a download the browser started on its own was cancelled and
 erased with nothing to replace it. Full audit:
-[`EXTENSION_AUDIT.md`](EXTENSION_AUDIT.md).
+[`docs/EXTENSION_AUDIT.md`](docs/EXTENSION_AUDIT.md).
 
 ### Added
 
@@ -672,7 +771,7 @@ erased with nothing to replace it. Full audit:
 
 ### Fixed
 
-- **A dead host no longer breaks the browser** ([`EXTENSION_AUDIT.md`](EXTENSION_AUDIT.md) P0-2).
+- **A dead host no longer breaks the browser** ([`docs/EXTENSION_AUDIT.md`](docs/EXTENSION_AUDIT.md) P0-2).
   `content.js` caches host liveness (pushed on every transport
   transition) and skips interception entirely when DM is unreachable or
   when the extension runtime was invalidated by a reload. It fails

@@ -1,6 +1,7 @@
 // Extract one version's section for the GitHub release body.
 //
 //   node scripts/changelog-section.mjs v0.6.0
+//   node scripts/changelog-section.mjs v0.8.0 --require-notes   # no fallback
 //   node scripts/changelog-section.mjs --self-test
 //
 // Two sources, one contract (kept in sync by hand — every entry in the
@@ -36,12 +37,13 @@ const RELEASE_NOTES = path.join(HERE, "..", "RELEASE_NOTES.md");
 const HEADING = /^##\s+\[?v?([0-9]+\.[0-9]+\.[0-9]+(?:[-+][^\]\s]+)?)\]?/;
 
 /**
- * @param {string} markdown full CHANGELOG.md
+ * @param {string} markdown full CHANGELOG.md / RELEASE_NOTES.md
  * @param {string} version tag or version, with or without a leading `v`
+ * @param {string} [label] file name used in error messages
  * @returns {string} the section body (no heading), trimmed
  * @throws when the version has no section
  */
-export function extractSection(markdown, version) {
+export function extractSection(markdown, version, label = "CHANGELOG.md") {
   const wanted = String(version).replace(/^v/i, "").trim();
   const lines = markdown.split(/\r?\n/);
   let start = -1;
@@ -54,7 +56,7 @@ export function extractSection(markdown, version) {
   }
   if (start === -1) {
     throw new Error(
-      `CHANGELOG.md has no section for "${wanted}". ` +
+      `${label} has no section for "${wanted}". ` +
         `Found: ${found.join(", ") || "(none)"}`,
     );
   }
@@ -73,7 +75,7 @@ export function extractSection(markdown, version) {
   // Collapse runs of blank lines left behind by the trim above.
   body = body.replace(/\n{3,}/g, "\n\n");
   if (!body) {
-    throw new Error(`the CHANGELOG section for "${wanted}" is empty`);
+    throw new Error(`${label} has an empty section for "${wanted}"`);
   }
   return body;
 }
@@ -95,14 +97,20 @@ export function resolveSection(notesMd, changelogMd, version) {
   const missing = [];
   if (notesMd && notesMd.trim()) {
     try {
-      return { body: extractSection(notesMd, version), source: "RELEASE_NOTES.md" };
+      return {
+        body: extractSection(notesMd, version, "RELEASE_NOTES.md"),
+        source: "RELEASE_NOTES.md",
+      };
     } catch (e) {
       missing.push(`RELEASE_NOTES.md: ${stripFilePrefix(e.message)}`);
     }
   }
   if (changelogMd && changelogMd.trim()) {
     try {
-      return { body: extractSection(changelogMd, version), source: "CHANGELOG.md" };
+      return {
+        body: extractSection(changelogMd, version, "CHANGELOG.md"),
+        source: "CHANGELOG.md",
+      };
     } catch (e) {
       missing.push(`CHANGELOG.md: ${stripFilePrefix(e.message)}`);
     }
@@ -112,10 +120,51 @@ export function resolveSection(notesMd, changelogMd, version) {
   );
 }
 
-// The inner extractors name their own file in the error message; strip
-// it so the combined message can attribute each half correctly.
+// The inner extractor names the file it parsed; strip that prefix so the
+// combined message can attribute each half itself ("RELEASE_NOTES.md:
+// has no section …").
 function stripFilePrefix(message) {
-  return message.replace(/^CHANGELOG\.md (has no section|the .* section)/, "$1");
+  return message.replace(/^(?:CHANGELOG|RELEASE_NOTES)\.md /, "");
+}
+
+/**
+ * Assert that one specific file carries a section for `version`.
+ * `resolveSection` cannot answer that on its own: it stops at the first
+ * source that works, so a version present in RELEASE_NOTES.md but missing
+ * from CHANGELOG.md resolves happily. `release.sh` requires both.
+ *
+ * @param {string|null} markdown full file contents
+ * @param {string} version
+ * @param {string} label file name for the error message
+ * @throws when the file is absent or has no section
+ */
+export function enforceSection(markdown, version, label) {
+  if (!markdown || !markdown.trim()) {
+    throw new Error(`${label} is missing or empty`);
+  }
+  extractSection(markdown, version, label);
+}
+
+/**
+ * Turn the changelog fallback into a hard failure. `release.yml` keeps
+ * the fallback on purpose (by tag time the binaries are already built,
+ * and a long body beats a failed release), but the local bump is the
+ * last cheap moment to notice that the curated highlights are missing —
+ * `release.sh` calls this via `--require-notes`.
+ *
+ * @param {{ body: string, source: string }} resolved
+ * @param {string} version
+ * @throws when the body did not come from RELEASE_NOTES.md
+ */
+export function enforceNotes(resolved, version) {
+  if (resolved.source === "RELEASE_NOTES.md") return;
+  const wanted = String(version).replace(/^v/i, "").trim();
+  throw new Error(
+    `RELEASE_NOTES.md has no section for "${wanted}", so the release body ` +
+      `would fall back to the detailed CHANGELOG.md history. Add the ` +
+      `curated highlights first (or pass through release.yml, which ` +
+      `tolerates the fallback).`,
+  );
 }
 
 function selfTest() {
@@ -198,6 +247,60 @@ function selfTest() {
   if (!extractSection(changelogFixture, "1.9.0").includes("old thing")) {
     throw new Error("self-test: the bracketed/bare heading styles must both parse");
   }
+
+  // 6. An empty notes section falls back to the changelog, and the error
+  //    names the file it actually failed on.
+  const emptyNotes = ["# Release Notes", "", "## [2.0.0] - 2026-01-01", ""].join("\n");
+  if (resolveSection(emptyNotes, changelogFixture, "2.0.0").source !== "CHANGELOG.md") {
+    throw new Error("self-test: an empty notes section must fall back to the changelog");
+  }
+  let emptyErr = null;
+  try {
+    resolveSection(emptyNotes, "", "2.0.0");
+  } catch (e) {
+    emptyErr = e;
+  }
+  if (!emptyErr || !emptyErr.message.includes('RELEASE_NOTES.md: has an empty section for "2.0.0"')) {
+    throw new Error("self-test: the empty-section error must name RELEASE_NOTES.md, not CHANGELOG.md");
+  }
+
+  // 7. --require-notes rejects a changelog-sourced body and accepts a
+  //    notes-sourced one.
+  if (enforceNotes(fromNotes, "2.0.0") !== undefined) {
+    throw new Error("self-test: require-notes must accept a notes-sourced body");
+  }
+  let notesErr = null;
+  try {
+    enforceNotes(fromChangelog, "1.9.0");
+  } catch (e) {
+    notesErr = e;
+  }
+  if (!notesErr || !notesErr.message.includes("RELEASE_NOTES.md has no section for \"1.9.0\"")) {
+    throw new Error("self-test: require-notes must reject a changelog-sourced body");
+  }
+
+  // 8. enforceSection checks ONE file. resolveSection cannot do this: it
+  //    stops at the first source that resolves, so a notes-only version
+  //    looks fine even when the changelog has no section.
+  enforceSection(changelogFixture, "2.0.0", "CHANGELOG.md"); // must not throw
+  let sectionErr = null;
+  try {
+    enforceSection(changelogFixture, "9.9.9", "CHANGELOG.md");
+  } catch (e) {
+    sectionErr = e;
+  }
+  if (!sectionErr || !sectionErr.message.includes('CHANGELOG.md has no section for "9.9.9"')) {
+    throw new Error("self-test: enforceSection must name the file it checked");
+  }
+  let emptyFileErr = null;
+  try {
+    enforceSection("", "2.0.0", "CHANGELOG.md");
+  } catch (e) {
+    emptyFileErr = e;
+  }
+  if (!emptyFileErr || !emptyFileErr.message.includes("is missing or empty")) {
+    throw new Error("self-test: enforceSection must reject an empty file");
+  }
   console.log("changelog-section: self-test passed");
 }
 
@@ -206,22 +309,32 @@ function main(argv) {
     selfTest();
     return;
   }
-  const version = argv[0];
+  // Refuse the CHANGELOG.md fallback when asked. `release.sh` passes this
+  // so a tag cannot be cut with the curated highlights missing.
+  const requireNotes = argv.includes("--require-notes");
+  // Assert that CHANGELOG.md *itself* carries the section — resolveSection
+  // stops at the first working source and so cannot notice a notes-only
+  // version.
+  const requireChangelog = argv.includes("--require-changelog");
+  const version = argv.find((a) => !a.startsWith("--"));
   if (!version) {
-    console.error("usage: node scripts/changelog-section.mjs <version|--self-test>");
+    console.error(
+      "usage: node scripts/changelog-section.mjs <version> [--require-notes|--require-changelog]\n" +
+        "       node scripts/changelog-section.mjs --self-test",
+    );
     process.exit(64);
   }
   const readOptional = (p) => (fs.existsSync(p) ? fs.readFileSync(p, "utf8") : null);
   try {
-    const { body, source } = resolveSection(
-      readOptional(RELEASE_NOTES),
-      readOptional(CHANGELOG),
-      version,
-    );
+    const notesMd = readOptional(RELEASE_NOTES);
+    const changelogMd = readOptional(CHANGELOG);
+    const resolved = resolveSection(notesMd, changelogMd, version);
+    if (requireNotes) enforceNotes(resolved, version);
+    if (requireChangelog) enforceSection(changelogMd, version, "CHANGELOG.md");
     // Human-friendly provenance on stderr; stdout stays clean for the
     // `releaseBody` capture in release.yml.
-    console.error(`release body for ${version} from ${source}`);
-    process.stdout.write(body + "\n");
+    console.error(`release body for ${version} from ${resolved.source}`);
+    process.stdout.write(resolved.body + "\n");
   } catch (e) {
     console.error(`error: ${e.message}`);
     process.exit(1);

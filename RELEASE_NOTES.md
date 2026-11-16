@@ -13,6 +13,31 @@ complete when they don't.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.8.0] - 2026-11-16
+
+### Changed
+
+- **A new interface: one ledger, no sidebar.** Filters are a chip strip,
+  adding is a single line, and every download is one 40 px row in fixed
+  numeric columns whose meter shows the segment split. Aggregates live in
+  the status bar — the throughput hero and the stats block are gone. Light
+  and dark come from one token system, and the extension popup follows it.
+- **Chip counts follow the search**, so "All" no longer says six while one
+  row is visible.
+
+### Fixed
+
+- **47 findings from two UI audit passes.** The ones you would feel: a
+  popup error that dropped its explanation, a scroll lock that survived
+  closing the settings drawer, a rejected speed limit that stayed in the
+  status bar, a removed download that stayed selected, Tab hijacked inside
+  the command palette, and control borders at 1.2–1.6:1 contrast (now
+  4.7–5.8:1).
+- **Windows: adding a task no longer wedges the UI.** Event-emitting Tauri
+  commands run on the async runtime instead of the main thread.
+
 ### Added
 
 - **Multi-algorithm checksums.** Downloads can be verified against
@@ -21,11 +46,6 @@ complete when they don't.
   when the download is added instead of at 100 %.
 - **Launch at login** toggle in Settings → General → Behavior
   (Registry Run key / LaunchAgent / `.desktop` autostart).
-
-### Fixed
-
-- **Windows: adding a task no longer wedges the UI.** Event-emitting
-  Tauri commands run on the async runtime instead of the main thread.
 
 ## [0.7.0] - 2026-11-11
 

@@ -102,11 +102,16 @@ jobs:
           node-version: "20"
           cache: "npm"
 
-      - name: Release-notes extractor self-test
-        # `scripts/changelog-section.mjs` turns the CHANGELOG section for
-        # a tag into the GitHub release body. A parser regression must
-        # fail here, not on tag day. Dependency-free — runs before npm ci.
-        run: node scripts/changelog-section.mjs --self-test
+      - name: Release tooling self-test
+        # `scripts/changelog-section.mjs` turns the CHANGELOG / RELEASE_NOTES
+        # section for a tag into the GitHub release body, and
+        # `scripts/release.sh` bumps every manifest and tags. A regression in
+        # either must fail here, not on tag day. Dependency-free — runs
+        # before npm ci.
+        run: |
+          node scripts/changelog-section.mjs --self-test
+          bash -n scripts/release.sh
+          ./scripts/release.sh --current
 
       - name: Install npm dependencies
         run: npm ci

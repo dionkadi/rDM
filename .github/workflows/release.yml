@@ -128,7 +128,15 @@ jobs:
       - name: Build frontend (type check + bundle)
         run: npm run check && npm run build
 
-      - name: Release notes from CHANGELOG.md
+      - name: Compute version without leading "v"
+        id: ver
+        shell: bash
+        # The release body quotes the extension artifact names, which are
+        # built from the bare version (`package.sh` strips the `v`), so
+        # the tag has to be stripped here too.
+        run: echo "stripped=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Release notes (RELEASE_NOTES.md, else CHANGELOG.md)
         id: notes
         # `shell: bash` because this job matrix includes Windows, where
         # the default PowerShell would not understand the heredoc below.
@@ -182,11 +190,14 @@ jobs:
 
             | Browser | File | Install |
             | --- | --- | --- |
-            | Chrome / Edge / Brave / Arc | `dm-grabber-${{ github.ref_name }}.zip` | `chrome://extensions` → Developer mode → Load unpacked |
-            | Firefox | `dm-grabber-${{ github.ref_name }}.xpi` | Drag the `.xpi` onto Firefox, or about:addons → Install From File |
+            | Chrome / Edge / Brave / Arc | `dm-grabber-${{ steps.ver.outputs.stripped }}.zip` | `chrome://extensions` → Developer mode → Load unpacked |
+            | Firefox | `dm-grabber-${{ steps.ver.outputs.stripped }}.xpi` | Drag the `.xpi` onto Firefox, or about:addons → Install From File |
 
-            See `browser-extension/INSTALL.md` for the native-messaging
-            host setup, which is required before "Send to DM" will work.
+            See `browser-extension/INSTALL.md`. Chromium browsers need
+            nothing but the running app — they reach it over
+            `ws://127.0.0.1:9157`. Firefox additionally needs the
+            `dm-native-host` binary registered as a native-messaging
+            host.
           releaseDraft: false
           prerelease: ${{ contains(github.ref_name, '-rc') }}
           # `includeUpdaterJson` would add a latest.json for Tauri's

@@ -11,6 +11,7 @@ Working contract for **AI coding agents and code contributors**. Read this befor
 | `docs/UI_DESIGN_PLAN.md` | anyone touching UX | visual system + information-architecture target |
 | `docs/UI_REVIEW.md` | anyone auditing UX | first-round dated issue list, severity/priority, v2.1 change record |
 | `docs/UI_REVIEW_ROUND2.md` | anyone auditing UX | second-round issue list (failure paths, keyboard, lifecycle, contrast), reproductions and fix order |
+| `docs/CODE_REVIEW.md`, `docs/EXTENSION_AUDIT.md`, `docs/FIX_VERIFICATION.md`, `docs/bench/BENCHMARK_REPORT.md` | anyone auditing code | dated audit / benchmark snapshots — the evidence behind past decisions, **not** the live contract |
 | `CHANGELOG.md` / `RELEASE_NOTES.md` | users & maintainers | version history, bug narratives |
 | `TODO.md` | contributors | roadmap by maturity tier |
 
@@ -23,8 +24,8 @@ Tauri 2 shell (`src-tauri`) → UI-agnostic Rust engine (`crates/engine`) → Sv
 ## Repo map (non-obvious only)
 
 - **Cargo workspace at repo root** unifies `target/` — the release binary is `target/release/dm-tauri`, not `src-tauri/target/...`.
-- **`browser-extension/manifest.json` is the Firefox 109+ template.** Chromium manifests are derived at package time (`scripts/package.sh` / `dev-unpacked.sh`). Loading the repo folder in Chrome yields **no background context at all** — always ship/load the derived build.
-- `build-with-shim.sh` + `.pkgconfig-shim/` are **required on Fedora 40+** (bundler needs `libappindicator3` `.pc` files the distro no longer ships).
+- **`browser-extension/manifest.json` is the Firefox 109+ template.** Chromium manifests are derived at package time (`browser-extension/scripts/package.sh` / `dev-unpacked.sh`). Loading the repo folder in Chrome yields **no background context at all** — always ship/load the derived build.
+- **A production binary needs the `custom-protocol` feature.** `tauri`'s build script derives dev mode from it (`let dev = !has_feature("custom-protocol")` → `cargo:dev`, read by `tauri-build::is_dev()`), so a plain `cargo build --release -p dm-tauri` produces a **dev-configured** binary that loads `devUrl` (`localhost:5173`) and never reads `dist/` — it dies on "Could not connect to localhost" without a Vite server. Use `npm run tauri build`, or `cargo build --release -p dm-tauri --features tauri/custom-protocol`.
 - `.taurignore` (root) keeps the Tauri CLI file-walker from EMFILE-panicking on `target/` + `node_modules/`. Keep those patterns.
 - Gitignored scratch: `.pi/`, `coredump/`, `dist/`, `images/`, `target/`. Never commit from them.
 - Tauri identifier is **`com.dm.downloadmanager`** (the old `com.dm.app` collided with `.app` on macOS). Do not change without updating the macOS bundle name.
@@ -42,8 +43,13 @@ npm run check          # svelte-check — must be 0 errors / 0 warnings
 cargo test -p dm-engine
 cargo test -p dm-engine --test integration remove_while_downloading   # CI gate for the remove/cancel race
 
-# Full build
-./build-with-shim.sh   # Fedora 40+; plain `npm run tauri build` elsewhere
+# Full build (frontend bundle + embedded assets + installers)
+npm run tauri build   # → target/release/dm-tauri and target/release/bundle/*
+
+# Release body / version bump (docs first — the bump verifies both files)
+node scripts/changelog-section.mjs --self-test
+node scripts/changelog-section.mjs v<version>    # exactly what release.yml publishes
+./scripts/release.sh <version>                   # bumps every manifest, tags v<version>
 
 # Extension regression suite (no npm install needed)
 cd browser-extension && node --test test/*.test.mjs    # + node test/mutation-check.mjs (must catch all)
@@ -85,7 +91,7 @@ node scripts/check-css-vars.mjs
 9. **CSS custom properties must all resolve.** An undefined `var()` silently drops the whole declaration. Short-name aliases (`--surface`, `--border`, `--text-muted`, …) live in the **theme-agnostic** `:root` of `src/app.css` and point at `--color-*` tokens — never inside a single theme block. `scripts/check-css-vars.mjs` is the gate.
 10. **`window.__playinfo__`-style page expandos are invisible to content scripts** (isolated world). Firefox needs `window.wrappedJSObject` (`pageGlobal()`). Cross-frame media is observed in `background.js` via an **observational** `webRequest.onHeadersReceived` (never `webRequestBlocking`), bounded per-tab log persisted to `chrome.storage.session`.
 11. **Resource-timing buffer keeps the OLDEST entries.** Hence `content.js` runs at `document_start`, mirrors into a 400-entry ring via `PerformanceObserver`, and calls `clearResourceTimings()` in the callback.
-12. **Modal scroll containment**: `App.svelte` `lockCount` refcount sets `overflow: hidden !important` on `<html>`+`<body>` while `showSettings || showCommandPalette`; every scrollable region inside a fixed panel declares `overscroll-behavior: contain`. New modal panels must join the reactive statement.
+12. **Modal scroll containment is idempotent, not reference-counted.** `App.svelte`'s `setBodyScrollLocked(locked)` is driven by a level-triggered `$:` on `showSettings || showCommandPalette`: it returns early when `locked === scrollLocked` and otherwise sets `overflow: hidden !important` on `<html>`+`<body>`; `onDestroy` unlocks. A counter double-counts here — the reactive statement re-runs on every relevant store change, so the palette's "Open settings" path (settings opens while the palette is still up) increments twice and leaves the page frozen after both close. Every scrollable region inside a fixed panel declares `overscroll-behavior: contain`. New modal panels must join the same reactive condition.
 
 ## Gotchas (symptom → cause → rule)
 
@@ -99,10 +105,11 @@ node scripts/check-css-vars.mjs
 - **Row stuck on "Connecting" during HLS** → the HLS branch must set `Downloading` itself; `run_download` returns before its own transition.
 - **HLS progress jumps / reads 0 B/s** → `downloaded` must be on-disk **+ live** (`AtomicU64` for in-flight fetches).
 - **`fmtBytes`** is unit-aware to `YB` (`≥1024 YB` past that); open-ended chunks render `879 B · unknown total`, never the `u64::MAX` sentinel. `DownloadRow` detects non-finite `chunk.end`.
-- **Tray/indicator build failure on Linux** → run `./build-with-shim.sh`.
+- **Tray/indicator link failure on Linux** → the `libayatana-appindicator3` dev files are missing at build time. Install the distro package (`libayatana-appindicator3-dev` on Debian/Ubuntu, `libayatana-appindicator-gtk3-devel` on Fedora) — this is the *loud* version; at runtime Tauri only logs tray failures.
+- **`cargo build --release` succeeds but the window stays blank / says "Could not connect to localhost"** → the binary was built without the `custom-protocol` feature, so it is dev-configured and loading `devUrl`. Build with `npm run tauri build` (or add `--features tauri/custom-protocol`).
 - **Dropdown menu "follows the wrong row"** → stale `transform` or missed `DropdownMenu` reset; it re-measures on resize/scroll, flips above, clamps horizontally, caret clamps to `[14, menuW-14]`.
 - **Scheduler tests time out** → they deliberately use `tokio::time::timeout(100ms, ...)` to assert blocked acquires. Don't widen without understanding the intent.
-- **Extension "won't connect" (WS close 1006 is undecidable)** → layer it: (1) `node browser-extension/scripts/check-host.mjs` distinguishes `refused` / `no-response` (pre-0.4.2 app: line-JSON listener) / `bad-accept` / `ok`; (2) popup error `Receiving end does not exist` = **no background worker** (repo folder loaded in Chrome — build with `scripts/dev-unpacked.sh`); (3) to test without the GUI use `src-tauri/probe-listener/` (real `ws.rs`, port 9158).
+- **Extension "won't connect" (WS close 1006 is undecidable)** → layer it: (1) `node browser-extension/scripts/check-host.mjs` distinguishes `refused` / `no-response` (pre-0.4.2 app: line-JSON listener) / `bad-accept` / `ok`; (2) popup error `Receiving end does not exist` = **no background worker** (repo folder loaded in Chrome — build with `browser-extension/scripts/dev-unpacked.sh`); (3) to test without the GUI use `src-tauri/probe-listener/` (real `ws.rs`, port 9158).
 - **"I pulled the fix but it's still broken"** → MV3 service worker doesn't reload from disk; click **Reload** on the extension card (check "Inspect views" shows the new source).
 - **Firefox media links do nothing** → `nativeMessaging` permission missing (it was dropped for a whole release in 0.4.2): `connectNative is not a function` **and** the click was already `preventDefault()`ed. `node --test test/*.test.mjs` catches this.
 - **A download vanished from `chrome://downloads`** → cancelled a browser download DM never received. See invariant 1; mutation `P0-3` reproduces it.
