@@ -158,7 +158,7 @@ $: if (typeof window !== "undefined") {
 | #28 状态点主机制 | 成立：两条新回归测试分别钉住断开 / 连接态的 `className`、文字与 `title` |
 | 上一轮 30 项 | 未发现"标为已修但实际未修"的回退 |
 
-三个阶段均按要求"改完 → 全套验证 → 单独提交"推进，每阶段一个独立 commit（P0 为 `37bc831`，P1 为 `c35184c`，P2 见 `git log`）。`vite build` 在沙箱内使用 `.pi/` 下 gitignored 的临时配置（跳过两个需要 WASM 的 import-analysis 插件），不入库。**截图级双主题目检仍未执行**：沙箱无法启动 WebView，这仍是最高优先级的未完成验证，尤其应验证阶段 3 的焦点陷阱、对话框淡入、`--control-border` 在真实屏幕上的观感。
+三个阶段均按要求"改完 → 全套验证 → 单独提交"推进，每阶段一个独立 commit（P0 为 `37bc831`，P1 为 `c35184c`，P2 为 `cba20cf`）。`vite build` 在沙箱内使用 `.pi/` 下 gitignored 的临时配置（跳过两个需要 WASM 的 import-analysis 插件），不入库。**截图级双主题目检已于 2026-11-15 补做**，见下节「视觉验证」。
 
 ## 明确排除的疑点
 
@@ -178,7 +178,7 @@ $: if (typeof window !== "undefined") {
 6. **R2-09 – R2-15**：键盘与 a11y 批次（Space、对话框焦点、Tab、Toast、控件边界）。
 7. **R2-16 / R2-17**：死代码与生命周期收尾。
 
-修复后建议按 `AGENTS.md` 的门禁复跑：`npm run check`、`cargo test -p dm-engine`、`node --test test/*.test.mjs`、`node test/mutation-check.mjs`、`node scripts/check-css-vars.mjs`，并在真实 WebView 里补一次双主题目检。
+修复后按 `AGENTS.md` 的门禁复跑：`npm run check`、`cargo test -p dm-engine`、`node --test test/*.test.mjs`、`node test/mutation-check.mjs`、`node scripts/check-css-vars.mjs`；真实 WebView 的双主题目检已在下节完成。
 
 ## 处理进度（分阶段，每阶段独立验证并提交）
 
@@ -201,4 +201,32 @@ $: if (typeof window !== "undefined") {
 - R2-16 / R2-17：删除零引用且已漂移的 `design-tokens.ts`、`.list-head`、`--divider-on-surface`、`--border-focus`、`globalSpeedLimit`、`clipboardMonitorEnabled`、`isMac` 及 6 个未使用工具函数；`initKeyboardShortcuts()` 的注销函数在 `onDestroy` 生效。模块级 `theme.subscribe` 属单例设计，保留。
 - 因 `setHostState` 重构，同步更新了 `mutation-check.mjs` 中该变异的匹配串，避免 stale pattern。
 
-**仍未处理**：截图级双主题目检（沙箱无 WebView）；`trash` 动作是否依赖 `Removed` 事件、Capture/Auth/dropveil 的背景滚动、列头 sticky 偏移对 38 px 的硬编码依赖，三者列为待确认。
+**仍待确认（不影响已完成项）**：`trash` 动作是否依赖 `Removed` 事件、Capture/Auth/dropveil 的背景滚动、列头 sticky 偏移对 38 px 的硬编码依赖。截图级双主题目检已完成，见下节。
+
+## 视觉验证（2026-11-15）
+
+第一轮记录里"沙箱无法启动 Chromium/Firefox"的结论**已不成立**：当前环境有 `DISPLAY=:0`（X.Org 24.1.14，2560×1440）、`google-chrome 157`、`firefox`、`libwebkit2gtk-4.1`、ImageMagick 与 PyGObject/WebKit2。本轮在两种引擎里渲染了**最终构建产物**（`cba20cf` 之后的源码，含本轮修正）：
+
+| 引擎 | 方式 | 结果 |
+|---|---|---|
+| Blink | `google-chrome --headless=new --screenshot` + `agent-browser`（交互） | 1440×900 深/浅、1024×768 浅色、选中 2 行、设置抽屉、命令面板、弹窗深/浅；控制台 0 error |
+| WebKitGTK 4.1 | Tauri 同引擎：PyGObject `WebKit2.WebView` 窗口加载同一 URL，`convert x:<window-id>` 抓屏 | 1440×900 深/浅，与 Blink 布局一致 |
+| Tauri 本体 | `target/release/dm-tauri` 在 `DISPLAY=:0` 下启动 | **启动成功**（日志：`DM starting up`、native-host 监听 `127.0.0.1:9157`、ws 客户端接入），窗口 `DM — Download Manager` 可抓取；但二进制内嵌的是 **v0.7 旧 UI**（侧栏/throughput hero/渐变按钮），因为它编译时嵌入的是旧 `dist/`，不能代表当前设计 |
+
+**逐项核对（运行时证据，不只是截图）**
+- 双主题：浅色 `bodyBg=rgb(244,245,247)`、深色 `#17191e`；两主题下 6 行账本、筛选计数、分类 chip、状态栏 sparkline、demo 标记均完整；1024×768 下 ETA 列按 §5 在 1180px 断点正确消失，Speed 列保留。
+- #27（sparkline 主题响应）：`system` 模式下用 `prefers-color-scheme` 翻转 OS 偏好，`data-theme` 从 `light → dark`，canvas 上第一个有内容的像素从 `rgb(13,122,94)`（=`#0d7a5e`）变为 `rgb(64,200,161)`（≈`#41c9a2`）。折线确实立即重绘换色。
+- R2-15（控件边界）：浏览器实测未选中 `input.cb` 的 `border-color = rgb(103,110,124)`，正是 `--color-faint #676e7c`；`:focus` 用实心 accent。
+- R2-02（滚动锁）：复现原泄漏路径 —— 从命令面板选 `Open settings`，关闭后 `body.style.overflow` 与 `html.style.overflow` 均为 `""`（已解锁）。
+- R2-09 / R2-10（焦点与面板）：打开命令面板后 `document.activeElement` 为 `INPUT[aria-label="Type a command"]`；9 条结果；面板关闭后焦点恢复。
+- R2-14（校验反馈）：输入 `not-a-url` + Enter → `.err[role="alert"]` 显示 "Enter a complete http(s) URL."；换成合法 URL 后 Add 由 `disabled=true / opacity .45` 变为 `disabled=false / opacity 1`（`bg=rgb(13,122,94)`、白字）。先前截图里 Add 偏暗是禁用态，不是对比度缺陷。
+- 批量操作条：1440×900 放大核对为 `2 selected · 2 active 3.4 GB / 5.2 GB | Pause ▶ Resume ⇄ Limit ⇄ Merge 🗑 Trash 🗑 Remove`，无重叠、浮在状态栏上方。
+- 扩展弹窗：深/浅双主题下标题行 `DM Grabber` + 红点 `Disconnected`、单行状态、内联错误详情、主按钮与两个开关均按 §7 排布（纯浏览器中 `chrome.*` 不存在，故显示的是断连诊断态）。
+
+**本轮视觉验证发现并修复的缺陷**：命令面板 footer 仍写着 `tab switch mode`，但阶段 3 已把 Tab 还给原生导航（R2-10）。已改为 `tab move focus`，重建后实测 footer 文本为 `↑↓ navigate / ↵ select / tab move focus / esc close`。
+
+**沙箱构建的一个必要说明**：容器把 `RLIMIT_AS` 限到 4 GiB，V8 无法为 WASM 分配内存，因此 `vite build` 必须跳过 `vite:build-import-analysis` 与 `vite:dynamic-import-vars` 两个依赖 es-module-lexer WASM 的插件。跳过前者会让产物引用未定义的 `__VITE_IS_MODERN__` 而**加载即崩**（本轮首次截图全黑的原因）。验证用配置（`.pi/vite.sandbox.config.mjs`，gitignored）现在补了 `transformIndexHtml` 注入 `window.__VITE_IS_MODERN__=true`，产物开箱可运行；这只影响验证副本，不改产品配置，正常环境下的 `npm run build` 由 Vite 自行注入。
+
+**截图**（`docs/ui/verified-*.png`）：`verified-app-dark/light/1024/selection/palette/settings.png`（Blink）、`verified-webview-light/dark.png`（WebKitGTK）、`verified-popup-light/dark.png`（扩展弹窗）。
+
+**仍无法覆盖**：真实 Tauri 二进制内嵌的当前版界面（需重新编译 Tauri release 以嵌入新 `dist/`）；带真实后端数据的设置面板（纯浏览器下显示 "Settings unavailable in preview mode."）；真实屏幕上的字体/像素密度主观观感。

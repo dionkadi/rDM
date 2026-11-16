@@ -166,7 +166,7 @@
     <div class="footer">
       <span><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
       <span><kbd>↵</kbd> select</span>
-      <span><kbd>tab</kbd> switch mode</span>
+      <span><kbd>tab</kbd> move focus</span>
       <span><kbd>esc</kbd> close</span>
     </div>
   </div>
