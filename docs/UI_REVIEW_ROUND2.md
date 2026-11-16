@@ -158,7 +158,7 @@ $: if (typeof window !== "undefined") {
 | #28 状态点主机制 | 成立：两条新回归测试分别钉住断开 / 连接态的 `className`、文字与 `title` |
 | 上一轮 30 项 | 未发现"标为已修但实际未修"的回退 |
 
-三个阶段均按要求"改完 → 全套验证 → 单独提交"推进，每阶段一个独立 commit（P0 为 `37bc831`，P1 为 `c35184c`，P2 为 `cba20cf`）。`vite build` 在沙箱内使用 `.pi/` 下 gitignored 的临时配置（跳过两个需要 WASM 的 import-analysis 插件），不入库。**截图级双主题目检已于 2026-11-15 补做**，见下节「视觉验证」。
+三个阶段均按要求"改完 → 全套验证 → 单独提交"推进，每阶段一个独立 commit（P0 为 `37bc831`，P1 为 `c35184c`，P2 为 `cba20cf`）。`vite build` 在沙箱内使用 `.pi/` 下 gitignored 的临时配置（跳过两个需要 WASM 的 import-analysis 插件），不入库。**截图级双主题目检已完成**（2026-11-15 补 Blink/WebKitGTK，2026-11-16 补真实 `dm-tauri` 窗口），见下节「视觉验证」。
 
 ## 明确排除的疑点
 
@@ -203,7 +203,7 @@ $: if (typeof window !== "undefined") {
 
 **仍待确认（不影响已完成项）**：`trash` 动作是否依赖 `Removed` 事件、Capture/Auth/dropveil 的背景滚动、列头 sticky 偏移对 38 px 的硬编码依赖。截图级双主题目检已完成，见下节。
 
-## 视觉验证（2026-11-15）
+## 视觉验证（2026-11-15 起，2026-11-16 补完 Tauri 本体）
 
 第一轮记录里"沙箱无法启动 Chromium/Firefox"的结论**已不成立**：当前环境有 `DISPLAY=:0`（X.Org 24.1.14，2560×1440）、`google-chrome 157`、`firefox`、`libwebkit2gtk-4.1`、ImageMagick 与 PyGObject/WebKit2。本轮在两种引擎里渲染了**最终构建产物**（`cba20cf` 之后的源码，含本轮修正）：
 
@@ -211,7 +211,7 @@ $: if (typeof window !== "undefined") {
 |---|---|---|
 | Blink | `google-chrome --headless=new --screenshot` + `agent-browser`（交互） | 1440×900 深/浅、1024×768 浅色、选中 2 行、设置抽屉、命令面板、弹窗深/浅；控制台 0 error |
 | WebKitGTK 4.1 | Tauri 同引擎：PyGObject `WebKit2.WebView` 窗口加载同一 URL，`convert x:<window-id>` 抓屏 | 1440×900 深/浅，与 Blink 布局一致 |
-| Tauri 本体 | `target/release/dm-tauri` 在 `DISPLAY=:0` 下启动 | **启动成功**（日志：`DM starting up`、native-host 监听 `127.0.0.1:9157`、ws 客户端接入），窗口 `DM — Download Manager` 可抓取；但二进制内嵌的是 **v0.7 旧 UI**（侧栏/throughput hero/渐变按钮），因为它编译时嵌入的是旧 `dist/`，不能代表当前设计 |
+| Tauri 本体 | `target/release/dm-tauri` 在 `DISPLAY=:0` 下启动 | 初步结论见下节：用普通 `cargo build --release` 编出来的是 **dev 配置**的二进制，不读 `dist/`；补 `--features tauri/custom-protocol` 重编后，窗口渲染的是**当前**界面（深浅各一张），空库还会走到 "Nothing here yet" 空状态 |
 
 **逐项核对（运行时证据，不只是截图）**
 - 双主题：浅色 `bodyBg=rgb(244,245,247)`、深色 `#17191e`；两主题下 6 行账本、筛选计数、分类 chip、状态栏 sparkline、demo 标记均完整；1024×768 下 ETA 列按 §5 在 1180px 断点正确消失，Speed 列保留。
@@ -227,6 +227,21 @@ $: if (typeof window !== "undefined") {
 
 **沙箱构建的一个必要说明**：容器把 `RLIMIT_AS` 限到 4 GiB，V8 无法为 WASM 分配内存，因此 `vite build` 必须跳过 `vite:build-import-analysis` 与 `vite:dynamic-import-vars` 两个依赖 es-module-lexer WASM 的插件。跳过前者会让产物引用未定义的 `__VITE_IS_MODERN__` 而**加载即崩**（本轮首次截图全黑的原因）。验证用配置（`.pi/vite.sandbox.config.mjs`，gitignored）现在补了 `transformIndexHtml` 注入 `window.__VITE_IS_MODERN__=true`，产物开箱可运行；这只影响验证副本，不改产品配置，正常环境下的 `npm run build` 由 Vite 自行注入。
 
-**截图**（`docs/ui/verified-*.png`）：`verified-app-dark/light/1024/selection/palette/settings.png`（Blink）、`verified-webview-light/dark.png`（WebKitGTK）、`verified-popup-light/dark.png`（扩展弹窗）。
+### Tauri 本体（2026-11-16 补做）
 
-**仍无法覆盖**：真实 Tauri 二进制内嵌的当前版界面（需重新编译 Tauri release 以嵌入新 `dist/`）；带真实后端数据的设置面板（纯浏览器下显示 "Settings unavailable in preview mode."）；真实屏幕上的字体/像素密度主观观感。
+上一轮把"窗口里是 v0.7 旧界面"归因于"编译时嵌入了旧 `dist/`"。方向对，但机制只说了一半，而且它导致了一条错误的操作结论（"重编一次就会好"）。真实机制是：
+
+- `tauri` 的 `build.rs` 只有一个判据 —— `let custom_protocol = has_feature("custom-protocol"); let dev = !custom_protocol;`，然后 `cargo:dev={dev}`，`tauri-build::is_dev()` 读的正是 `DEP_TAURI_DEV`。所以**普通 `cargo build --release` 编出来的是 dev 配置的二进制**：它去加载 `devUrl`（`http://localhost:5173`），压根不读 `dist/`。窗口里那行 `Could not connect to localhost: Connection refused` 就是它，和资源新旧无关。
+- 生产二进制必须显式带特性：`cargo build --release -p dm-tauri --features tauri/custom-protocol`。`tauri build` 自己会传（CLI 二进制里同时含 `custom-protocol` 与 `tauri/custom-protocol` 两个串，说明它会按应用清单有无该特性二选一）。9 月那个旧二进制是 CLI 构建的，嵌的是当时的 `dist/`，所以显示 v0.7 界面 —— 那是"旧产物 + 正确构建方式"，不是"构建方式错了"。
+- 按上面的命令重编（`dist/` 已替换为当前产物）后启动，窗口渲染的就是当前设计：账本行、`All / Active / Queued / Paused / Done / Errors` 筛选条、行内粘贴框与 `Default (no category)` / `More` / `Add`。
+- 空库：`dm.sqlite` 的 `downloads` 为空，于是这次同时**首次验证了零数据空状态** —— `Nothing here yet` + `Ctrl K / Ctrl N / drop` 三个提示，状态栏 `0 active · — · 0 B downloaded · limit Unlimited · 0 done`。此前的截图全部是 demo 数据的 6 行，空状态一次都没出现过。
+- 双主题：WebView 里 `dm-theme` 持久化为 `system`（`localstorage` 实测值 `system`），于是按 GTK 的 `prefers-color-scheme` 解析 —— 默认浅色；加 `GTK_THEME=Adwaita:dark` 再启动即深色。`system` 分支在**真实 Tauri 引擎**里同样成立，不只是 Chrome 里成立。
+
+两个环境坑（与产品无关，但会让人误判成缺陷）：
+
+- 沙箱把 `http_proxy/https_proxy` 指向 `127.0.0.1:38139`，WebKit 会把 `http://tauri.localhost` 的整页请求也交给这个代理，结果整页变成 `upstream connect failed: Connection refused (os error 111)`。启动时 `env -u http_proxy -u https_proxy …` 即恢复。这是第一次重编后窗口全白的原因。
+- 这台机器上同时跑着真正的 Free Download Manager，抓屏必须按 `_NET_WM_NAME` 精确匹配：`_NET_CLIENT_LIST` 里 `0x2000011` 是 FDM，`0x2200003` 才是 DM。按"第一个窗口"取会抓到别人的界面。
+
+**截图**（`docs/ui/verified-*.png`）：`verified-app-dark/light/1024/selection/palette/settings.png`（Blink）、`verified-webview-light/dark.png`（WebKitGTK 静态页）、`verified-popup-light/dark.png`（扩展弹窗）、`verified-tauri-light/dark.png`（真实 `dm-tauri`，1180×760 窗口原始尺寸）。
+
+**仍无法覆盖**：带真实后端数据的设置面板（纯浏览器下只有 "Settings unavailable in preview mode."，而 Tauri 窗口内无法驱动交互，只能看首屏）；WebView 内的键盘 / 焦点 / 面板交互（没有 devtools 自动化通道，这部分只能在 Blink 里用 `agent-browser` 验）；真实屏幕上的字体与像素密度主观观感。

@@ -4,7 +4,7 @@
 参照：`docs/UI_DESIGN_PLAN.md` v2（审查后升级为 v2.1）。
 方式：逐文件静态审查 + 设计 token 对照 + 对照 `docs/ui/` 下的审查前截图 + 编译/构建验证。当前沙箱无法启动 Chromium/Firefox（进程被系统终止），因此没有**改动后**的截图级回归；所有结论均来自实现代码、审查前截图与渲染规则，最终仍建议在真实 WebView 中做一次双主题目检。
 
-> 第二轮审查（覆盖失败路径、键盘与生命周期，含可复现实验）见 [`UI_REVIEW_ROUND2.md`](UI_REVIEW_ROUND2.md)；本文件只保留第一轮的 30 条清单与变更记录。第一轮缺失的截图级双主题目检已在第二轮补做，截图在 `docs/ui/verified-*.png`，方法与结论见 `UI_REVIEW_ROUND2.md` 的「视觉验证」一节。
+> 第二轮审查（覆盖失败路径、键盘与生命周期，含可复现实验）见 [`UI_REVIEW_ROUND2.md`](UI_REVIEW_ROUND2.md)；本文件只保留第一轮的 30 条清单与变更记录。第一轮缺失的截图级双主题目检已在第二轮补做，覆盖 Blink、WebKitGTK 与真实 `dm-tauri` 窗口三层，截图在 `docs/ui/verified-*.png`，方法与结论见 `UI_REVIEW_ROUND2.md` 的「视觉验证」一节。
 
 ## 总体判断
 
@@ -119,7 +119,7 @@ v2 的设计系统本身是成立的：扁平表面、发丝线、单一强调�
 | 扩展回归 `node --test test/*.test.mjs` | **106 passed / 0 failed**（popup 结构改动未破坏选择器，新增 2 条状态点测试） |
 | `node test/mutation-check.mjs` | **25/25 caught**（新增 1 条变异） |
 | `cargo test -p dm-engine` | **全绿**。沙箱 `/tmp` 只有 10 MB，需把 `TMPDIR` 指向仓库内 gitignored 目录并限制 `--test-threads=2` |
-| 截图级回归 | **第一轮未执行**（当时沙箱内 Chromium/Firefox 被系统终止）；第二轮已补做：Blink + WebKitGTK 双引擎、深浅双主题、1440×900 / 1024×768、选中态/设置/面板/弹窗，见 `docs/ui/verified-*.png` 与 `UI_REVIEW_ROUND2.md` |
+| 截图级回归 | **第一轮未执行**（当时沙箱内 Chromium/Firefox 被系统终止）；第二轮已补做：Blink + WebKitGTK + 真实 `dm-tauri` 三层、深浅双主题、1440×900 / 1024×768、选中态/设置/面板/弹窗/空状态，见 `docs/ui/verified-*.png` 与 `UI_REVIEW_ROUND2.md` |
 
 ## 建议的下一步（不改代码也能做）
 
